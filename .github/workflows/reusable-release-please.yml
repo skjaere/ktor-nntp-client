@@ -1,0 +1,73 @@
+name: Release Please (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      java-version:
+        description: Java version for the build job
+        type: string
+        default: '25'
+      java-distribution:
+        description: Java distribution (e.g. temurin, corretto, zulu)
+        type: string
+        default: temurin
+      build-command:
+        description: Command to run for the verification build
+        type: string
+        default: ./gradlew build
+      run-build:
+        description: Whether to run the build job after a release is created
+        type: boolean
+        default: true
+      config-file:
+        description: Path to release-please-config.json
+        type: string
+        default: release-please-config.json
+      manifest-file:
+        description: Path to .release-please-manifest.json
+        type: string
+        default: .release-please-manifest.json
+    outputs:
+      release_created:
+        description: Whether a release was created
+        value: ${{ jobs.release-please.outputs.release_created }}
+      tag_name:
+        description: The tag name of the created release
+        value: ${{ jobs.release-please.outputs.tag_name }}
+      version:
+        description: The version of the created release
+        value: ${{ jobs.release-please.outputs.version }}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          manifest-file: ${{ inputs.manifest-file }}
+          config-file: ${{ inputs.config-file }}
+
+  build:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true' && inputs.run-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: ${{ inputs.java-distribution }}
+          java-version: ${{ inputs.java-version }}
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - run: ${{ inputs.build-command }}
