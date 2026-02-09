@@ -1,5 +1,8 @@
 # Ktor NNTP Client
 
+[![CI](https://github.com/skjaere/ktor-nntp-client/actions/workflows/ci.yml/badge.svg)](https://github.com/skjaere/ktor-nntp-client/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/skjaere/ktor-nntp-client/graph/badge.svg)](https://codecov.io/gh/skjaere/ktor-nntp-client)
+
 A Kotlin NNTP (Network News Transfer Protocol) client library built on Ktor's asynchronous socket API. Implements all RFC 3977 commands plus streaming yEnc body decoding via [rapidyenc-kotlin-wrapper](https://github.com/skjaere/rapidyenc-kotlin-wrapper).
 
 ## Features
