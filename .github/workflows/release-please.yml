@@ -3,11 +3,11 @@ name: Release Please
 on:
   push:
     branches:
-      - release
+      - main
 
 jobs:
   release:
-    uses: OWNER/shared-workflows/.github/workflows/reusable-release-please.yml@main
+    uses: skjaere/debridav-ci/.github/workflows/reusable-release-please.yml@main
     permissions:
       contents: write
       pull-requests: write
