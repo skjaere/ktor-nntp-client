@@ -9,14 +9,14 @@ A Kotlin NNTP (Network News Transfer Protocol) client library built on Ktor's as
 ## Features
 
 - Full RFC 3977 NNTP command support
-- Streaming yEnc body decoding with `ByteReadChannel`
+- Connection pool with automatic reconnection and structured concurrency
+- Flow-based streaming yEnc body decoding
 - Lightweight yEnc header retrieval without downloading the full body
 - SIMD-accelerated yEnc decoding via rapidyenc native library
 - CRC32 validation for yEnc articles
-- Automatic reconnection on partial body read cancellation
 - Coroutine-based async I/O with backpressure
-- Thread-safe for concurrent connections (one `NntpClient` per connection)
 - TLS support
+- Credential storage for automatic re-authentication on reconnect
 
 ## Requirements
 
@@ -40,7 +40,37 @@ dependencies {
 
 ## Usage
 
-### Basic Connection
+### Connection Pool (Recommended)
+
+`NntpClientPool` manages a pool of connections with automatic reconnection. This is the recommended way to use the library.
+
+```kotlin
+val selectorManager = SelectorManager(Dispatchers.IO)
+val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+val pool = NntpClientPool(
+    host = "news.example.com",
+    port = 119,
+    selectorManager = selectorManager,
+    username = "user",
+    password = "pass",
+    maxConnections = 5,
+    scope = scope
+)
+pool.connect()
+
+// All commands are delegated through the pool
+val group = pool.group("alt.binaries.test")
+println("Articles: ${group.count}, range: ${group.low}-${group.high}")
+
+pool.close()
+```
+
+After operations that consume partial data (like `bodyYencHeaders`), the pool automatically reconnects the underlying connection and re-authenticates before reusing it. Callers don't need to manage connection state.
+
+### Direct Connection
+
+For simple use cases, you can create a single `NntpClient` directly:
 
 ```kotlin
 val selectorManager = SelectorManager(Dispatchers.IO)
@@ -59,7 +89,7 @@ val client = NntpClient.connect("news.example.com", 563, selectorManager, useTls
 ### Group Selection
 
 ```kotlin
-val group = client.group("alt.binaries.test")
+val group = pool.group("alt.binaries.test")
 println("Articles: ${group.count}, range: ${group.low}-${group.high}")
 ```
 
@@ -67,38 +97,44 @@ println("Articles: ${group.count}, range: ${group.low}-${group.high}")
 
 ```kotlin
 // Full article (headers + body)
-val article = client.article("<message-id@host>")
+val article = pool.article("<message-id@host>")
 println(article.content.joinToString("\n"))
 
 // Headers only
-val head = client.head("<message-id@host>")
+val head = pool.head("<message-id@host>")
 
 // Body only (text)
-val body = client.body(12345L)
+val body = pool.body(12345L)
 
 // Check if article exists
-val stat = client.stat("<message-id@host>")
+val stat = pool.stat("<message-id@host>")
 println("Article ${stat.articleNumber}: ${stat.messageId}")
 ```
 
 ### yEnc Body Decoding (Streaming)
 
+`bodyYenc()` returns a `Flow<YencEvent>` that emits a `Headers` event followed by a `Body` event containing a `ByteReadChannel` for streaming the decoded data:
+
 ```kotlin
-val result = client.bodyYenc("<yenc-message-id@host>")
+pool.bodyYenc("<yenc-message-id@host>").collect { event ->
+    when (event) {
+        is YencEvent.Headers -> {
+            println("Filename: ${event.yencHeaders.name}")
+            println("Size: ${event.yencHeaders.size}")
+        }
+        is YencEvent.Body -> {
+            // Stream decoded binary data
+            val decoded = event.data.toByteArray()
 
-// Access yEnc headers
-println("Filename: ${result.yencHeaders.name}")
-println("Size: ${result.yencHeaders.size}")
-
-// Stream decoded binary data
-val decoded = result.data.toByteArray()
-
-// Or process incrementally
-val buffer = ByteArray(8192)
-while (!result.data.isClosedForRead) {
-    val read = result.data.readAvailable(buffer)
-    if (read > 0) {
-        // Process buffer[0..read]
+            // Or process incrementally
+            val buffer = ByteArray(8192)
+            while (!event.data.isClosedForRead) {
+                val read = event.data.readAvailable(buffer)
+                if (read > 0) {
+                    // Process buffer[0..read]
+                }
+            }
+        }
     }
 }
 ```
@@ -108,7 +144,7 @@ while (!result.data.isClosedForRead) {
 Retrieve just the yEnc headers (filename, size, part info) from an article body without downloading or decoding the full content. The connection automatically reconnects in the background after the headers are read.
 
 ```kotlin
-val headers = client.bodyYencHeaders("<yenc-message-id@host>")
+val headers = pool.bodyYencHeaders("<yenc-message-id@host>")
 
 println("Filename: ${headers.name}")
 println("Size: ${headers.size}")
@@ -120,23 +156,34 @@ if (headers.part != null) {
     println("Byte range: ${headers.partBegin}-${headers.partEnd}")
 }
 
-// The connection is still usable — subsequent commands work after the background reconnect
-val nextHeaders = client.bodyYencHeaders("<another-message-id@host>")
+// Subsequent commands work immediately — the pool handles reconnection transparently
+val nextHeaders = pool.bodyYencHeaders("<another-message-id@host>")
 ```
 
 ### Concurrent Downloads
 
+With the connection pool, concurrent downloads are handled automatically:
+
 ```kotlin
-val selectorManager = SelectorManager(Dispatchers.IO)
-val clients = (1..10).map {
-    NntpClient.connect("news.example.com", 119, selectorManager)
-}
+val pool = NntpClientPool(
+    host = "news.example.com",
+    port = 119,
+    selectorManager = selectorManager,
+    maxConnections = 10,
+    scope = scope
+)
+pool.connect()
 
 coroutineScope {
-    messageIds.zip(clients).map { (msgId, client) ->
+    messageIds.map { msgId ->
         async {
-            val result = client.bodyYenc(msgId)
-            result.data.toByteArray()
+            var decoded: ByteArray? = null
+            pool.bodyYenc(msgId).collect { event ->
+                if (event is YencEvent.Body) {
+                    decoded = event.data.toByteArray()
+                }
+            }
+            decoded!!
         }
     }.awaitAll()
 }
@@ -145,6 +192,8 @@ coroutineScope {
 ### Other Commands
 
 ```kotlin
+pool.close()
+// Or with a direct client:
 client.capabilities()
 client.modeReader()
 client.help()
@@ -156,6 +205,21 @@ client.close()
 ```
 
 ## API Reference
+
+### NntpClientPool
+
+| Method | Description |
+|--------|-------------|
+| `connect()` | Initialize pool connections |
+| `withClient(block)` | Borrow a client, execute block, return client to pool |
+| `bodyYenc(messageId/number)` | Stream yEnc decoded body as `Flow<YencEvent>` |
+| `bodyYencHeaders(messageId/number)` | Retrieve yEnc headers only |
+| `group(name)` | Select newsgroup |
+| `article(messageId/number)` | Retrieve full article |
+| `head(messageId/number)` | Retrieve headers |
+| `body(messageId/number)` | Retrieve body (text) |
+| `stat(messageId/number)` | Check article exists |
+| `close()` | Close all connections |
 
 ### NntpClient
 
@@ -170,7 +234,7 @@ client.close()
 | `article(messageId/number)` | Retrieve full article |
 | `head(messageId/number)` | Retrieve headers |
 | `body(messageId/number)` | Retrieve body (text) |
-| `bodyYenc(messageId/number)` | Retrieve and decode yEnc body |
+| `bodyYenc(messageId/number)` | Stream yEnc decoded body as `Flow<YencEvent>` |
 | `bodyYencHeaders(messageId/number)` | Retrieve yEnc headers only |
 | `stat(messageId/number)` | Check article exists |
 | `next()` / `last()` | Navigate articles |
@@ -189,10 +253,11 @@ client.close()
 
 ### Thread Safety
 
+- `NntpClientPool` is safe for concurrent use from multiple coroutines
+- The pool uses `supervisorScope` to isolate failures and `NonCancellable` to ensure connections are always returned
+- After `bodyYencHeaders()` or a cancelled `bodyYenc()`, the connection automatically reconnects in the background and re-authenticates if credentials were provided
 - Each `NntpClient` instance is safe for sequential use from any coroutine
-- Multiple `NntpClient` instances can operate concurrently (separate connections)
 - A single `SelectorManager` can be shared across all connections
-- If a `bodyYenc()` consumer cancels mid-read, or after `bodyYencHeaders()` returns, the connection automatically reconnects in the background
 
 ## Building
 

@@ -41,12 +41,10 @@ data class ListGroupResponse(
     val articleNumbers: List<Long>
 )
 
-data class YencBodyResult(
-    val code: Int,
-    val message: String,
-    val yencHeaders: YencHeaders,
-    val data: ByteReadChannel
-)
+sealed interface YencEvent {
+    data class Headers(val yencHeaders: YencHeaders) : YencEvent
+    data class Body(val data: ByteReadChannel) : YencEvent
+}
 
 internal fun parseResponseLine(line: String): NntpResponse {
     if (line.length < 3) {

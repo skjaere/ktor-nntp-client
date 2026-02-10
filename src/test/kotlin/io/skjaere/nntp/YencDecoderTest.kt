@@ -4,15 +4,16 @@ import io.ktor.network.selector.*
 import io.ktor.utils.io.*
 import io.skjaere.yenc.RapidYenc
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import java.io.PrintWriter
 import java.net.ServerSocket
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 
 class YencDecoderTest {
 
@@ -56,11 +57,9 @@ class YencDecoderTest {
                 out.write("200 welcome\r\n".toByteArray())
                 out.flush()
 
-                // Read the BODY command
                 val reader = socket.getInputStream().bufferedReader()
                 reader.readLine()
 
-                // Send response
                 out.write("222 body follows\r\n".toByteArray())
                 out.write(buildYencArticle(originalData, "test.txt"))
                 out.flush()
@@ -73,13 +72,20 @@ class YencDecoderTest {
         val response = connection.commandRaw("BODY <test@msg>")
         assertEquals(222, response.code)
 
-        val decoder = YencDecoder(this)
-        val result = decoder.decode(connection, response)
+        var headers: YencHeaders? = null
+        var decoded: ByteArray? = null
+        channelFlow {
+            with(YencDecoder()) { decode(connection, response) }
+        }.collect { event ->
+            when (event) {
+                is YencEvent.Headers -> headers = event.yencHeaders
+                is YencEvent.Body -> decoded = event.data.toByteArray()
+            }
+        }
 
-        assertEquals("test.txt", result.yencHeaders.name)
-        assertEquals(originalData.size.toLong(), result.yencHeaders.size)
-
-        val decoded = result.data.toByteArray()
+        assertNotNull(headers)
+        assertEquals("test.txt", headers!!.name)
+        assertEquals(originalData.size.toLong(), headers!!.size)
         assertContentEquals(originalData, decoded)
     }
 
@@ -121,22 +127,28 @@ class YencDecoderTest {
         )
         val response = connection.commandRaw("BODY <part1@msg>")
 
-        val decoder = YencDecoder(this)
-        val result = decoder.decode(connection, response)
+        var headers: YencHeaders? = null
+        var decoded: ByteArray? = null
+        channelFlow {
+            with(YencDecoder()) { decode(connection, response) }
+        }.collect { event ->
+            when (event) {
+                is YencEvent.Headers -> headers = event.yencHeaders
+                is YencEvent.Body -> decoded = event.data.toByteArray()
+            }
+        }
 
-        assertEquals("archive.rar", result.yencHeaders.name)
-        assertEquals(1, result.yencHeaders.part)
-        assertEquals(3, result.yencHeaders.total)
-        assertEquals(1L, result.yencHeaders.partBegin)
-        assertEquals(1000L, result.yencHeaders.partEnd)
-
-        val decoded = result.data.toByteArray()
+        assertNotNull(headers)
+        assertEquals("archive.rar", headers!!.name)
+        assertEquals(1, headers!!.part)
+        assertEquals(3, headers!!.total)
+        assertEquals(1L, headers!!.partBegin)
+        assertEquals(1000L, headers!!.partEnd)
         assertContentEquals(originalData, decoded)
     }
 
     @Test
     fun `decode large yenc body across multiple chunks`() = runTest {
-        // Use data larger than the 16KB buffer to test multi-chunk reading
         val originalData = ByteArray(50000) { (it % 256).toByte() }
 
         launch(Dispatchers.IO) {
@@ -160,12 +172,18 @@ class YencDecoderTest {
         )
         val response = connection.commandRaw("BODY <large@msg>")
 
-        val decoder = YencDecoder(this)
-        val result = decoder.decode(connection, response)
+        var headers: YencHeaders? = null
+        var decoded: ByteArray? = null
+        channelFlow {
+            with(YencDecoder()) { decode(connection, response) }
+        }.collect { event ->
+            when (event) {
+                is YencEvent.Headers -> headers = event.yencHeaders
+                is YencEvent.Body -> decoded = event.data.toByteArray()
+            }
+        }
 
-        assertEquals(50000L, result.yencHeaders.size)
-
-        val decoded = result.data.toByteArray()
+        assertEquals(50000L, headers!!.size)
         assertContentEquals(originalData, decoded)
     }
 }

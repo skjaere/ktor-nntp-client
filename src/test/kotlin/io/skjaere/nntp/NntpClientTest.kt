@@ -254,19 +254,24 @@ class NntpClientTest {
         }
 
         val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
-        val result = client.bodyYenc("<yenc@msg>")
 
-        assertEquals("yenctest.bin", result.yencHeaders.name)
-        assertEquals(originalData.size.toLong(), result.yencHeaders.size)
+        var headers: YencHeaders? = null
+        var decoded: ByteArray? = null
+        client.bodyYenc("<yenc@msg>").collect { event ->
+            when (event) {
+                is YencEvent.Headers -> headers = event.yencHeaders
+                is YencEvent.Body -> decoded = event.data.toByteArray()
+            }
+        }
 
-        val decoded = result.data.toByteArray()
+        assertEquals("yenctest.bin", headers!!.name)
+        assertEquals(originalData.size.toLong(), headers!!.size)
         assertContentEquals(originalData, decoded)
         client.close()
     }
 
     @Test
     fun `bodyYenc with cancellation triggers reconnect`() = runBlocking {
-        // Send partial yenc data so writer is still blocking when we cancel
         val partialData = ByteArray(1000) { (it % 256).toByte() }
         val partialEncoded = RapidYenc.encode(partialData)
 
@@ -287,20 +292,16 @@ class NntpClientTest {
                                 out.flush()
 
                                 if (connNum == 1) {
-                                    // First connection: send headers + partial data, then STOP
-                                    // (don't send =yend or .\r\n so writer blocks waiting for more)
                                     reader.readLine()
                                     out.write("222 body follows\r\n".toByteArray())
                                     out.write("=ybegin line=128 size=99999 name=large.bin\r\n".toByteArray())
                                     out.write(partialEncoded)
                                     out.flush()
-                                    // Block until client disconnects
                                     try {
                                         Thread.sleep(30000)
                                     } catch (_: Exception) {
                                     }
                                 } else {
-                                    // Second connection (after reconnect): serve GROUP
                                     try {
                                         val cmd = reader.readLine()
                                         if (cmd != null && cmd.startsWith("GROUP")) {
@@ -321,21 +322,21 @@ class NntpClientTest {
 
             val client = NntpClient.connect("localhost", multiServerSocket.localPort, selectorManager)
 
-            // Start bodyYenc - writer will block after reading partial data
-            val result = client.bodyYenc("<large@msg>")
-
-            // Read some decoded bytes
-            val buf = ByteArray(100)
-            result.data.readAvailable(buf)
-
-            // Cancel the channel - writer coroutine will be cancelled
-            // and scheduleReconnect() should be called in the finally block
-            result.data.cancel()
+            // Collect the flow; cancel the body channel to trigger writer cancellation
+            client.bodyYenc("<large@msg>").collect { event ->
+                when (event) {
+                    is YencEvent.Headers -> { /* continue */ }
+                    is YencEvent.Body -> {
+                        val buf = ByteArray(100)
+                        event.data.readAvailable(buf)
+                        event.data.cancel()
+                    }
+                }
+            }
 
             // Wait for reconnection (real I/O time)
             delay(2000)
 
-            // Now try a command - should work after reconnection
             val groupResponse = client.group("test.group")
             assertEquals(211, groupResponse.code)
             assertEquals("test.group", groupResponse.name)
@@ -381,12 +382,16 @@ class NntpClientTest {
                 NntpClient.connect("localhost", server.localPort, selectorManager)
             }
 
-            // All three connections decode concurrently
             val results = coroutineScope {
                 clients.map { client ->
                     async {
-                        val result = client.bodyYenc("<concurrent@msg>")
-                        result.data.toByteArray()
+                        var decoded: ByteArray? = null
+                        client.bodyYenc("<concurrent@msg>").collect { event ->
+                            if (event is YencEvent.Body) {
+                                decoded = event.data.toByteArray()
+                            }
+                        }
+                        decoded!!
                     }
                 }.map { it.await() }
             }

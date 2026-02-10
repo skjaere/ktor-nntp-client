@@ -23,6 +23,8 @@ class NntpConnection private constructor(
 
     internal val commandMutex = Mutex()
     private var reconnectJob: Job? = null
+    private var username: String? = null
+    private var password: String? = null
 
     companion object {
         suspend fun connect(
@@ -69,6 +71,11 @@ class NntpConnection private constructor(
         }
     }
 
+    internal fun setCredentials(username: String, password: String) {
+        this.username = username
+        this.password = password
+    }
+
     internal suspend fun ensureConnected() {
         reconnectJob?.join()
     }
@@ -86,6 +93,34 @@ class NntpConnection private constructor(
             socket = newSocket
             // Read and discard welcome message
             readChannel.readLine()
+
+            // Re-authenticate if credentials are stored
+            val user = username
+            val pass = password
+            if (user != null && pass != null) {
+                writeChannel.writeStringUtf8("AUTHINFO USER $user\r\n")
+                val userLine = readChannel.readLine()
+                    ?: throw NntpConnectionException("Connection closed during re-auth")
+                val userResponse = parseResponseLine(userLine)
+                if (userResponse.code == 381) {
+                    writeChannel.writeStringUtf8("AUTHINFO PASS $pass\r\n")
+                    val passLine = readChannel.readLine()
+                        ?: throw NntpConnectionException("Connection closed during re-auth")
+                    val passResponse = parseResponseLine(passLine)
+                    if (passResponse.code != 281) {
+                        throw NntpAuthenticationException(
+                            "Re-auth failed: ${passResponse.code} ${passResponse.message}",
+                            passResponse
+                        )
+                    }
+                } else if (userResponse.code != 281) {
+                    throw NntpAuthenticationException(
+                        "Re-auth failed: ${userResponse.code} ${userResponse.message}",
+                        userResponse
+                    )
+                }
+            }
+
             reconnectJob = null
         }
     }

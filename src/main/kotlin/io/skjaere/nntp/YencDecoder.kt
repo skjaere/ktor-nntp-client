@@ -4,64 +4,51 @@ import io.ktor.utils.io.*
 import io.skjaere.yenc.RapidYenc
 import io.skjaere.yenc.RapidYencDecoderEnd
 import io.skjaere.yenc.RapidYencDecoderState
-import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.ProducerScope
 import java.io.Closeable
 
-internal class YencDecoder(
-    private val scope: CoroutineScope
-) {
+internal class YencDecoder {
     companion object {
         private const val BUFFER_SIZE = 16384
     }
 
-    suspend fun decode(
+    suspend fun ProducerScope<YencEvent>.decode(
         connection: NntpConnection,
         response: NntpResponse
-    ): YencBodyResult {
-        // Read =ybegin line (ASCII-safe, so readLine is fine)
-        val ybeginLine = connection.readLine()
-        if (!ybeginLine.startsWith("=ybegin ")) {
-            connection.commandMutex.unlock()
-            throw YencDecodingException("Expected =ybegin line, got: $ybeginLine")
-        }
-
-        // Read next line as raw bytes to avoid UTF-8 corruption of yenc data
-        val nextLineBytes = connection.readRawLine()
-        val nextLineStr = String(nextLineBytes, Charsets.ISO_8859_1)
-
-        val ypartLine: String?
-        val firstDataBytes: ByteArray?
-
-        if (nextLineStr.startsWith("=ypart ")) {
-            ypartLine = nextLineStr
-            firstDataBytes = null
-        } else {
-            ypartLine = null
-            // This is the first line of encoded data - preserve raw bytes with CRLF
-            firstDataBytes = nextLineBytes + byteArrayOf('\r'.code.toByte(), '\n'.code.toByte())
-        }
-
-        val headers = YencHeaders.parse(ybeginLine, ypartLine)
-
-        val writerJob = ChannelWriterJob(scope, connection, firstDataBytes)
-
-        return YencBodyResult(
-            code = response.code,
-            message = response.message,
-            yencHeaders = headers,
-            data = writerJob.channel
-        )
-    }
-
-    private class ChannelWriterJob(
-        scope: CoroutineScope,
-        connection: NntpConnection,
-        firstDataBytes: ByteArray?
     ) {
-        val channel: ByteReadChannel
+        var mutexHandedToWriter = false
+        try {
+            // Skip blank lines before =ybegin (real NNTP servers send header/body separator)
+            var ybeginLine: String
+            while (true) {
+                ybeginLine = connection.readLine()
+                if (ybeginLine.startsWith("=ybegin ")) break
+                if (ybeginLine.isNotBlank()) {
+                    throw YencDecodingException("Expected =ybegin line, got: $ybeginLine")
+                }
+            }
 
-        init {
-            val writerJob = scope.writer(autoFlush = true) {
+            // Read next line as raw bytes to avoid UTF-8 corruption of yenc data
+            val nextLineBytes = connection.readRawLine()
+            val nextLineStr = String(nextLineBytes, Charsets.ISO_8859_1)
+
+            val ypartLine: String?
+            val firstDataBytes: ByteArray?
+
+            if (nextLineStr.startsWith("=ypart ")) {
+                ypartLine = nextLineStr
+                firstDataBytes = null
+            } else {
+                ypartLine = null
+                // This is the first line of encoded data - preserve raw bytes with CRLF
+                firstDataBytes = nextLineBytes + byteArrayOf('\r'.code.toByte(), '\n'.code.toByte())
+            }
+
+            val headers = YencHeaders.parse(ybeginLine, ypartLine)
+            send(YencEvent.Headers(headers))
+
+            // Launch writer as child of this ProducerScope (= channelFlow's scope)
+            val writerJob = writer(autoFlush = true) {
                 var completed = false
                 Closeable {
                     if (!completed) {
@@ -134,27 +121,44 @@ internal class YencDecoder(
                     }
                 }
             }
-            channel = writerJob.channel
-        }
 
-        private suspend fun drainUntilArticleEnd(
-            connection: NntpConnection,
-            alreadyRead: ByteArray
-        ) {
-            // Check if the article terminator is already in what we've read
-            val str = String(alreadyRead, Charsets.ISO_8859_1)
-            if (str.contains("\r\n.\r\n") || str.endsWith("\r\n.\r\n")) {
-                return
+            // Fallback cleanup: if the writer coroutine is cancelled before it starts,
+            // its Closeable.use block never executes. invokeOnCompletion runs even for
+            // jobs cancelled before starting, ensuring the mutex is always released.
+            writerJob.job.invokeOnCompletion { cause ->
+                if (cause != null && connection.commandMutex.isLocked) {
+                    connection.scheduleReconnect()
+                    connection.commandMutex.unlock()
+                }
             }
-            // Continue reading until we find the article end marker
-            val buffer = ByteArray(BUFFER_SIZE)
-            val accumulator = StringBuilder(str)
-            while (true) {
-                val bytesRead = connection.rawReadChannel.readAvailable(buffer)
-                if (bytesRead == -1) break
-                accumulator.append(String(buffer, 0, bytesRead, Charsets.ISO_8859_1))
-                if (accumulator.contains("\r\n.\r\n")) break
+
+            mutexHandedToWriter = true
+            send(YencEvent.Body(writerJob.channel))
+        } finally {
+            if (!mutexHandedToWriter) {
+                connection.scheduleReconnect()
+                connection.commandMutex.unlock()
             }
+        }
+    }
+
+    private suspend fun drainUntilArticleEnd(
+        connection: NntpConnection,
+        alreadyRead: ByteArray
+    ) {
+        // Check if the article terminator is already in what we've read
+        val str = String(alreadyRead, Charsets.ISO_8859_1)
+        if (str.contains("\r\n.\r\n") || str.endsWith("\r\n.\r\n")) {
+            return
+        }
+        // Continue reading until we find the article end marker
+        val buffer = ByteArray(BUFFER_SIZE)
+        val accumulator = StringBuilder(str)
+        while (true) {
+            val bytesRead = connection.rawReadChannel.readAvailable(buffer)
+            if (bytesRead == -1) break
+            accumulator.append(String(buffer, 0, bytesRead, Charsets.ISO_8859_1))
+            if (accumulator.contains("\r\n.\r\n")) break
         }
     }
 }
