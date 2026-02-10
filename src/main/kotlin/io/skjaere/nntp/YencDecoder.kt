@@ -5,6 +5,7 @@ import io.skjaere.yenc.RapidYenc
 import io.skjaere.yenc.RapidYencDecoderEnd
 import io.skjaere.yenc.RapidYencDecoderState
 import kotlinx.coroutines.CoroutineScope
+import java.io.Closeable
 
 internal class YencDecoder(
     private val scope: CoroutineScope
@@ -62,10 +63,15 @@ internal class YencDecoder(
         init {
             val writerJob = scope.writer(autoFlush = true) {
                 var completed = false
-                try {
+                Closeable {
+                    if (!completed) {
+                        connection.scheduleReconnect()
+                    }
+                    connection.commandMutex.unlock()
+                }.use {
                     val buffer = ByteArray(BUFFER_SIZE)
                     var decoderState = RapidYencDecoderState.CRLF
-                    var crc: UInt = 0u
+                    var crc = 0u
                     var pendingBytes: ByteArray? = firstDataBytes
 
                     while (true) {
@@ -126,11 +132,6 @@ internal class YencDecoder(
                             }
                         }
                     }
-                } finally {
-                    if (!completed) {
-                        connection.scheduleReconnect()
-                    }
-                    connection.commandMutex.unlock()
                 }
             }
             channel = writerJob.channel
