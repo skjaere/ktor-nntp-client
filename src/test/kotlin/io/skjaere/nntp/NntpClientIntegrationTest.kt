@@ -4,8 +4,9 @@ import io.ktor.network.selector.*
 import io.ktor.utils.io.*
 import io.skjaere.mocknntp.testcontainer.MockNntpServerContainer
 import io.skjaere.yenc.RapidYenc
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -26,16 +27,32 @@ class NntpClientIntegrationTest {
     }
 
     private lateinit var selectorManager: SelectorManager
+    private lateinit var poolScope: CoroutineScope
 
     @BeforeEach
     fun setUp() = runBlocking {
         selectorManager = SelectorManager(Dispatchers.IO)
+        poolScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         mockServer.client.clearExpectations()
     }
 
     @AfterEach
     fun tearDown() {
         selectorManager.close()
+    }
+
+    private suspend fun createPool(maxConnections: Int = 1): NntpClientPool {
+        val pool = NntpClientPool(
+            host = mockServer.nntpHost,
+            port = mockServer.nntpPort,
+            selectorManager = selectorManager,
+            maxConnections = maxConnections,
+            scope = poolScope,
+            /*username = "username",
+            password = "password"*/
+        )
+        pool.connect()
+        return pool
     }
 
     @Test
@@ -47,9 +64,9 @@ class NntpClientIntegrationTest {
             filename = "testfile.bin"
         )
 
-        val client = NntpClient.connect(mockServer.nntpHost, mockServer.nntpPort, selectorManager)
-        client.use { client ->
-            val headers = client.bodyYencHeaders("<single-part@test>")
+        val pool = createPool()
+        pool.use {
+            val headers = pool.bodyYencHeaders("<single-part@test>")
 
             assertEquals("testfile.bin", headers.name)
             assertEquals(originalData.size.toLong(), headers.size)
@@ -79,9 +96,9 @@ class NntpClientIntegrationTest {
 
         mockServer.client.addRawYencBodyExpectation("<multipart@test>", rawYenc)
 
-        val client = NntpClient.connect(mockServer.nntpHost, mockServer.nntpPort, selectorManager)
-        client.use { client ->
-            val headers = client.bodyYencHeaders("<multipart@test>")
+        val pool = createPool()
+        pool.use {
+            val headers = pool.bodyYencHeaders("<multipart@test>")
 
             assertEquals("archive.rar", headers.name)
             assertEquals(5000L, headers.size)
@@ -94,7 +111,7 @@ class NntpClientIntegrationTest {
     }
 
     @Test
-    fun `bodyYencHeaders allows subsequent commands after reconnect`() = runBlocking {
+    fun `bodyYencHeaders allows subsequent commands without manual delay`() = runBlocking {
         val data1 = "First article data".toByteArray()
         val data2 = "Second article data".toByteArray()
         mockServer.client.addYencBodyExpectation(
@@ -108,15 +125,13 @@ class NntpClientIntegrationTest {
             filename = "second.bin"
         )
 
-        val client = NntpClient.connect(mockServer.nntpHost, mockServer.nntpPort, selectorManager)
-        client.use { client ->
-            val headers1 = client.bodyYencHeaders("<article-1@test>")
+        val pool = createPool()
+        pool.use {
+            val headers1 = pool.bodyYencHeaders("<article-1@test>")
             assertEquals("first.bin", headers1.name)
 
-            // Wait for background reconnect to complete
-            delay(2000)
-
-            val headers2 = client.bodyYencHeaders("<article-2@test>")
+            // No delay needed — pool waits for reconnection before reusing the client
+            val headers2 = pool.bodyYencHeaders("<article-2@test>")
             assertEquals("second.bin", headers2.name)
             assertEquals(data2.size.toLong(), headers2.size)
         }
@@ -137,20 +152,22 @@ class NntpClientIntegrationTest {
             filename = "download.bin"
         )
 
-        val client = NntpClient.connect(mockServer.nntpHost, mockServer.nntpPort, selectorManager)
-        client.use { client ->
-            // First: just read headers
-            val headers = client.bodyYencHeaders("<headers-only@test>")
+        val pool = createPool()
+        pool.use {
+            // First: just read headers (triggers reconnect internally)
+            val headers = it.bodyYencHeaders("<headers-only@test>")
             assertEquals("headers.bin", headers.name)
 
-            // Wait for background reconnect
-            delay(2000)
-
-            // Then: full yenc download on a different article
-            val result = client.bodyYenc("<full-download@test>")
-            assertEquals("download.bin", result.yencHeaders.name)
-
-            val decoded = result.data.toByteArray()
+            // No delay needed — pool handles reconnection transparently
+            var yencHeaders: YencHeaders? = null
+            var decoded: ByteArray? = null
+            it.bodyYenc("<full-download@test>").collect { event ->
+                when (event) {
+                    is YencEvent.Headers -> yencHeaders = event.yencHeaders
+                    is YencEvent.Body -> decoded = event.data.toByteArray()
+                }
+            }
+            assertEquals("download.bin", yencHeaders!!.name)
             assertContentEquals(downloadData, decoded)
         }
     }

@@ -4,6 +4,10 @@ import io.ktor.network.selector.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.filterIsInstance
+import kotlinx.coroutines.flow.first
 import java.io.Closeable
 
 class NntpClient(
@@ -54,7 +58,10 @@ class NntpClient(
 
     suspend fun authenticate(username: String, password: String): NntpResponse {
         val userResponse = connection.command(NntpCommand.authinfoUser(username))
-        if (userResponse.code == 281) return userResponse
+        if (userResponse.code == 281) {
+            connection.setCredentials(username, password)
+            return userResponse
+        }
         if (userResponse.code != 381) {
             throw NntpAuthenticationException(
                 "AUTHINFO USER failed: ${userResponse.code} ${userResponse.message}",
@@ -68,6 +75,7 @@ class NntpClient(
                 passResponse
             )
         }
+        connection.setCredentials(username, password)
         return passResponse
     }
 
@@ -119,23 +127,19 @@ class NntpClient(
 
     // --- Yenc body ---
 
-    suspend fun bodyYenc(messageId: String): YencBodyResult {
-        return fetchBodyYenc(NntpCommand.body(messageId))
-    }
+    fun bodyYenc(messageId: String): Flow<YencEvent> =
+        fetchBodyYenc(NntpCommand.body(messageId))
 
-    suspend fun bodyYenc(number: Long): YencBodyResult {
-        return fetchBodyYenc(NntpCommand.body(number))
-    }
+    fun bodyYenc(number: Long): Flow<YencEvent> =
+        fetchBodyYenc(NntpCommand.body(number))
 
     // --- Yenc headers only ---
 
-    suspend fun bodyYencHeaders(messageId: String): YencHeaders {
-        return fetchBodyYencHeaders(NntpCommand.body(messageId))
-    }
+    suspend fun bodyYencHeaders(messageId: String): YencHeaders =
+        bodyYenc(messageId).filterIsInstance<YencEvent.Headers>().first().yencHeaders
 
-    suspend fun bodyYencHeaders(number: Long): YencHeaders {
-        return fetchBodyYencHeaders(NntpCommand.body(number))
-    }
+    suspend fun bodyYencHeaders(number: Long): YencHeaders =
+        bodyYenc(number).filterIsInstance<YencEvent.Headers>().first().yencHeaders
 
     // --- Group selection ---
 
@@ -307,7 +311,7 @@ class NntpClient(
         return StatResponse(code, response.message, number, messageId)
     }
 
-    private suspend fun fetchBodyYenc(cmd: String): YencBodyResult {
+    private fun fetchBodyYenc(cmd: String): Flow<YencEvent> = channelFlow {
         val response = connection.commandRaw(cmd)
         if (response.code != 222) {
             connection.commandMutex.unlock()
@@ -316,33 +320,6 @@ class NntpClient(
                 response
             )
         }
-        val decoder = YencDecoder(scope)
-        return decoder.decode(connection, response)
-    }
-
-    private suspend fun fetchBodyYencHeaders(cmd: String): YencHeaders {
-        val response = connection.commandRaw(cmd)
-        if (response.code != 222) {
-            connection.commandMutex.unlock()
-            throw NntpProtocolException(
-                "BODY failed: ${response.code} ${response.message}",
-                response
-            )
-        }
-        return Closeable {
-            connection.scheduleReconnect()
-            connection.commandMutex.unlock()
-        }.use {
-            val ybeginLine = connection.readLine()
-            if (!ybeginLine.startsWith("=ybegin ")) {
-                throw YencDecodingException("Expected =ybegin line, got: $ybeginLine")
-            }
-
-            val nextLineBytes = connection.readRawLine()
-            val nextLineStr = String(nextLineBytes, Charsets.ISO_8859_1)
-            val ypartLine = if (nextLineStr.startsWith("=ypart ")) nextLineStr else null
-
-            YencHeaders.parse(ybeginLine, ypartLine)
-        }
+        with(YencDecoder()) { decode(connection, response) }
     }
 }
