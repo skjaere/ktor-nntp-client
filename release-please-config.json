@@ -5,8 +5,7 @@
   "packages": {
     ".": {
       "extra-files": [
-        { "type": "generic", "path": "gradle.properties" },
-        { "type": "generic", "path": "build.gradle.kts" }
+        { "type": "generic", "path": "gradle.properties" }
       ]
     }
   }

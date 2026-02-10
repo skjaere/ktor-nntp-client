@@ -1,5 +1,4 @@
 group = "io.skjaere"
-version = "0.1.0" // x-release-please-version
 
 plugins {
     `java-library`
@@ -9,7 +8,6 @@ plugins {
 }
 
 repositories {
-    mavenLocal()
     mavenCentral()
     maven("https://jitpack.io")
 }

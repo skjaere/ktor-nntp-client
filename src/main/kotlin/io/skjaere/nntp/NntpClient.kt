@@ -329,7 +329,10 @@ class NntpClient(
                 response
             )
         }
-        try {
+        return Closeable {
+            connection.scheduleReconnect()
+            connection.commandMutex.unlock()
+        }.use {
             val ybeginLine = connection.readLine()
             if (!ybeginLine.startsWith("=ybegin ")) {
                 throw YencDecodingException("Expected =ybegin line, got: $ybeginLine")
@@ -339,10 +342,7 @@ class NntpClient(
             val nextLineStr = String(nextLineBytes, Charsets.ISO_8859_1)
             val ypartLine = if (nextLineStr.startsWith("=ypart ")) nextLineStr else null
 
-            return YencHeaders.parse(ybeginLine, ypartLine)
-        } finally {
-            connection.scheduleReconnect()
-            connection.commandMutex.unlock()
+            YencHeaders.parse(ybeginLine, ypartLine)
         }
     }
 }
