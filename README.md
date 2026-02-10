@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/skjaere/ktor-nntp-client/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/skjaere/ktor-nntp-client/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/skjaere/ktor-nntp-client/branch/main/graph/badge.svg)](https://codecov.io/gh/skjaere/ktor-nntp-client)
+[![](https://jitpack.io/v/skjaere/ktor-nntp-client.svg)](https://jitpack.io/#skjaere/ktor-nntp-client)
 
 A Kotlin NNTP (Network News Transfer Protocol) client library built on Ktor's asynchronous socket API. Implements all RFC 3977 commands plus streaming yEnc body decoding via [rapidyenc-kotlin-wrapper](https://github.com/skjaere/rapidyenc-kotlin-wrapper).
 
@@ -29,17 +30,12 @@ Add to your `build.gradle.kts`:
 ```kotlin
 repositories {
     mavenCentral()
-    mavenLocal()
+    maven("https://jitpack.io")
 }
 
 dependencies {
-    implementation("io.skjaere:ktor-nntp-client:0.1.0")
+    implementation("com.github.skjaere:ktor-nntp-client:v0.1.0")
 }
-```
-
-Publish locally first:
-```bash
-./gradlew publishToMavenLocal
 ```
 
 ## Usage
