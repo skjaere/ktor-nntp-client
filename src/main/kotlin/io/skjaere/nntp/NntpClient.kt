@@ -320,6 +320,6 @@ class NntpClient(
                 response
             )
         }
-        with(YencDecoder()) { decode(connection, response) }
+        with(YencDecoder) { decode(connection) }
     }
 }

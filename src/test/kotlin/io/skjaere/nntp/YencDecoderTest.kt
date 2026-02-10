@@ -75,7 +75,7 @@ class YencDecoderTest {
         var headers: YencHeaders? = null
         var decoded: ByteArray? = null
         channelFlow {
-            with(YencDecoder()) { decode(connection, response) }
+            with(YencDecoder) { decode(connection) }
         }.collect { event ->
             when (event) {
                 is YencEvent.Headers -> headers = event.yencHeaders
@@ -130,7 +130,7 @@ class YencDecoderTest {
         var headers: YencHeaders? = null
         var decoded: ByteArray? = null
         channelFlow {
-            with(YencDecoder()) { decode(connection, response) }
+            with(YencDecoder) { decode(connection) }
         }.collect { event ->
             when (event) {
                 is YencEvent.Headers -> headers = event.yencHeaders
@@ -175,7 +175,7 @@ class YencDecoderTest {
         var headers: YencHeaders? = null
         var decoded: ByteArray? = null
         channelFlow {
-            with(YencDecoder()) { decode(connection, response) }
+            with(YencDecoder) { decode(connection) }
         }.collect { event ->
             when (event) {
                 is YencEvent.Headers -> headers = event.yencHeaders
