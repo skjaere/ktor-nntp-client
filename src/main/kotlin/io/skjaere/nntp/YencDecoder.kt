@@ -7,14 +7,11 @@ import io.skjaere.yenc.RapidYencDecoderState
 import kotlinx.coroutines.channels.ProducerScope
 import java.io.Closeable
 
-internal class YencDecoder {
-    companion object {
-        private const val BUFFER_SIZE = 16384
-    }
+internal object YencDecoder {
+    private const val BUFFER_SIZE = 16384
 
     suspend fun ProducerScope<YencEvent>.decode(
-        connection: NntpConnection,
-        response: NntpResponse
+        connection: NntpConnection
     ) {
         var mutexHandedToWriter = false
         try {
@@ -48,79 +45,7 @@ internal class YencDecoder {
             send(YencEvent.Headers(headers))
 
             // Launch writer as child of this ProducerScope (= channelFlow's scope)
-            val writerJob = writer(autoFlush = true) {
-                var completed = false
-                Closeable {
-                    if (!completed) {
-                        connection.scheduleReconnect()
-                    }
-                    connection.commandMutex.unlock()
-                }.use {
-                    val buffer = ByteArray(BUFFER_SIZE)
-                    var decoderState = RapidYencDecoderState.CRLF
-                    var crc = 0u
-                    var pendingBytes: ByteArray? = firstDataBytes
-
-                    while (true) {
-                        @Suppress("UNNECESSARY_NOT_NULL_ASSERTION")
-                        val rawChunk: ByteArray = if (pendingBytes != null) {
-                            val tmp = pendingBytes!!
-                            pendingBytes = null
-                            tmp
-                        } else {
-                            val bytesRead = connection.rawReadChannel.readAvailable(buffer)
-                            if (bytesRead == -1) break
-                            buffer.copyOf(bytesRead)
-                        }
-
-                        val result = RapidYenc.decodeIncremental(rawChunk, decoderState)
-
-                        if (result.data.isNotEmpty()) {
-                            channel.writeFully(result.data)
-                            crc = RapidYenc.crc32(result.data, initCrc = crc)
-                        }
-
-                        decoderState = result.state
-
-                        when (result.end) {
-                            RapidYencDecoderEnd.CONTROL -> {
-                                // Found =yend line - parse trailer for CRC validation
-                                val remaining = rawChunk.copyOfRange(
-                                    result.bytesConsumed.toInt(), rawChunk.size
-                                )
-                                val remainingStr = String(remaining, Charsets.ISO_8859_1)
-                                val yendLine = remainingStr.lines()
-                                    .firstOrNull { it.startsWith("=yend") }
-                                if (yendLine != null) {
-                                    val trailer = YencTrailer.parse(yendLine)
-                                    val expectedCrc = trailer.pcrc32 ?: trailer.crc32
-                                    if (expectedCrc != null && expectedCrc != crc) {
-                                        throw YencCrcMismatchException(
-                                            "CRC mismatch: expected ${expectedCrc.toString(16)}, got ${crc.toString(16)}",
-                                            expected = expectedCrc,
-                                            actual = crc
-                                        )
-                                    }
-                                }
-                                // Drain remaining bytes until NNTP article terminator
-                                drainUntilArticleEnd(connection, remaining)
-                                completed = true
-                                break
-                            }
-
-                            RapidYencDecoderEnd.ARTICLE -> {
-                                // Found \r\n.\r\n - article end
-                                completed = true
-                                break
-                            }
-
-                            RapidYencDecoderEnd.NONE -> {
-                                // Continue reading
-                            }
-                        }
-                    }
-                }
-            }
+            val writerJob = launchWriterJob(connection, firstDataBytes)
 
             // Fallback cleanup: if the writer coroutine is cancelled before it starts,
             // its Closeable.use block never executes. invokeOnCompletion runs even for
@@ -138,6 +63,83 @@ internal class YencDecoder {
             if (!mutexHandedToWriter) {
                 connection.scheduleReconnect()
                 connection.commandMutex.unlock()
+            }
+        }
+    }
+
+    private fun ProducerScope<YencEvent>.launchWriterJob(
+        connection: NntpConnection,
+        firstDataBytes: ByteArray?
+    ): WriterJob = writer(autoFlush = true) {
+        var completed = false
+        Closeable {
+            if (!completed) {
+                connection.scheduleReconnect()
+            }
+            connection.commandMutex.unlock()
+        }.use {
+            val buffer = ByteArray(BUFFER_SIZE)
+            var decoderState = RapidYencDecoderState.CRLF
+            var crc = 0u
+            var pendingBytes: ByteArray? = firstDataBytes
+
+            while (true) {
+                @Suppress("UNNECESSARY_NOT_NULL_ASSERTION")
+                val rawChunk: ByteArray = if (pendingBytes != null) {
+                    val tmp = pendingBytes!!
+                    pendingBytes = null
+                    tmp
+                } else {
+                    val bytesRead = connection.rawReadChannel.readAvailable(buffer)
+                    if (bytesRead == -1) break
+                    buffer.copyOf(bytesRead)
+                }
+
+                val result = RapidYenc.decodeIncremental(rawChunk, decoderState)
+
+                if (result.data.isNotEmpty()) {
+                    channel.writeFully(result.data)
+                    crc = RapidYenc.crc32(result.data, initCrc = crc)
+                }
+
+                decoderState = result.state
+
+                when (result.end) {
+                    RapidYencDecoderEnd.CONTROL -> {
+                        // Found =yend line - parse trailer for CRC validation
+                        val remaining = rawChunk.copyOfRange(
+                            result.bytesConsumed.toInt(), rawChunk.size
+                        )
+                        val remainingStr = String(remaining, Charsets.ISO_8859_1)
+                        val yendLine = remainingStr.lines()
+                            .firstOrNull { it.startsWith("=yend") }
+                        if (yendLine != null) {
+                            val trailer = YencTrailer.parse(yendLine)
+                            val expectedCrc = trailer.pcrc32 ?: trailer.crc32
+                            if (expectedCrc != null && expectedCrc != crc) {
+                                throw YencCrcMismatchException(
+                                    "CRC mismatch: expected ${expectedCrc.toString(16)}, got ${crc.toString(16)}",
+                                    expected = expectedCrc,
+                                    actual = crc
+                                )
+                            }
+                        }
+                        // Drain remaining bytes until NNTP article terminator
+                        drainUntilArticleEnd(connection, remaining)
+                        completed = true
+                        break
+                    }
+
+                    RapidYencDecoderEnd.ARTICLE -> {
+                        // Found \r\n.\r\n - article end
+                        completed = true
+                        break
+                    }
+
+                    RapidYencDecoderEnd.NONE -> {
+                        // Continue reading
+                    }
+                }
             }
         }
     }
