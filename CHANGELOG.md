@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.1](https://github.com/skjaere/ktor-nntp-client/compare/v0.1.0...v0.1.1) (2026-02-10)
+
+
+### Bug Fixes
+
+* cleaning up dirty connections, and using a connection pool for the public API ([079853b](https://github.com/skjaere/ktor-nntp-client/commit/079853b16b04ce52f0f6ad8363dea05ccf6a2e1e))
+* replacing usage of try/finally with .use{} ([34e96cc](https://github.com/skjaere/ktor-nntp-client/commit/34e96cce551f477623f7a148b5650736e2d09260))
+
 ## [0.1.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.0.1...v0.1.0) (2026-02-10)
 
 
