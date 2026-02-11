@@ -3,6 +3,7 @@ package io.skjaere.nntp
 import io.ktor.network.selector.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ClosedSendChannelException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import java.io.Closeable
@@ -39,7 +40,12 @@ class NntpClientPool(
         } finally {
             scope.launch(NonCancellable) {
                 client.connection.ensureConnected()
-                available.send(client)
+                try {
+                    available.send(client)
+                } catch (_: ClosedSendChannelException) {
+                    // Pool was closed while reconnecting — just close the client
+                    runCatching { client.close() }
+                }
             }
         }
     }
