@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.2](https://github.com/skjaere/ktor-nntp-client/compare/v0.1.1...v0.1.2) (2026-02-11)
+
+
+### Bug Fixes
+
+* adding error handling
+* refactoring
+
 ## [0.1.1](https://github.com/skjaere/ktor-nntp-client/compare/v0.1.0...v0.1.1) (2026-02-10)
 
 
