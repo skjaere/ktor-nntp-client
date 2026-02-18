@@ -57,26 +57,7 @@ class NntpClient(
     }
 
     suspend fun authenticate(username: String, password: String): NntpResponse {
-        val userResponse = connection.command(NntpCommand.authinfoUser(username))
-        if (userResponse.code == 281) {
-            connection.setCredentials(username, password)
-            return userResponse
-        }
-        if (userResponse.code != 381) {
-            throw NntpAuthenticationException(
-                "AUTHINFO USER failed: ${userResponse.code} ${userResponse.message}",
-                userResponse
-            )
-        }
-        val passResponse = connection.command(NntpCommand.authinfoPass(password))
-        if (passResponse.code != 281) {
-            throw NntpAuthenticationException(
-                "AUTHINFO PASS failed: ${passResponse.code} ${passResponse.message}",
-                passResponse
-            )
-        }
-        connection.setCredentials(username, password)
-        return passResponse
+        return connection.authenticate(username, password)
     }
 
     suspend fun quit(): NntpResponse {

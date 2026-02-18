@@ -71,10 +71,43 @@ class NntpConnection private constructor(
         }
     }
 
-    internal fun setCredentials(username: String, password: String) {
-        this.username = username
-        this.password = password
+    /**
+     * Perform the AUTHINFO USER/PASS handshake on the current channels.
+     * Must only be called when the caller already owns the command mutex
+     * or during reconnect (where no other command can run concurrently).
+     */
+    private suspend fun performAuth(user: String, pass: String): NntpResponse {
+        writeLine(NntpCommand.authinfoUser(user))
+        val userResponse = readResponse()
+        if (userResponse.code == 281) {
+            username = user
+            password = pass
+            return userResponse
+        }
+        if (userResponse.code != 381) {
+            throw NntpAuthenticationException(
+                "AUTHINFO USER failed: ${userResponse.code} ${userResponse.message}",
+                userResponse
+            )
+        }
+        writeLine(NntpCommand.authinfoPass(pass))
+        val passResponse = readResponse()
+        if (passResponse.code != 281) {
+            throw NntpAuthenticationException(
+                "AUTHINFO PASS failed: ${passResponse.code} ${passResponse.message}",
+                passResponse
+            )
+        }
+        username = user
+        password = pass
+        return passResponse
     }
+
+    internal suspend fun authenticate(username: String, password: String): NntpResponse =
+        commandMutex.withLock {
+            ensureConnected()
+            performAuth(username, password)
+        }
 
     internal suspend fun ensureConnected() {
         reconnectJob?.join()
@@ -98,27 +131,7 @@ class NntpConnection private constructor(
             val user = username
             val pass = password
             if (user != null && pass != null) {
-                writeChannel.writeStringUtf8("AUTHINFO USER $user\r\n")
-                val userLine = readChannel.readLine()
-                    ?: throw NntpConnectionException("Connection closed during re-auth")
-                val userResponse = parseResponseLine(userLine)
-                if (userResponse.code == 381) {
-                    writeChannel.writeStringUtf8("AUTHINFO PASS $pass\r\n")
-                    val passLine = readChannel.readLine()
-                        ?: throw NntpConnectionException("Connection closed during re-auth")
-                    val passResponse = parseResponseLine(passLine)
-                    if (passResponse.code != 281) {
-                        throw NntpAuthenticationException(
-                            "Re-auth failed: ${passResponse.code} ${passResponse.message}",
-                            passResponse
-                        )
-                    }
-                } else if (userResponse.code != 281) {
-                    throw NntpAuthenticationException(
-                        "Re-auth failed: ${userResponse.code} ${userResponse.message}",
-                        userResponse
-                    )
-                }
+                performAuth(user, pass)
             }
 
             reconnectJob = null
