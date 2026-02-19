@@ -11,6 +11,11 @@ class NntpProtocolException(
     response: NntpResponse? = null
 ) : NntpException(message, response)
 
+class ArticleNotFoundException(
+    message: String,
+    response: NntpResponse? = null
+) : NntpException(message, response)
+
 class NntpAuthenticationException(
     message: String,
     response: NntpResponse? = null

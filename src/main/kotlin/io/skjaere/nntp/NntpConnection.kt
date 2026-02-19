@@ -1,10 +1,21 @@
 package io.skjaere.nntp
 
-import io.ktor.network.selector.*
-import io.ktor.network.sockets.*
-import io.ktor.network.tls.*
-import io.ktor.utils.io.*
-import kotlinx.coroutines.*
+import io.ktor.network.selector.SelectorManager
+import io.ktor.network.sockets.Socket
+import io.ktor.network.sockets.aSocket
+import io.ktor.network.sockets.openReadChannel
+import io.ktor.network.sockets.openWriteChannel
+import io.ktor.network.tls.tls
+import io.ktor.utils.io.ByteReadChannel
+import io.ktor.utils.io.ByteWriteChannel
+import io.ktor.utils.io.readByte
+import io.ktor.utils.io.readLine
+import io.ktor.utils.io.writeStringUtf8
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.slf4j.LoggerFactory

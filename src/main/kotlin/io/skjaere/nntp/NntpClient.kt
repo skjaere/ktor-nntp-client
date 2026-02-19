@@ -271,6 +271,12 @@ class NntpClient(
     private suspend fun fetchArticle(cmd: String, expectedCode: Int): ArticleResponse {
         val (response, lines) = connection.commandMultiLine(cmd)
         if (response.code != expectedCode) {
+            if (response.code == 430) {
+                throw ArticleNotFoundException(
+                    "Article not found: ${response.code} ${response.message}",
+                    response
+                )
+            }
             throw NntpProtocolException(
                 "Command failed: ${response.code} ${response.message}",
                 response
@@ -305,6 +311,12 @@ class NntpClient(
         }
         if (response.code != 222) {
             connection.commandMutex.unlock()
+            if (response.code == 430) {
+                throw ArticleNotFoundException(
+                    "Article not found: ${response.code} ${response.message}",
+                    response
+                )
+            }
             throw NntpProtocolException(
                 "BODY failed: ${response.code} ${response.message}",
                 response
