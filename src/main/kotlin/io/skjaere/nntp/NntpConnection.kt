@@ -7,6 +7,7 @@ import io.ktor.utils.io.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import org.slf4j.LoggerFactory
 import java.io.Closeable
 
 class NntpConnection private constructor(
@@ -25,8 +26,10 @@ class NntpConnection private constructor(
     private var reconnectJob: Job? = null
     private var username: String? = null
     private var password: String? = null
+    private val logger = LoggerFactory.getLogger(NntpConnection::class.java)
 
     companion object {
+        private val log = LoggerFactory.getLogger(NntpConnection::class.java)
         suspend fun connect(
             host: String,
             port: Int,
@@ -62,6 +65,7 @@ class NntpConnection private constructor(
             selectorManager: SelectorManager,
             useTls: Boolean
         ): Socket {
+            log.info("openSocket called with host='{}', port={}, useTls={}", host, port, useTls)
             val rawSocket = aSocket(selectorManager).tcp().connect(host, port)
             return if (useTls) {
                 rawSocket.tls(coroutineContext = Dispatchers.IO)
@@ -114,12 +118,14 @@ class NntpConnection private constructor(
     }
 
     internal fun scheduleReconnect() {
+        logger.info("scheduleReconnect called, host='{}', port={}", host, port)
         try {
             socket.close()
         } catch (_: Exception) {
             // Ignore close errors on poisoned socket
         }
         reconnectJob = scope.launch {
+            logger.info("scheduleReconnect launching openSocket with host='{}', port={}", host, port)
             val newSocket = openSocket(host, port, selectorManager, useTls)
             readChannel = newSocket.openReadChannel()
             writeChannel = newSocket.openWriteChannel(autoFlush = true)

@@ -18,6 +18,7 @@ dependencies {
     api(libs.ktor.io)
     api(libs.rapidyenc)
     implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.slf4j.api)
 
     testImplementation(libs.kotlin.test)
     testImplementation(libs.junit.jupiter)
