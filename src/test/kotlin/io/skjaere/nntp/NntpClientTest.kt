@@ -439,4 +439,85 @@ class NntpClientTest {
         }
         client.close()
     }
+
+    @Test
+    fun `article throws ArticleNotFoundException on 430`() = runTest {
+        launchServer { reader, out ->
+            reader.readLine()
+            out.write("430 No Such Article Found\r\n".toByteArray())
+            out.flush()
+        }
+
+        val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
+        val ex = assertFailsWith<ArticleNotFoundException> {
+            client.article("<missing@host>")
+        }
+        assertEquals(430, ex.response?.code)
+        client.close()
+    }
+
+    @Test
+    fun `body throws ArticleNotFoundException on 430`() = runTest {
+        launchServer { reader, out ->
+            reader.readLine()
+            out.write("430 No Such Article Found\r\n".toByteArray())
+            out.flush()
+        }
+
+        val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
+        val ex = assertFailsWith<ArticleNotFoundException> {
+            client.body("<missing@host>")
+        }
+        assertEquals(430, ex.response?.code)
+        client.close()
+    }
+
+    @Test
+    fun `head throws ArticleNotFoundException on 430`() = runTest {
+        launchServer { reader, out ->
+            reader.readLine()
+            out.write("430 No Such Article Found\r\n".toByteArray())
+            out.flush()
+        }
+
+        val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
+        val ex = assertFailsWith<ArticleNotFoundException> {
+            client.head("<missing@host>")
+        }
+        assertEquals(430, ex.response?.code)
+        client.close()
+    }
+
+    @Test
+    fun `bodyYenc throws ArticleNotFoundException on 430`() = runTest {
+        launchServer { reader, out ->
+            reader.readLine()
+            out.write("430 No Such Article Found\r\n".toByteArray())
+            out.flush()
+        }
+
+        val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
+        val ex = assertFailsWith<ArticleNotFoundException> {
+            client.bodyYenc("<missing@host>").collect { }
+        }
+        assertEquals(430, ex.response?.code)
+        client.close()
+    }
+
+    @Test
+    fun `article throws NntpProtocolException on non-430 error`() = runTest {
+        launchServer { reader, out ->
+            reader.readLine()
+            out.write("423 No article with that number\r\n".toByteArray())
+            out.flush()
+        }
+
+        val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
+        val ex = assertFailsWith<NntpProtocolException> {
+            client.article(99999L)
+        }
+        assertEquals(423, ex.response?.code)
+        assertEquals("NntpProtocolException", ex::class.simpleName)
+        client.close()
+    }
 }
