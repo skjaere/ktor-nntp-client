@@ -38,12 +38,11 @@ class NntpClientPool(
                 block(client)
             }
         } finally {
-            scope.launch(NonCancellable) {
-                client.connection.ensureConnected()
+            withContext(NonCancellable) {
                 try {
                     available.send(client)
                 } catch (_: ClosedSendChannelException) {
-                    // Pool was closed while reconnecting — just close the client
+                    // Pool was closed while returning — just close the client
                     runCatching { client.close() }
                 }
             }

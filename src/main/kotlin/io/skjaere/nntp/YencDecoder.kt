@@ -8,7 +8,7 @@ import kotlinx.coroutines.channels.ProducerScope
 import java.io.Closeable
 
 internal object YencDecoder {
-    private const val BUFFER_SIZE = 16384
+    private const val BUFFER_SIZE = 131072
 
     suspend fun ProducerScope<YencEvent>.decode(
         connection: NntpConnection
