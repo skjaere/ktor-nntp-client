@@ -6,6 +6,7 @@ import io.skjaere.yenc.RapidYencDecoderEnd
 import io.skjaere.yenc.RapidYencDecoderState
 import kotlinx.coroutines.channels.ProducerScope
 import java.io.Closeable
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal object YencDecoder {
     private const val BUFFER_SIZE = 131072
@@ -45,13 +46,14 @@ internal object YencDecoder {
             send(YencEvent.Headers(headers))
 
             // Launch writer as child of this ProducerScope (= channelFlow's scope)
-            val writerJob = launchWriterJob(connection, firstDataBytes)
+            // The flag tracks whether the writer's Closeable.use cleanup already ran.
+            // invokeOnCompletion is a fallback for when the writer is cancelled before
+            // its lambda starts (so Closeable.use never executes).
+            val writerCleanedUp = AtomicBoolean(false)
+            val writerJob = launchWriterJob(connection, firstDataBytes, writerCleanedUp)
 
-            // Fallback cleanup: if the writer coroutine is cancelled before it starts,
-            // its Closeable.use block never executes. invokeOnCompletion runs even for
-            // jobs cancelled before starting, ensuring the mutex is always released.
             writerJob.job.invokeOnCompletion { cause ->
-                if (cause != null && connection.commandMutex.isLocked) {
+                if (cause != null && !writerCleanedUp.get()) {
                     connection.scheduleReconnect()
                     connection.commandMutex.unlock()
                 }
@@ -69,10 +71,12 @@ internal object YencDecoder {
 
     private fun ProducerScope<YencEvent>.launchWriterJob(
         connection: NntpConnection,
-        firstDataBytes: ByteArray?
+        firstDataBytes: ByteArray?,
+        cleanedUp: AtomicBoolean
     ): WriterJob = writer(autoFlush = true) {
         var completed = false
         Closeable {
+            cleanedUp.set(true)
             if (!completed) {
                 connection.scheduleReconnect()
             }

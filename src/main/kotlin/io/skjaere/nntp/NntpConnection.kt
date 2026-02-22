@@ -11,9 +11,9 @@ import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.readByte
 import io.ktor.utils.io.readLine
 import io.ktor.utils.io.writeStringUtf8
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -26,15 +26,18 @@ class NntpConnection private constructor(
     private val port: Int,
     private val selectorManager: SelectorManager,
     private val useTls: Boolean,
-    private var socket: Socket,
-    private var readChannel: ByteReadChannel,
-    private var writeChannel: ByteWriteChannel,
+    socket: Socket,
+    readChannel: ByteReadChannel,
+    writeChannel: ByteWriteChannel,
     val welcomeResponse: NntpResponse,
     private val scope: CoroutineScope
 ) : Closeable {
 
     internal val commandMutex = Mutex()
-    private var reconnectJob: Job? = null
+    @Volatile private var reconnecting: CompletableDeferred<Unit>? = null
+    @Volatile private var socket: Socket = socket
+    @Volatile private var readChannel: ByteReadChannel = readChannel
+    @Volatile private var writeChannel: ByteWriteChannel = writeChannel
     private var username: String? = null
     private var password: String? = null
     private val logger = LoggerFactory.getLogger(NntpConnection::class.java)
@@ -125,33 +128,49 @@ class NntpConnection private constructor(
         }
 
     internal suspend fun ensureConnected() {
-        reconnectJob?.join()
+        reconnecting?.await()
     }
 
     internal fun scheduleReconnect() {
-        logger.info("scheduleReconnect called, host='{}', port={}", host, port)
-        try {
-            socket.close()
-        } catch (_: Exception) {
-            // Ignore close errors on poisoned socket
-        }
-        reconnectJob = scope.launch {
-            logger.info("scheduleReconnect launching openSocket with host='{}', port={}", host, port)
-            val newSocket = openSocket(host, port, selectorManager, useTls)
-            readChannel = newSocket.openReadChannel()
-            writeChannel = newSocket.openWriteChannel(autoFlush = true)
-            socket = newSocket
-            // Read and discard welcome message
-            readChannel.readLine()
+        synchronized(this) {
+            val current = reconnecting
+            if (current != null && !current.isCompleted) return
 
-            // Re-authenticate if credentials are stored
-            val user = username
-            val pass = password
-            if (user != null && pass != null) {
-                performAuth(user, pass)
+            logger.info("scheduleReconnect called, host='{}', port={}", host, port)
+            try {
+                socket.close()
+            } catch (_: Exception) {
+                // Ignore close errors on poisoned socket
             }
 
-            reconnectJob = null
+            val deferred = CompletableDeferred<Unit>()
+            reconnecting = deferred
+
+            scope.launch {
+                try {
+                    logger.info("Reconnecting to host='{}', port={}", host, port)
+                    val newSocket = openSocket(host, port, selectorManager, useTls)
+                    readChannel = newSocket.openReadChannel()
+                    writeChannel = newSocket.openWriteChannel(autoFlush = true)
+                    socket = newSocket
+                    // Read and discard welcome message
+                    readChannel.readLine()
+
+                    // Re-authenticate if credentials are stored
+                    val user = username
+                    val pass = password
+                    if (user != null && pass != null) {
+                        performAuth(user, pass)
+                    }
+
+                    deferred.complete(Unit)
+                } catch (e: Exception) {
+                    logger.error("Reconnect failed for host='{}', port={}", host, port, e)
+                    deferred.completeExceptionally(
+                        NntpConnectionException("Reconnect failed: ${e.message}", e)
+                    )
+                }
+            }
         }
     }
 
@@ -239,7 +258,7 @@ class NntpConnection private constructor(
     }
 
     override fun close() {
-        reconnectJob?.cancel()
+        reconnecting?.cancel()
         try {
             socket.close()
         } catch (_: Exception) {
