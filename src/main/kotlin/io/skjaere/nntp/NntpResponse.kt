@@ -15,12 +15,19 @@ data class ArticleResponse(
     val content: List<String>
 )
 
-data class StatResponse(
-    val code: Int,
-    val message: String,
-    val articleNumber: Long,
-    val messageId: String
-)
+sealed interface StatResult {
+    data class Found(
+        val code: Int,
+        val message: String,
+        val articleNumber: Long,
+        val messageId: String
+    ) : StatResult
+
+    data class NotFound(
+        val code: Int,
+        val message: String
+    ) : StatResult
+}
 
 data class GroupResponse(
     val code: Int,
