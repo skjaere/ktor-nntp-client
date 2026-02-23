@@ -82,10 +82,26 @@ class NntpClientTest {
         }
 
         val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
-        val response = client.stat("<msg@host>")
-        assertEquals(223, response.code)
-        assertEquals(42L, response.articleNumber)
-        assertEquals("<msg@host>", response.messageId)
+        val result = client.stat("<msg@host>")
+        assertTrue(result is StatResult.Found)
+        assertEquals(223, result.code)
+        assertEquals(42L, result.articleNumber)
+        assertEquals("<msg@host>", result.messageId)
+        client.close()
+    }
+
+    @Test
+    fun `stat returns NotFound on 430`() = runTest {
+        launchServer { reader, out ->
+            reader.readLine()
+            out.write("430 No Such Article Found\r\n".toByteArray())
+            out.flush()
+        }
+
+        val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
+        val result = client.stat("<missing@host>")
+        assertTrue(result is StatResult.NotFound)
+        assertEquals(430, result.code)
         client.close()
     }
 

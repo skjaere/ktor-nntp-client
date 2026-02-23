@@ -90,10 +90,10 @@ class NntpClientPool(
     suspend fun body(number: Long): ArticleResponse =
         withClient { it.body(number) }
 
-    suspend fun stat(messageId: String): StatResponse =
+    suspend fun stat(messageId: String): StatResult =
         withClient { it.stat(messageId) }
 
-    suspend fun stat(number: Long): StatResponse =
+    suspend fun stat(number: Long): StatResult =
         withClient { it.stat(number) }
 
     override fun close() {

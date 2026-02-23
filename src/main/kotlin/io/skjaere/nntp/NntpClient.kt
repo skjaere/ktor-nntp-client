@@ -90,19 +90,19 @@ class NntpClient(
         return fetchArticle(NntpCommand.body(number), 222)
     }
 
-    suspend fun stat(messageId: String): StatResponse {
+    suspend fun stat(messageId: String): StatResult {
         return fetchStat(NntpCommand.stat(messageId))
     }
 
-    suspend fun stat(number: Long): StatResponse {
+    suspend fun stat(number: Long): StatResult {
         return fetchStat(NntpCommand.stat(number))
     }
 
-    suspend fun next(): StatResponse {
+    suspend fun next(): StatResult {
         return fetchStat(NntpCommand.NEXT)
     }
 
-    suspend fun last(): StatResponse {
+    suspend fun last(): StatResult {
         return fetchStat(NntpCommand.LAST)
     }
 
@@ -286,8 +286,11 @@ class NntpClient(
         return ArticleResponse(code, response.message, number, messageId, lines)
     }
 
-    private suspend fun fetchStat(cmd: String): StatResponse {
+    private suspend fun fetchStat(cmd: String): StatResult {
         val response = connection.command(cmd)
+        if (response.code == 430) {
+            return StatResult.NotFound(response.code, response.message)
+        }
         if (response.code != 223) {
             throw NntpProtocolException(
                 "Command failed: ${response.code} ${response.message}",
@@ -295,7 +298,7 @@ class NntpClient(
             )
         }
         val (code, number, messageId) = parseArticleResponseLine("${response.code} ${response.message}")
-        return StatResponse(code, response.message, number, messageId)
+        return StatResult.Found(code, response.message, number, messageId)
     }
 
     private fun fetchBodyYenc(cmd: String): Flow<YencEvent> = channelFlow {
