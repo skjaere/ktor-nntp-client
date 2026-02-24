@@ -15,9 +15,14 @@ import org.junit.jupiter.api.Timeout
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.ServerSocket
+import java.net.Socket
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class NntpClientPoolTest {
 
@@ -80,6 +85,72 @@ class NntpClientPoolTest {
                 }
             }
         }.start()
+    }
+
+    /**
+     * Launch a mock NNTP server that handles DATE and STAT commands,
+     * and tracks accepted sockets for selective killing.
+     */
+    private fun launchCommandServer(
+        maxAccepts: Int = Int.MAX_VALUE,
+        acceptedSockets: CopyOnWriteArrayList<Socket> = CopyOnWriteArrayList(),
+        killAfterAccept: Boolean = false,
+        failStatOnce: AtomicBoolean = AtomicBoolean(false)
+    ): CopyOnWriteArrayList<Socket> {
+        Thread {
+            var accepted = 0
+            while (accepted < maxAccepts) {
+                try {
+                    val client = serverSocket.accept()
+                    acceptedSockets.add(client)
+                    if (killAfterAccept) {
+                        client.close()
+                        accepted++
+                        continue
+                    }
+                    Thread {
+                        try {
+                            val reader = BufferedReader(InputStreamReader(client.getInputStream()))
+                            val out = client.getOutputStream()
+                            out.write("200 welcome\r\n".toByteArray())
+                            out.flush()
+                            while (!client.isClosed) {
+                                val cmd = reader.readLine() ?: break
+                                when {
+                                    cmd == "DATE" -> {
+                                        out.write("111 20260224120000\r\n".toByteArray())
+                                        out.flush()
+                                    }
+                                    cmd.startsWith("STAT") -> {
+                                        if (failStatOnce.compareAndSet(true, false)) {
+                                            // Close to simulate connection failure
+                                            client.close()
+                                            break
+                                        }
+                                        out.write("223 0 <test@msg> article exists\r\n".toByteArray())
+                                        out.flush()
+                                    }
+                                    cmd == "QUIT" -> {
+                                        out.write("205 bye\r\n".toByteArray())
+                                        out.flush()
+                                        break
+                                    }
+                                    else -> {
+                                        out.write("500 unknown command\r\n".toByteArray())
+                                        out.flush()
+                                    }
+                                }
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }.start()
+                    accepted++
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }.start()
+        return acceptedSockets
     }
 
     @Test
@@ -149,5 +220,284 @@ class NntpClientPoolTest {
         } finally {
             pool.close()
         }
+    }
+
+    // --- New tests for keepalive, retry, sleep/wake ---
+
+    @Test
+    @Timeout(30, unit = TimeUnit.SECONDS)
+    fun `keepalive detects dead connection and reconnects`() = runBlocking {
+        // Server accepts: initial connection + reconnection after keepalive detects dead
+        val sockets = launchCommandServer(maxAccepts = 2)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 500,
+            idleGracePeriodMs = 0  // disable auto-sleep
+        )
+        pool.connect()
+
+        try {
+            // Verify stat works initially
+            val result = pool.stat("<test@msg>")
+            assertTrue(result is StatResult.Found)
+
+            // Kill the server-side socket to simulate dead connection
+            delay(100)
+            sockets.first().close()
+
+            // Wait for keepalive to detect and schedule reconnect
+            delay(1500)
+
+            // Next operation should succeed via reconnected client
+            val result2 = pool.stat("<test@msg>")
+            assertTrue(result2 is StatResult.Found)
+        } finally {
+            pool.close()
+        }
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `retry with different connection when first fails`() = runBlocking {
+        // Pool size 2: first STAT fails (connection killed), retry gets second connection
+        val failOnce = AtomicBoolean(false)
+        // Accept: 2 initial + 1 reconnect
+        launchCommandServer(maxAccepts = 3, failStatOnce = failOnce)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 2,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,  // disable keepalive
+            idleGracePeriodMs = 0
+        )
+        pool.connect()
+
+        try {
+            // Set up: next STAT on one connection will close the socket
+            failOnce.set(true)
+
+            // withClient should catch the NntpConnectionException, retry with the other client
+            val result = pool.stat("<test@msg>")
+            assertTrue(result is StatResult.Found)
+        } finally {
+            pool.close()
+        }
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `both connections dead propagates exception`() = runBlocking {
+        // Server accepts 2 initial connections, then kills all reconnect attempts
+        val sockets = launchCommandServer(maxAccepts = 2)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 2,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        pool.connect()
+
+        // Kill both server-side sockets
+        delay(100)
+        sockets.forEach { it.close() }
+        // Close the server so reconnects fail
+        serverSocket.close()
+
+        delay(200) // let TCP state settle
+
+        assertFailsWith<NntpConnectionException> {
+            pool.stat("<test@msg>")
+        }
+
+        pool.close()
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `pool size 1 waits for reconnect on retry`() = runBlocking {
+        // Accept: 1 initial + 1 reconnect
+        val failOnce = AtomicBoolean(false)
+        launchCommandServer(maxAccepts = 2, failStatOnce = failOnce)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        pool.connect()
+
+        try {
+            failOnce.set(true)
+
+            // With pool size 1, retry gets the same (reconnecting) client.
+            // ensureConnected() waits for reconnect to complete.
+            val result = pool.stat("<test@msg>")
+            assertTrue(result is StatResult.Found)
+        } finally {
+            pool.close()
+        }
+    }
+
+    @Test
+    @Timeout(10, unit = TimeUnit.SECONDS)
+    fun `non-connection exceptions are not retried`() = runBlocking {
+        // Server that responds 430 to STAT (article not found)
+        Thread {
+            repeat(1) {
+                try {
+                    val client = serverSocket.accept()
+                    Thread {
+                        try {
+                            val reader = BufferedReader(InputStreamReader(client.getInputStream()))
+                            val out = client.getOutputStream()
+                            out.write("200 welcome\r\n".toByteArray())
+                            out.flush()
+                            while (!client.isClosed) {
+                                val cmd = reader.readLine() ?: break
+                                if (cmd.startsWith("STAT")) {
+                                    out.write("430 no such article\r\n".toByteArray())
+                                    out.flush()
+                                } else {
+                                    out.write("500 unknown\r\n".toByteArray())
+                                    out.flush()
+                                }
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }.start()
+                } catch (_: Exception) {
+                }
+            }
+        }.start()
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        pool.connect()
+
+        try {
+            // stat() returns StatResult.NotFound for 430, not an exception
+            // But article() throws ArticleNotFoundException for 430
+            // ArticleNotFoundException is NOT NntpConnectionException, so no retry
+            assertFailsWith<ArticleNotFoundException> {
+                pool.article("<nonexistent@msg>")
+            }
+        } finally {
+            pool.close()
+        }
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `grace period puts pool to sleep`() = runBlocking {
+        val sockets = launchCommandServer(maxAccepts = 10)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 200,
+            idleGracePeriodMs = 500
+        )
+        pool.connect()
+
+        assertEquals(1, sockets.size, "Should have 1 initial connection")
+
+        // Wait for grace period + keepalive interval to trigger sleep
+        delay(1500)
+
+        // After sleeping, withClient should auto-wake creating a new server connection
+        val result = pool.stat("<test@msg>")
+        assertTrue(result is StatResult.Found)
+        assertEquals(2, sockets.size, "Should have 2 connections total (initial + after wake)")
+
+        pool.close()
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `auto-wake on withClient after sleep`() = runBlocking {
+        // Accept: 1 initial + 1 after auto-wake
+        launchCommandServer(maxAccepts = 2)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 200,
+            idleGracePeriodMs = 500
+        )
+        pool.connect()
+
+        // Wait for auto-sleep to trigger
+        delay(1500)
+
+        // Now call withClient — should auto-wake and transparently reconnect
+        val result = pool.stat("<test@msg>")
+        assertTrue(result is StatResult.Found)
+
+        pool.close()
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `explicit sleep and wake`() = runBlocking {
+        // Accept: 1 initial + 1 after wake
+        val sockets = launchCommandServer(maxAccepts = 2)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        pool.connect()
+
+        // Verify working
+        val result1 = pool.stat("<test@msg>")
+        assertTrue(result1 is StatResult.Found)
+        assertEquals(1, sockets.size, "Should have 1 initial connection")
+
+        // Sleep
+        pool.sleep()
+
+        // Wake
+        pool.wake()
+
+        // Verify working after wake — server should have accepted a second connection
+        val result2 = pool.stat("<test@msg>")
+        assertTrue(result2 is StatResult.Found)
+        assertEquals(2, sockets.size, "Should have 2 connections total (initial + after wake)")
+
+        pool.close()
     }
 }
