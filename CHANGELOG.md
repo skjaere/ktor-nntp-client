@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.2.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.1.2...v0.2.0) (2026-02-25)
+
+
+### Features
+
+* feat:  ([a24e299](https://github.com/skjaere/ktor-nntp-client/commit/a24e2997c6ff8a3d619c309f9561528c7c60077d))
+
+
+### Bug Fixes
+
+* increasing buffer size for YencDecoder ([a18bf6f](https://github.com/skjaere/ktor-nntp-client/commit/a18bf6f5fd9f4c925a5e5a7b3e75bb2899011223))
+* inline release-please workflow instead of referencing reusable workflow ([22e14c0](https://github.com/skjaere/ktor-nntp-client/commit/22e14c0f216bf4a28182e1634a1bb981b7dfe6f6))
+* making re-connecting thread-safe ([fce93c9](https://github.com/skjaere/ktor-nntp-client/commit/fce93c925e89760cdca85b04885281675e41a863))
+* removing duplicated authentication code ([a56469a](https://github.com/skjaere/ktor-nntp-client/commit/a56469a76bd7332864fe52998bebd9ffef60ecce))
+* returning sealed interface from stat commands ([bf596d9](https://github.com/skjaere/ktor-nntp-client/commit/bf596d94493f7dd5f3cbec039b19800e311186b4))
+* throwing ArticleNotFoundException on 430 responses ([560a91b](https://github.com/skjaere/ktor-nntp-client/commit/560a91baae24301d8b24b968aa87dda2ead48b91))
+
 ## [0.1.2](https://github.com/skjaere/ktor-nntp-client/compare/v0.1.1...v0.1.2) (2026-02-11)
 
 
