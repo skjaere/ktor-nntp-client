@@ -2,9 +2,6 @@ package io.skjaere.nntp
 
 import io.ktor.network.selector.SelectorManager
 import kotlin.collections.ArrayDeque
-import kotlin.collections.List
-import kotlin.collections.forEach
-import kotlin.collections.toList
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -67,6 +64,7 @@ class NntpClientPool(
 
     @Volatile
     private var sleeping = false
+
     @Volatile
     private var lastActivityMs = System.currentTimeMillis()
 
@@ -211,6 +209,8 @@ class NntpClientPool(
         }
     }
 
+    suspend fun <T> withClient(block: suspend (NntpClient) -> T): T = withClient(0, block)
+
     suspend fun <T> withClient(priority: Int = 0, block: suspend (NntpClient) -> T): T {
         if (sleeping) doWake()
         lastActivityMs = System.currentTimeMillis()
@@ -260,50 +260,50 @@ class NntpClientPool(
 
     // --- Delegated commands ---
 
-    fun bodyYenc(messageId: String): Flow<YencEvent> = channelFlow {
-        withClient { client ->
+    fun bodyYenc(messageId: String, priority: Int = 0): Flow<YencEvent> = channelFlow {
+        withClient(priority) { client ->
             client.bodyYenc(messageId).collect { event -> send(event) }
         }
     }
 
-    fun bodyYenc(number: Long): Flow<YencEvent> = channelFlow {
-        withClient { client ->
+    fun bodyYenc(number: Long, priority: Int = 0): Flow<YencEvent> = channelFlow {
+        withClient(priority) { client ->
             client.bodyYenc(number).collect { event -> send(event) }
         }
     }
 
-    suspend fun bodyYencHeaders(messageId: String): YencHeaders =
-        withClient { it.bodyYencHeaders(messageId) }
+    suspend fun bodyYencHeaders(messageId: String, priority: Int = 0): YencHeaders =
+        withClient(priority) { it.bodyYencHeaders(messageId) }
 
-    suspend fun bodyYencHeaders(number: Long): YencHeaders =
-        withClient { it.bodyYencHeaders(number) }
+    suspend fun bodyYencHeaders(number: Long, priority: Int = 0): YencHeaders =
+        withClient(priority) { it.bodyYencHeaders(number) }
 
-    suspend fun group(name: String): GroupResponse =
-        withClient { it.group(name) }
+    suspend fun group(name: String, priority: Int = 0): GroupResponse =
+        withClient(priority) { it.group(name) }
 
-    suspend fun article(messageId: String): ArticleResponse =
-        withClient { it.article(messageId) }
+    suspend fun article(messageId: String, priority: Int = 0): ArticleResponse =
+        withClient(priority) { it.article(messageId) }
 
-    suspend fun article(number: Long): ArticleResponse =
-        withClient { it.article(number) }
+    suspend fun article(number: Long, priority: Int = 0): ArticleResponse =
+        withClient(priority) { it.article(number) }
 
-    suspend fun head(messageId: String): ArticleResponse =
-        withClient { it.head(messageId) }
+    suspend fun head(messageId: String, priority: Int = 0): ArticleResponse =
+        withClient(priority) { it.head(messageId) }
 
-    suspend fun head(number: Long): ArticleResponse =
-        withClient { it.head(number) }
+    suspend fun head(number: Long, priority: Int = 0): ArticleResponse =
+        withClient(priority) { it.head(number) }
 
-    suspend fun body(messageId: String): ArticleResponse =
-        withClient { it.body(messageId) }
+    suspend fun body(messageId: String, priority: Int = 0): ArticleResponse =
+        withClient(priority) { it.body(messageId) }
 
-    suspend fun body(number: Long): ArticleResponse =
-        withClient { it.body(number) }
+    suspend fun body(number: Long, priority: Int = 0): ArticleResponse =
+        withClient(priority) { it.body(number) }
 
-    suspend fun stat(messageId: String): StatResult =
-        withClient { it.stat(messageId) }
+    suspend fun stat(messageId: String, priority: Int = 0): StatResult =
+        withClient(priority) { it.stat(messageId) }
 
-    suspend fun stat(number: Long): StatResult =
-        withClient { it.stat(number) }
+    suspend fun stat(number: Long, priority: Int = 0): StatResult =
+        withClient(priority) { it.stat(number) }
 
     override fun close() {
         keepaliveJob?.cancel()
