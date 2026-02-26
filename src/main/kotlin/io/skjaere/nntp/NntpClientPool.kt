@@ -12,6 +12,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
@@ -92,16 +93,24 @@ class NntpClientPool(
     }
 
     suspend fun connect() {
-        repeat(maxConnections) {
-            val client = if (username != null && password != null)
-                NntpClient.connect(host, port, selectorManager, useTls, username, password, scope)
-            else
-                NntpClient.connect(host, port, selectorManager, useTls, scope)
-            addClientToPool(client)
-        }
+        connectAll()
         sleeping = false
         lastActivityMs = System.currentTimeMillis()
         startKeepalive()
+    }
+
+    private suspend fun connectAll() {
+        coroutineScope {
+            repeat(maxConnections) {
+                launch {
+                    val client = if (username != null && password != null)
+                        NntpClient.connect(host, port, selectorManager, useTls, username, password, scope)
+                    else
+                        NntpClient.connect(host, port, selectorManager, useTls, scope)
+                    addClientToPool(client)
+                }
+            }
+        }
     }
 
     private fun startKeepalive() {
@@ -178,13 +187,7 @@ class NntpClientPool(
         // Drain any stale clients returned after sleep (from in-flight withClient calls)
         val stale = drainIdle()
         stale.forEach { runCatching { it.close() } }
-        repeat(maxConnections) {
-            val client = if (username != null && password != null)
-                NntpClient.connect(host, port, selectorManager, useTls, username, password, scope)
-            else
-                NntpClient.connect(host, port, selectorManager, useTls, scope)
-            addClientToPool(client)
-        }
+        connectAll()
         lastActivityMs = System.currentTimeMillis()
         startKeepalive()
     }
