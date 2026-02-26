@@ -11,7 +11,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -37,8 +36,7 @@ class NntpClientPool(
     private val maxConnections: Int,
     private val scope: CoroutineScope,
     private val keepaliveIntervalMs: Long = DEFAULT_KEEPALIVE_INTERVAL_MS,
-    private val idleGracePeriodMs: Long = DEFAULT_IDLE_GRACE_PERIOD_MS,
-    startSleeping: Boolean = true
+    private val idleGracePeriodMs: Long = DEFAULT_IDLE_GRACE_PERIOD_MS
 ) : Closeable {
 
     companion object {
@@ -68,7 +66,7 @@ class NntpClientPool(
     private var keepaliveJob: Job? = null
 
     @Volatile
-    private var sleeping = startSleeping
+    private var sleeping = true
 
     @Volatile
     private var lastActivityMs = System.currentTimeMillis()
