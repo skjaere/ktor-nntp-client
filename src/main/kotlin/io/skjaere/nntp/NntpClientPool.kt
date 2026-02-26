@@ -148,8 +148,12 @@ class NntpClientPool(
     }
 
     private suspend fun doSleep() {
-        if (sleeping) return
-        sleeping = true
+        val shouldSleep = poolMutex.withLock {
+            if (sleeping) return@withLock false
+            sleeping = true
+            true
+        }
+        if (!shouldSleep) return
         keepaliveJob?.cancel()
         keepaliveJob = null
         val clients = drainIdle()
@@ -164,9 +168,13 @@ class NntpClientPool(
     }
 
     private suspend fun doWake() {
-        if (!sleeping) return
+        val shouldWake = poolMutex.withLock {
+            if (!sleeping) return@withLock false
+            sleeping = false
+            true
+        }
+        if (!shouldWake) return
         logger.info("Waking pool, reconnecting {} connections", maxConnections)
-        sleeping = false
         // Drain any stale clients returned after sleep (from in-flight withClient calls)
         val stale = drainIdle()
         stale.forEach { runCatching { it.close() } }
