@@ -16,6 +16,7 @@ dependencies {
     api(libs.ktor.network)
     api(libs.ktor.network.tls)
     api(libs.ktor.io)
+    api(libs.micrometer.core)
     api(libs.rapidyenc)
     implementation(libs.kotlinx.coroutines.core)
     implementation(libs.slf4j.api)
