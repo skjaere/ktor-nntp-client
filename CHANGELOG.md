@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.3.1...v0.4.0) (2026-02-26)
+
+
+### Features
+
+* supporting starting the pool is a sleeping state
+
+
+### Bug Fixes
+
+* fix: 
+* adding metrics
+* fixing race condition in sleep/awake
+* initializing connections concurrently
+* removing  redundant startSleeping parameter
+* removing duplicate logger and reducing noise in logs
+
 ## [0.3.1](https://github.com/skjaere/ktor-nntp-client/compare/v0.3.0...v0.3.1) (2026-02-26)
 
 
