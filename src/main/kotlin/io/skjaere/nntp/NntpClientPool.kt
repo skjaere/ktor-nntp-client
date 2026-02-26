@@ -1,6 +1,9 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.SelectorManager
+import io.micrometer.core.instrument.Gauge
+import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
 import kotlin.collections.ArrayDeque
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -33,7 +36,8 @@ class NntpClientPool(
     private val maxConnections: Int,
     private val scope: CoroutineScope,
     private val keepaliveIntervalMs: Long = DEFAULT_KEEPALIVE_INTERVAL_MS,
-    private val idleGracePeriodMs: Long = DEFAULT_IDLE_GRACE_PERIOD_MS
+    private val idleGracePeriodMs: Long = DEFAULT_IDLE_GRACE_PERIOD_MS,
+    private val meterRegistry: MeterRegistry? = null
 ) : Closeable {
 
     companion object {
@@ -67,6 +71,25 @@ class NntpClientPool(
 
     @Volatile
     private var lastActivityMs = System.currentTimeMillis()
+
+    private val poolName = "$host:$port"
+
+    init {
+        meterRegistry?.let { registry ->
+            Gauge.builder("nntp.pool.idle", idleClients) { it.size.toDouble() }
+                .tag("pool.name", poolName)
+                .register(registry)
+            Gauge.builder("nntp.pool.active", idleClients) { maxConnections - it.size.toDouble() }
+                .tag("pool.name", poolName)
+                .register(registry)
+            Gauge.builder("nntp.pool.waiters", waiters) { it.size.toDouble() }
+                .tag("pool.name", poolName)
+                .register(registry)
+            Gauge.builder("nntp.pool.sleeping", this) { if (it.sleeping) 1.0 else 0.0 }
+                .tag("pool.name", poolName)
+                .register(registry)
+        }
+    }
 
     suspend fun connect() {
         repeat(maxConnections) {
@@ -160,6 +183,7 @@ class NntpClientPool(
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private suspend fun acquire(priority: Int = 0): NntpClient {
+        val sample = meterRegistry?.let { Timer.start(it) }
         val deferred = CompletableDeferred<NntpClient>()
         val waiter = poolMutex.withLock {
             val client = idleClients.removeFirstOrNull()
@@ -171,10 +195,15 @@ class NntpClientPool(
             waiters.add(w)
             w
         }
-        if (waiter == null) return deferred.getCompleted()
+        if (waiter == null) {
+            recordAcquire(sample, priority)
+            return deferred.getCompleted()
+        }
         // Await outside the lock
         try {
-            return deferred.await()
+            val client = deferred.await()
+            recordAcquire(sample, priority)
+            return client
         } catch (e: CancellationException) {
             // On cancellation, remove from queue and handle race where client was already completed
             poolMutex.withLock { waiters.remove(waiter) }
@@ -188,6 +217,14 @@ class NntpClientPool(
             }
             throw e
         }
+    }
+
+    private fun recordAcquire(sample: Timer.Sample?, priority: Int) {
+        val registry = meterRegistry ?: return
+        sample?.stop(Timer.builder("nntp.pool.acquire")
+            .tag("pool.name", poolName)
+            .tag("priority", priority.toString())
+            .register(registry))
     }
 
     /**
@@ -323,6 +360,15 @@ class NntpClientPool(
                     runCatching { client.close() }
                 }
                 idleClients.clear()
+            }
+        }
+        meterRegistry?.let { registry ->
+            registry.find("nntp.pool.idle").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
+            registry.find("nntp.pool.active").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
+            registry.find("nntp.pool.waiters").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
+            registry.find("nntp.pool.sleeping").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
+            registry.find("nntp.pool.acquire").tag("pool.name", poolName).timers().forEach { timer ->
+                registry.remove(timer.id)
             }
         }
     }
