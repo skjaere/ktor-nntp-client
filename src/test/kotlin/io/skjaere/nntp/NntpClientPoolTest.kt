@@ -2,10 +2,14 @@ package io.skjaere.nntp
 
 import io.ktor.network.selector.*
 import io.skjaere.yenc.RapidYenc
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
 import org.junit.jupiter.api.AfterEach
@@ -499,5 +503,209 @@ class NntpClientPoolTest {
         assertEquals(2, sockets.size, "Should have 2 connections total (initial + after wake)")
 
         pool.close()
+    }
+
+    // --- Priority tests ---
+
+    @Test
+    @Timeout(10, unit = TimeUnit.SECONDS)
+    fun `higher priority waiters are served first when pool is exhausted`() = runBlocking {
+        launchCommandServer(maxAccepts = 10)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        pool.connect()
+
+        try {
+            val served = CopyOnWriteArrayList<String>()
+            val gate = CompletableDeferred<Unit>()
+
+            // Hold the only client
+            val holder = async {
+                pool.withClient {
+                    gate.await() // hold until we release
+                }
+            }
+
+            // Give the holder time to acquire
+            delay(100)
+
+            // Launch three waiters with different priorities
+            val low = async {
+                pool.withClient(priority = 1) {
+                    served.add("low")
+                }
+            }
+            delay(50) // ensure enqueue order
+            val med = async {
+                pool.withClient(priority = 5) {
+                    served.add("med")
+                }
+            }
+            delay(50)
+            val high = async {
+                pool.withClient(priority = 10) {
+                    served.add("high")
+                }
+            }
+            delay(50)
+
+            // Release the holder
+            gate.complete(Unit)
+            holder.await()
+            low.await()
+            med.await()
+            high.await()
+
+            assertEquals(listOf("high", "med", "low"), served)
+        } finally {
+            pool.close()
+        }
+    }
+
+    @Test
+    @Timeout(10, unit = TimeUnit.SECONDS)
+    fun `same priority waiters are served in FIFO order`() = runBlocking {
+        launchCommandServer(maxAccepts = 10)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        pool.connect()
+
+        try {
+            val served = CopyOnWriteArrayList<String>()
+            val gate = CompletableDeferred<Unit>()
+
+            val holder = async {
+                pool.withClient {
+                    gate.await()
+                }
+            }
+            delay(100)
+
+            val first = async {
+                pool.withClient(priority = 0) {
+                    served.add("first")
+                }
+            }
+            delay(50)
+            val second = async {
+                pool.withClient(priority = 0) {
+                    served.add("second")
+                }
+            }
+            delay(50)
+            val third = async {
+                pool.withClient(priority = 0) {
+                    served.add("third")
+                }
+            }
+            delay(50)
+
+            gate.complete(Unit)
+            holder.await()
+            first.await()
+            second.await()
+            third.await()
+
+            assertEquals(listOf("first", "second", "third"), served)
+        } finally {
+            pool.close()
+        }
+    }
+
+    @Test
+    @Timeout(10, unit = TimeUnit.SECONDS)
+    fun `cancelled waiter does not leak or block`() = runBlocking {
+        launchCommandServer(maxAccepts = 10)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        pool.connect()
+
+        try {
+            val gate = CompletableDeferred<Unit>()
+
+            val holder = async {
+                pool.withClient {
+                    gate.await()
+                }
+            }
+            delay(100)
+
+            // Launch a waiter that we'll cancel
+            val waiterJob = launch {
+                pool.withClient(priority = 5) {
+                    // should never get here
+                }
+            }
+            delay(100)
+
+            // Cancel the waiter while it's waiting
+            waiterJob.cancel()
+            delay(50)
+
+            // Release the holder
+            gate.complete(Unit)
+            holder.await()
+
+            // The client should not be leaked — subsequent calls should work
+            val result = pool.stat("<test@msg>")
+            assertTrue(result is StatResult.Found)
+        } finally {
+            pool.close()
+        }
+    }
+
+    @Test
+    @Timeout(10, unit = TimeUnit.SECONDS)
+    fun `default priority is backward compatible`() = runBlocking {
+        launchCommandServer(maxAccepts = 10)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        pool.connect()
+
+        try {
+            // Call withClient without priority arg twice sequentially
+            pool.withClient { client ->
+                val result = client.stat("<test@msg>")
+                assertTrue(result is StatResult.Found)
+            }
+            pool.withClient { client ->
+                val result = client.stat("<test@msg>")
+                assertTrue(result is StatResult.Found)
+            }
+        } finally {
+            pool.close()
+        }
     }
 }

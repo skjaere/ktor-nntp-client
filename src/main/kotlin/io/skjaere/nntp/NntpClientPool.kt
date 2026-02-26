@@ -1,14 +1,30 @@
 package io.skjaere.nntp
 
-import io.ktor.network.selector.*
-import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.ClosedSendChannelException
+import io.ktor.network.selector.SelectorManager
+import kotlin.collections.ArrayDeque
+import kotlin.collections.List
+import kotlin.collections.forEach
+import kotlin.collections.toList
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import java.io.Closeable
-import kotlin.coroutines.coroutineContext
+import java.util.PriorityQueue
 
 class NntpClientPool(
     private val host: String,
@@ -28,12 +44,31 @@ class NntpClientPool(
         const val DEFAULT_IDLE_GRACE_PERIOD_MS = 300_000L // 5 minutes
     }
 
+    private class PriorityWaiter(
+        val priority: Int,
+        val deferred: CompletableDeferred<NntpClient>,
+        val sequenceNumber: Long
+    ) : Comparable<PriorityWaiter> {
+        override fun compareTo(other: PriorityWaiter): Int {
+            // Higher priority first, then lower sequence number first (FIFO)
+            val priorityCmp = other.priority.compareTo(this.priority)
+            if (priorityCmp != 0) return priorityCmp
+            return this.sequenceNumber.compareTo(other.sequenceNumber)
+        }
+    }
+
     private val logger = LoggerFactory.getLogger(NntpClientPool::class.java)
-    private val available = Channel<NntpClient>(maxConnections)
+    private val poolMutex = Mutex()
+    private val idleClients = ArrayDeque<NntpClient>()
+    private val waiters = PriorityQueue<PriorityWaiter>()
+    private var waiterSequence = 0L
+    private var closed = false
     private var keepaliveJob: Job? = null
 
-    @Volatile private var sleeping = false
-    @Volatile private var lastActivityMs = System.currentTimeMillis()
+    @Volatile
+    private var sleeping = false
+    @Volatile
+    private var lastActivityMs = System.currentTimeMillis()
 
     suspend fun connect() {
         repeat(maxConnections) {
@@ -41,7 +76,7 @@ class NntpClientPool(
                 NntpClient.connect(host, port, selectorManager, useTls, username, password, scope)
             else
                 NntpClient.connect(host, port, selectorManager, useTls, scope)
-            available.send(client)
+            addClientToPool(client)
         }
         sleeping = false
         lastActivityMs = System.currentTimeMillis()
@@ -55,7 +90,7 @@ class NntpClientPool(
     }
 
     private suspend fun keepaliveLoop() {
-        while (coroutineContext.isActive) {
+        while (currentCoroutineContext().isActive) {
             delay(keepaliveIntervalMs)
             if (sleeping) continue
             if (idleGracePeriodMs > 0 &&
@@ -65,65 +100,121 @@ class NntpClientPool(
                 doSleep()
                 continue
             }
-            val clients = drainAvailable()
+            val clients = drainIdle()
             for (client in clients) {
                 try {
                     client.date()
                 } catch (e: NntpConnectionException) {
                     logger.debug("Keepalive failed, scheduling reconnect: {}", e.message)
                     client.connection.scheduleReconnect()
-                } catch (_: Exception) { }
+                } catch (_: Exception) {
+                }
                 returnToPool(client)
             }
         }
     }
 
-    private fun drainAvailable(): List<NntpClient> {
-        val clients = mutableListOf<NntpClient>()
-        while (true) {
-            clients.add(available.tryReceive().getOrNull() ?: break)
+    private suspend fun drainIdle(): List<NntpClient> {
+        poolMutex.withLock {
+            val clients = idleClients.toList()
+            idleClients.clear()
+            return clients
         }
-        return clients
     }
 
-    suspend fun sleep() { doSleep() }
+    suspend fun sleep() {
+        doSleep()
+    }
 
     private suspend fun doSleep() {
         if (sleeping) return
         sleeping = true
         keepaliveJob?.cancel()
         keepaliveJob = null
-        val clients = drainAvailable()
+        val clients = drainIdle()
         for (client in clients) {
             runCatching { client.close() }
         }
         logger.info("Pool is now sleeping ({} connections closed)", clients.size)
     }
 
-    suspend fun wake() { doWake() }
+    suspend fun wake() {
+        doWake()
+    }
 
     private suspend fun doWake() {
         if (!sleeping) return
         logger.info("Waking pool, reconnecting {} connections", maxConnections)
         sleeping = false
         // Drain any stale clients returned after sleep (from in-flight withClient calls)
-        val stale = drainAvailable()
+        val stale = drainIdle()
         stale.forEach { runCatching { it.close() } }
         repeat(maxConnections) {
             val client = if (username != null && password != null)
                 NntpClient.connect(host, port, selectorManager, useTls, username, password, scope)
             else
                 NntpClient.connect(host, port, selectorManager, useTls, scope)
-            available.send(client)
+            addClientToPool(client)
         }
         lastActivityMs = System.currentTimeMillis()
         startKeepalive()
     }
 
-    suspend fun <T> withClient(block: suspend (NntpClient) -> T): T {
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private suspend fun acquire(priority: Int = 0): NntpClient {
+        val deferred = CompletableDeferred<NntpClient>()
+        val waiter = poolMutex.withLock {
+            val client = idleClients.removeFirstOrNull()
+            if (client != null) {
+                deferred.complete(client)
+                return@withLock null
+            }
+            val w = PriorityWaiter(priority, deferred, waiterSequence++)
+            waiters.add(w)
+            w
+        }
+        if (waiter == null) return deferred.getCompleted()
+        // Await outside the lock
+        try {
+            return deferred.await()
+        } catch (e: CancellationException) {
+            // On cancellation, remove from queue and handle race where client was already completed
+            poolMutex.withLock { waiters.remove(waiter) }
+            // If the deferred was completed before we could cancel, return the client to the pool
+            if (deferred.isCompleted) {
+                try {
+                    addClientToPool(deferred.getCompleted())
+                } catch (_: IllegalStateException) {
+                    // deferred completed exceptionally, nothing to return
+                }
+            }
+            throw e
+        }
+    }
+
+    /**
+     * Called under [poolMutex]: dispatch the client to the highest-priority waiter,
+     * skipping cancelled waiters. If no waiters, park in [idleClients].
+     */
+    private fun dispatchOrPark(client: NntpClient) {
+        while (true) {
+            val waiter = waiters.poll() ?: break
+            if (waiter.deferred.complete(client)) return
+            // Waiter was cancelled, try next
+        }
+        idleClients.addLast(client)
+    }
+
+    private suspend fun addClientToPool(client: NntpClient) {
+        poolMutex.withLock {
+            dispatchOrPark(client)
+        }
+    }
+
+    suspend fun <T> withClient(priority: Int = 0, block: suspend (NntpClient) -> T): T {
         if (sleeping) doWake()
         lastActivityMs = System.currentTimeMillis()
-        val client = available.receive()
+        val client = acquire(priority)
         var returned = false
         try {
             return supervisorScope { block(client) }
@@ -132,14 +223,17 @@ class NntpClientPool(
             client.connection.scheduleReconnect()
             returnToPool(client)
             returned = true
-            return retryWithDifferentClient(block)
+            return retryWithDifferentClient(priority, block)
         } finally {
             if (!returned) returnToPool(client)
         }
     }
 
-    private suspend fun <T> retryWithDifferentClient(block: suspend (NntpClient) -> T): T {
-        val client = available.receive()
+    private suspend fun <T> retryWithDifferentClient(
+        priority: Int,
+        block: suspend (NntpClient) -> T
+    ): T {
+        val client = acquire(priority)
         try {
             client.connection.ensureConnected()
             return supervisorScope { block(client) }
@@ -154,10 +248,12 @@ class NntpClientPool(
 
     private suspend fun returnToPool(client: NntpClient) {
         withContext(NonCancellable) {
-            try {
-                available.send(client)
-            } catch (_: ClosedSendChannelException) {
-                runCatching { client.close() }
+            poolMutex.withLock {
+                if (closed) {
+                    runCatching { client.close() }
+                } else {
+                    dispatchOrPark(client)
+                }
             }
         }
     }
@@ -212,11 +308,22 @@ class NntpClientPool(
     override fun close() {
         keepaliveJob?.cancel()
         keepaliveJob = null
-        available.close()
-        val clients = mutableListOf<NntpClient>()
-        while (true) {
-            clients.add(available.tryReceive().getOrNull() ?: break)
+        runBlocking {
+            poolMutex.withLock {
+                closed = true
+                // Complete all waiters exceptionally
+                while (true) {
+                    val waiter = waiters.poll() ?: break
+                    waiter.deferred.completeExceptionally(
+                        IllegalStateException("Pool closed")
+                    )
+                }
+                // Close all idle clients
+                for (client in idleClients) {
+                    runCatching { client.close() }
+                }
+                idleClients.clear()
+            }
         }
-        clients.forEach { runCatching { it.close() } }
     }
 }
