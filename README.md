@@ -9,7 +9,9 @@ A Kotlin NNTP (Network News Transfer Protocol) client library built on Ktor's as
 ## Features
 
 - Full RFC 3977 NNTP command support
-- Connection pool with automatic reconnection and structured concurrency
+- Connection pool with automatic reconnection, keepalive, sleep/wake, and priority scheduling
+- Idle connection keepalive with configurable interval
+- Automatic sleep after configurable idle grace period, with transparent wake-on-demand
 - Flow-based streaming yEnc body decoding
 - Lightweight yEnc header retrieval without downloading the full body
 - SIMD-accelerated yEnc decoding via rapidyenc native library
@@ -55,7 +57,9 @@ val pool = NntpClientPool(
     username = "user",
     password = "pass",
     maxConnections = 5,
-    scope = scope
+    scope = scope,
+    keepaliveIntervalMs = 60_000,   // send DATE every 60s to keep connections alive (default)
+    idleGracePeriodMs = 300_000     // sleep after 5 minutes of inactivity (default)
 )
 pool.connect()
 
@@ -189,6 +193,40 @@ coroutineScope {
 }
 ```
 
+### Keepalive and Sleep/Wake
+
+The pool periodically sends `DATE` commands to keep connections alive. If no activity occurs within the idle grace period, the pool automatically closes all connections (sleeps). The next `withClient` call transparently wakes the pool by reconnecting.
+
+You can also control sleep/wake explicitly:
+
+```kotlin
+// Manually sleep — closes all idle connections
+pool.sleep()
+
+// Manually wake — reconnects all connections
+pool.wake()
+```
+
+Set `keepaliveIntervalMs = 0` to disable keepalive, and `idleGracePeriodMs = 0` to disable automatic sleep.
+
+### Priority Scheduling
+
+When all pool connections are in use, waiting callers are served by priority. Higher `Int` values mean higher priority. Within the same priority level, callers are served in FIFO order.
+
+```kotlin
+// Default priority (0) — backward compatible
+val result = pool.stat("<message-id@host>")
+
+// Higher priority — served before default-priority waiters
+val urgent = pool.article("<important@host>", priority = 10)
+
+// Also works with withClient directly
+pool.withClient(priority = 5) { client ->
+    client.group("alt.binaries.test")
+    client.article(12345L)
+}
+```
+
 ### Other Commands
 
 ```kotlin
@@ -211,15 +249,17 @@ client.close()
 | Method | Description |
 |--------|-------------|
 | `connect()` | Initialize pool connections |
-| `withClient(block)` | Borrow a client, execute block, return client to pool |
-| `bodyYenc(messageId/number)` | Stream yEnc decoded body as `Flow<YencEvent>` |
-| `bodyYencHeaders(messageId/number)` | Retrieve yEnc headers only |
-| `group(name)` | Select newsgroup |
-| `article(messageId/number)` | Retrieve full article |
-| `head(messageId/number)` | Retrieve headers |
-| `body(messageId/number)` | Retrieve body (text) |
-| `stat(messageId/number)` | Check article exists |
-| `close()` | Close all connections |
+| `withClient(priority = 0, block)` | Borrow a client with optional priority, execute block, return client to pool |
+| `sleep()` | Close all idle connections and stop keepalive |
+| `wake()` | Reconnect all connections and restart keepalive |
+| `bodyYenc(messageId/number, priority = 0)` | Stream yEnc decoded body as `Flow<YencEvent>` |
+| `bodyYencHeaders(messageId/number, priority = 0)` | Retrieve yEnc headers only |
+| `group(name, priority = 0)` | Select newsgroup |
+| `article(messageId/number, priority = 0)` | Retrieve full article |
+| `head(messageId/number, priority = 0)` | Retrieve headers |
+| `body(messageId/number, priority = 0)` | Retrieve body (text) |
+| `stat(messageId/number, priority = 0)` | Check article exists |
+| `close()` | Close all connections and cancel waiters |
 
 ### NntpClient
 
@@ -255,6 +295,7 @@ client.close()
 
 - `NntpClientPool` is safe for concurrent use from multiple coroutines
 - The pool uses `supervisorScope` to isolate failures and `NonCancellable` to ensure connections are always returned
+- When all connections are busy, waiting coroutines are dispatched by priority (higher first, FIFO within same priority). Cancelled waiters are cleaned up without leaking connections.
 - After `bodyYencHeaders()` or a cancelled `bodyYenc()`, the connection automatically reconnects in the background and re-authenticates if credentials were provided
 - Each `NntpClient` instance is safe for sequential use from any coroutine
 - A single `SelectorManager` can be shared across all connections
