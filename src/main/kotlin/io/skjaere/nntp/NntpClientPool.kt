@@ -11,8 +11,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
@@ -38,7 +38,8 @@ class NntpClientPool(
     private val scope: CoroutineScope,
     private val keepaliveIntervalMs: Long = DEFAULT_KEEPALIVE_INTERVAL_MS,
     private val idleGracePeriodMs: Long = DEFAULT_IDLE_GRACE_PERIOD_MS,
-    private val meterRegistry: MeterRegistry? = null
+    private val meterRegistry: MeterRegistry? = null,
+    startSleeping: Boolean = true
 ) : Closeable {
 
     companion object {
@@ -68,7 +69,7 @@ class NntpClientPool(
     private var keepaliveJob: Job? = null
 
     @Volatile
-    private var sleeping = false
+    private var sleeping = startSleeping
 
     @Volatile
     private var lastActivityMs = System.currentTimeMillis()
@@ -232,10 +233,12 @@ class NntpClientPool(
 
     private fun recordAcquire(sample: Timer.Sample?, priority: Int) {
         val registry = meterRegistry ?: return
-        sample?.stop(Timer.builder("nntp.pool.acquire")
-            .tag("pool.name", poolName)
-            .tag("priority", priority.toString())
-            .register(registry))
+        sample?.stop(
+            Timer.builder("nntp.pool.acquire")
+                .tag("pool.name", poolName)
+                .tag("priority", priority.toString())
+                .register(registry)
+        )
     }
 
     /**
