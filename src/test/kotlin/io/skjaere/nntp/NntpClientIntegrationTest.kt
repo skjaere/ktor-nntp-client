@@ -51,7 +51,7 @@ class NntpClientIntegrationTest {
             /*username = "username",
             password = "password"*/
         )
-        pool.connect()
+        pool.wake()
         return pool
     }
 

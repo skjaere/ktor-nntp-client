@@ -2,7 +2,7 @@ package io.skjaere.nntp
 
 import io.ktor.network.selector.SelectorManager
 import io.micrometer.core.instrument.Gauge
-import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import kotlin.collections.ArrayDeque
 import kotlinx.coroutines.CancellationException
@@ -38,7 +38,6 @@ class NntpClientPool(
     private val scope: CoroutineScope,
     private val keepaliveIntervalMs: Long = DEFAULT_KEEPALIVE_INTERVAL_MS,
     private val idleGracePeriodMs: Long = DEFAULT_IDLE_GRACE_PERIOD_MS,
-    private val meterRegistry: MeterRegistry? = null,
     startSleeping: Boolean = true
 ) : Closeable {
 
@@ -76,40 +75,31 @@ class NntpClientPool(
 
     private val poolName = "$host:$port"
 
+    private val registry = Metrics.globalRegistry
+
     init {
-        meterRegistry?.let { registry ->
-            Gauge.builder("nntp.pool.idle", idleClients) { it.size.toDouble() }
-                .tag("pool.name", poolName)
-                .register(registry)
-            Gauge.builder("nntp.pool.active", idleClients) { maxConnections - it.size.toDouble() }
-                .tag("pool.name", poolName)
-                .register(registry)
-            Gauge.builder("nntp.pool.waiters", waiters) { it.size.toDouble() }
-                .tag("pool.name", poolName)
-                .register(registry)
-            Gauge.builder("nntp.pool.sleeping", this) { if (it.sleeping) 1.0 else 0.0 }
-                .tag("pool.name", poolName)
-                .register(registry)
-        }
+        Gauge.builder("nntp.pool.idle", idleClients) { it.size.toDouble() }
+            .tag("pool.name", poolName)
+            .register(registry)
+        Gauge.builder("nntp.pool.active", idleClients) { maxConnections - it.size.toDouble() }
+            .tag("pool.name", poolName)
+            .register(registry)
+        Gauge.builder("nntp.pool.waiters", waiters) { it.size.toDouble() }
+            .tag("pool.name", poolName)
+            .register(registry)
+        Gauge.builder("nntp.pool.sleeping", this) { if (it.sleeping) 1.0 else 0.0 }
+            .tag("pool.name", poolName)
+            .register(registry)
     }
 
-    suspend fun connect() {
-        connectAll()
-        sleeping = false
-        lastActivityMs = System.currentTimeMillis()
-        startKeepalive()
-    }
-
-    private suspend fun connectAll() {
-        coroutineScope {
-            repeat(maxConnections) {
-                launch {
-                    val client = if (username != null && password != null)
-                        NntpClient.connect(host, port, selectorManager, useTls, username, password, scope)
-                    else
-                        NntpClient.connect(host, port, selectorManager, useTls, scope)
-                    addClientToPool(client)
-                }
+    private fun launchConnections() {
+        repeat(maxConnections) {
+            scope.launch {
+                val client = if (username != null && password != null)
+                    NntpClient.connect(host, port, selectorManager, useTls, username, password, scope)
+                else
+                    NntpClient.connect(host, port, selectorManager, useTls, scope)
+                addClientToPool(client)
             }
         }
     }
@@ -188,14 +178,14 @@ class NntpClientPool(
         // Drain any stale clients returned after sleep (from in-flight withClient calls)
         val stale = drainIdle()
         stale.forEach { runCatching { it.close() } }
-        connectAll()
+        launchConnections()
         lastActivityMs = System.currentTimeMillis()
         startKeepalive()
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
     private suspend fun acquire(priority: Int = 0): NntpClient {
-        val sample = meterRegistry?.let { Timer.start(it) }
+        val sample = Timer.start(registry)
         val deferred = CompletableDeferred<NntpClient>()
         val waiter = poolMutex.withLock {
             val client = idleClients.removeFirstOrNull()
@@ -231,9 +221,8 @@ class NntpClientPool(
         }
     }
 
-    private fun recordAcquire(sample: Timer.Sample?, priority: Int) {
-        val registry = meterRegistry ?: return
-        sample?.stop(
+    private fun recordAcquire(sample: Timer.Sample, priority: Int) {
+        sample.stop(
             Timer.builder("nntp.pool.acquire")
                 .tag("pool.name", poolName)
                 .tag("priority", priority.toString())
@@ -376,14 +365,12 @@ class NntpClientPool(
                 idleClients.clear()
             }
         }
-        meterRegistry?.let { registry ->
-            registry.find("nntp.pool.idle").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
-            registry.find("nntp.pool.active").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
-            registry.find("nntp.pool.waiters").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
-            registry.find("nntp.pool.sleeping").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
-            registry.find("nntp.pool.acquire").tag("pool.name", poolName).timers().forEach { timer ->
-                registry.remove(timer.id)
-            }
+        registry.find("nntp.pool.idle").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
+        registry.find("nntp.pool.active").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
+        registry.find("nntp.pool.waiters").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
+        registry.find("nntp.pool.sleeping").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
+        registry.find("nntp.pool.acquire").tag("pool.name", poolName).timers().forEach { timer ->
+            registry.remove(timer.id)
         }
     }
 }

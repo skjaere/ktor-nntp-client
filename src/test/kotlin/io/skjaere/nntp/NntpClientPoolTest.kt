@@ -213,7 +213,7 @@ class NntpClientPoolTest {
             maxConnections = 1,
             scope = poolScope
         )
-        pool.connect()
+        pool.wake()
 
         try {
             val headers1 = pool.bodyYencHeaders("<article-1@test>")
@@ -243,7 +243,7 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 500,
             idleGracePeriodMs = 0  // disable auto-sleep
         )
-        pool.connect()
+        pool.wake()
 
         try {
             // Verify stat works initially
@@ -282,7 +282,7 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 0,  // disable keepalive
             idleGracePeriodMs = 0
         )
-        pool.connect()
+        pool.wake()
 
         try {
             // Set up: next STAT on one connection will close the socket
@@ -311,7 +311,7 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 0,
             idleGracePeriodMs = 0
         )
-        pool.connect()
+        pool.wake()
 
         // Kill both server-side sockets
         delay(100)
@@ -344,7 +344,7 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 0,
             idleGracePeriodMs = 0
         )
-        pool.connect()
+        pool.wake()
 
         try {
             failOnce.set(true)
@@ -399,7 +399,7 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 0,
             idleGracePeriodMs = 0
         )
-        pool.connect()
+        pool.wake()
 
         try {
             // stat() returns StatResult.NotFound for 430, not an exception
@@ -427,8 +427,10 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 200,
             idleGracePeriodMs = 500
         )
-        pool.connect()
+        pool.wake()
 
+        // Use withClient to ensure connection is established before checking
+        pool.withClient { it.stat("<test@msg>") }
         assertEquals(1, sockets.size, "Should have 1 initial connection")
 
         // Wait for grace period + keepalive interval to trigger sleep
@@ -457,7 +459,7 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 200,
             idleGracePeriodMs = 500
         )
-        pool.connect()
+        pool.wake()
 
         // Wait for auto-sleep to trigger
         delay(1500)
@@ -484,7 +486,7 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 0,
             idleGracePeriodMs = 0
         )
-        pool.connect()
+        pool.wake()
 
         // Verify working
         val result1 = pool.stat("<test@msg>")
@@ -521,7 +523,7 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 0,
             idleGracePeriodMs = 0
         )
-        pool.connect()
+        pool.wake()
 
         try {
             val served = CopyOnWriteArrayList<String>()
@@ -584,7 +586,7 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 0,
             idleGracePeriodMs = 0
         )
-        pool.connect()
+        pool.wake()
 
         try {
             val served = CopyOnWriteArrayList<String>()
@@ -642,7 +644,7 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 0,
             idleGracePeriodMs = 0
         )
-        pool.connect()
+        pool.wake()
 
         try {
             val gate = CompletableDeferred<Unit>()
@@ -692,7 +694,7 @@ class NntpClientPoolTest {
             keepaliveIntervalMs = 0,
             idleGracePeriodMs = 0
         )
-        pool.connect()
+        pool.wake()
 
         try {
             // Call withClient without priority arg twice sequentially
