@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.2.0...v0.3.0) (2026-02-26)
+
+
+### Features
+
+* supporting pool lease priority
+
 ## [0.2.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.1.2...v0.2.0) (2026-02-25)
 
 
