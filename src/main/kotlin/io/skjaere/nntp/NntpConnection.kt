@@ -34,13 +34,16 @@ class NntpConnection private constructor(
 ) : Closeable {
 
     internal val commandMutex = Mutex()
-    @Volatile private var reconnecting: CompletableDeferred<Unit>? = null
-    @Volatile private var socket: Socket = socket
-    @Volatile private var readChannel: ByteReadChannel = readChannel
-    @Volatile private var writeChannel: ByteWriteChannel = writeChannel
+    @Volatile
+    private var reconnecting: CompletableDeferred<Unit>? = null
+    @Volatile
+    private var socket: Socket = socket
+    @Volatile
+    private var readChannel: ByteReadChannel = readChannel
+    @Volatile
+    private var writeChannel: ByteWriteChannel = writeChannel
     private var username: String? = null
     private var password: String? = null
-    private val logger = LoggerFactory.getLogger(NntpConnection::class.java)
 
     companion object {
         private val log = LoggerFactory.getLogger(NntpConnection::class.java)
@@ -79,7 +82,7 @@ class NntpConnection private constructor(
             selectorManager: SelectorManager,
             useTls: Boolean
         ): Socket {
-            log.info("openSocket called with host='{}', port={}, useTls={}", host, port, useTls)
+            log.debug("openSocket called with host='{}', port={}, useTls={}", host, port, useTls)
             val rawSocket = aSocket(selectorManager).tcp().connect(host, port)
             return if (useTls) {
                 rawSocket.tls(coroutineContext = Dispatchers.IO)
@@ -136,7 +139,7 @@ class NntpConnection private constructor(
             val current = reconnecting
             if (current != null && !current.isCompleted) return
 
-            logger.info("scheduleReconnect called, host='{}', port={}", host, port)
+            log.debug("scheduleReconnect called, host='{}', port={}", host, port)
             try {
                 socket.close()
             } catch (_: Exception) {
@@ -148,7 +151,7 @@ class NntpConnection private constructor(
 
             scope.launch {
                 try {
-                    logger.info("Reconnecting to host='{}', port={}", host, port)
+                    log.debug("Reconnecting to host='{}', port={}", host, port)
                     val newSocket = openSocket(host, port, selectorManager, useTls)
                     readChannel = newSocket.openReadChannel()
                     writeChannel = newSocket.openWriteChannel(autoFlush = true)
@@ -165,7 +168,7 @@ class NntpConnection private constructor(
 
                     deferred.complete(Unit)
                 } catch (e: Exception) {
-                    logger.error("Reconnect failed for host='{}', port={}", host, port, e)
+                    log.error("Reconnect failed for host='{}', port={}", host, port, e)
                     deferred.completeExceptionally(
                         NntpConnectionException("Reconnect failed: ${e.message}", e)
                     )
