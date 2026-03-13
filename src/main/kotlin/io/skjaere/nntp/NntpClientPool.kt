@@ -22,8 +22,10 @@ import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
 import java.io.Closeable
+import java.nio.channels.UnresolvedAddressException
 import java.util.PriorityQueue
 
 class NntpClientPool(
@@ -42,6 +44,9 @@ class NntpClientPool(
     companion object {
         const val DEFAULT_KEEPALIVE_INTERVAL_MS = 60_000L
         const val DEFAULT_IDLE_GRACE_PERIOD_MS = 300_000L // 5 minutes
+        const val CONNECT_RETRY_BASE_DELAY_MS = 1_000L
+        const val CONNECT_RETRY_MAX_DELAY_MS = 30_000L
+        const val ACQUIRE_TIMEOUT_MS = 30_000L
     }
 
     private class PriorityWaiter(
@@ -93,13 +98,32 @@ class NntpClientPool(
     private fun launchConnections() {
         repeat(maxConnections) {
             scope.launch {
-                val client = if (username != null && password != null)
+                connectWithRetry()?.let { addClientToPool(it) }
+            }
+        }
+    }
+
+    private suspend fun connectWithRetry(): NntpClient? {
+        var delayMs = CONNECT_RETRY_BASE_DELAY_MS
+        while (currentCoroutineContext().isActive && !closed) {
+            try {
+                return if (username != null && password != null)
                     NntpClient.connect(host, port, selectorManager, useTls, username, password, scope)
                 else
                     NntpClient.connect(host, port, selectorManager, useTls, scope)
-                addClientToPool(client)
+            } catch (e: UnresolvedAddressException) {
+                logger.error("Failed to resolve host '{}:{}': {}", host, port, e.message)
+                delay(delayMs)
+                delayMs = (delayMs * 2).coerceAtMost(CONNECT_RETRY_MAX_DELAY_MS)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn("Failed to connect to {}:{}: {}", host, port, e.message)
+                delay(delayMs)
+                delayMs = (delayMs * 2).coerceAtMost(CONNECT_RETRY_MAX_DELAY_MS)
             }
         }
+        return null
     }
 
     private fun startKeepalive() {
@@ -199,11 +223,25 @@ class NntpClientPool(
             recordAcquire(sample, priority)
             return deferred.getCompleted()
         }
-        // Await outside the lock
+        // Await outside the lock with timeout
         try {
-            val client = deferred.await()
-            recordAcquire(sample, priority)
-            return client
+            val client = withTimeoutOrNull(ACQUIRE_TIMEOUT_MS) { deferred.await() }
+            if (client != null) {
+                recordAcquire(sample, priority)
+                return client
+            }
+            // Timed out — remove waiter and fail
+            poolMutex.withLock { waiters.remove(waiter) }
+            if (deferred.isCompleted) {
+                try {
+                    addClientToPool(deferred.getCompleted())
+                } catch (_: IllegalStateException) {
+                    // deferred completed exceptionally
+                }
+            }
+            throw NntpConnectionException(
+                "Timed out waiting for connection to $host:$port (${ACQUIRE_TIMEOUT_MS}ms)"
+            )
         } catch (e: CancellationException) {
             // On cancellation, remove from queue and handle race where client was already completed
             poolMutex.withLock { waiters.remove(waiter) }
