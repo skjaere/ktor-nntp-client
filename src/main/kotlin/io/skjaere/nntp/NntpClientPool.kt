@@ -15,6 +15,9 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.retry
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -46,6 +49,7 @@ class NntpClientPool(
         const val DEFAULT_IDLE_GRACE_PERIOD_MS = 300_000L // 5 minutes
         const val CONNECT_RETRY_BASE_DELAY_MS = 1_000L
         const val CONNECT_RETRY_MAX_DELAY_MS = 30_000L
+        const val CONNECT_MAX_RETRIES = 5L
         const val ACQUIRE_TIMEOUT_MS = 30_000L
     }
 
@@ -105,25 +109,24 @@ class NntpClientPool(
 
     private suspend fun connectWithRetry(): NntpClient? {
         var delayMs = CONNECT_RETRY_BASE_DELAY_MS
-        while (currentCoroutineContext().isActive && !closed) {
-            try {
-                return if (username != null && password != null)
+        return flow {
+            emit(
+                if (username != null && password != null)
                     NntpClient.connect(host, port, selectorManager, useTls, username, password, scope)
                 else
                     NntpClient.connect(host, port, selectorManager, useTls, scope)
-            } catch (e: UnresolvedAddressException) {
-                logger.error("Failed to resolve host '{}:{}': {}", host, port, e.message)
-                delay(delayMs)
-                delayMs = (delayMs * 2).coerceAtMost(CONNECT_RETRY_MAX_DELAY_MS)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                logger.warn("Failed to connect to {}:{}: {}", host, port, e.message)
-                delay(delayMs)
-                delayMs = (delayMs * 2).coerceAtMost(CONNECT_RETRY_MAX_DELAY_MS)
+            )
+        }.retry(CONNECT_MAX_RETRIES) { e ->
+            when (e) {
+                is UnresolvedAddressException ->
+                    logger.error("Failed to resolve host '{}:{}': {}", host, port, e.message)
+                else ->
+                    logger.warn("Failed to connect to {}:{}: {}", host, port, e.message)
             }
-        }
-        return null
+            delay(delayMs)
+            delayMs = (delayMs * 2).coerceAtMost(CONNECT_RETRY_MAX_DELAY_MS)
+            true
+        }.firstOrNull()
     }
 
     private fun startKeepalive() {
