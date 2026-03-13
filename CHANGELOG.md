@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/skjaere/ktor-nntp-client/compare/v0.4.0...v0.4.1) (2026-03-13)
+
+
+### Bug Fixes
+
+* retry connections with backoff and add acquire timeout ([76eaff4](https://github.com/skjaere/ktor-nntp-client/commit/76eaff4844d93d3ec5c731ffd7689076c6381fad))
+
 ## [0.4.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.3.1...v0.4.0) (2026-02-26)
 
 
