@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/skjaere/ktor-nntp-client/compare/v0.4.1...v0.4.2) (2026-03-18)
+
+
+### Bug Fixes
+
+* gracefully cancel TLS coroutines on reconnect and close ([076a7d0](https://github.com/skjaere/ktor-nntp-client/commit/076a7d07fce43ff719ad70038fb2c5231cf4afc9))
+
 ## [0.4.1](https://github.com/skjaere/ktor-nntp-client/compare/v0.4.0...v0.4.1) (2026-03-13)
 
 
