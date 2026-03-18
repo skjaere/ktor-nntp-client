@@ -15,6 +15,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -140,17 +141,25 @@ class NntpConnection private constructor(
             if (current != null && !current.isCompleted) return
 
             log.debug("scheduleReconnect called, host='{}', port={}", host, port)
-            try {
-                socket.close()
-            } catch (_: Exception) {
-                // Ignore close errors on poisoned socket
-            }
+            val oldSocket = socket
+            // Cancel TLS coroutines gracefully instead of abruptly closing the socket.
+            // This lets the TLS output actor and input producer finish their current
+            // operation before we tear down the connection.
+            oldSocket.socketContext.cancel()
 
             val deferred = CompletableDeferred<Unit>()
             reconnecting = deferred
 
             scope.launch {
                 try {
+                    // Wait for TLS coroutines to complete cancellation
+                    oldSocket.socketContext.join()
+                    try {
+                        oldSocket.close()
+                    } catch (_: Exception) {
+                        // Ignore close errors on poisoned socket
+                    }
+
                     log.debug("Reconnecting to host='{}', port={}", host, port)
                     val newSocket = openSocket(host, port, selectorManager, useTls)
                     readChannel = newSocket.openReadChannel()
@@ -263,6 +272,7 @@ class NntpConnection private constructor(
     override fun close() {
         reconnecting?.cancel()
         try {
+            socket.socketContext.cancel()
             socket.close()
         } catch (_: Exception) {
             // Ignore
