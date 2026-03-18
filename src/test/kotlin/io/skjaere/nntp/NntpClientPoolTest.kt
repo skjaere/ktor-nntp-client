@@ -43,6 +43,7 @@ class NntpClientPoolTest {
 
     @AfterEach
     fun tearDown() {
+        poolScope.cancel()
         serverSocket.close()
         selectorManager.close()
     }

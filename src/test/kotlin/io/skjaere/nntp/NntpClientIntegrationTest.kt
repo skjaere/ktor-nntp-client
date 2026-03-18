@@ -7,6 +7,7 @@ import io.skjaere.yenc.RapidYenc
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -38,6 +39,7 @@ class NntpClientIntegrationTest {
 
     @AfterEach
     fun tearDown() {
+        poolScope.cancel()
         selectorManager.close()
     }
 
