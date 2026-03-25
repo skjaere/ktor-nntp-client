@@ -12,6 +12,7 @@ import io.ktor.utils.io.readByte
 import io.ktor.utils.io.readLine
 import io.ktor.utils.io.writeStringUtf8
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -35,6 +36,7 @@ class NntpConnection private constructor(
 ) : Closeable {
 
     internal val commandMutex = Mutex()
+    val isChannelClosed: Boolean get() = writeChannel.isClosedForWrite
     @Volatile
     private var reconnecting: CompletableDeferred<Unit>? = null
     @Volatile
@@ -77,6 +79,10 @@ class NntpConnection private constructor(
             )
         }
 
+        private val tlsExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+            log.debug("TLS actor terminated: {}", throwable.message)
+        }
+
         private suspend fun openSocket(
             host: String,
             port: Int,
@@ -86,7 +92,7 @@ class NntpConnection private constructor(
             log.debug("openSocket called with host='{}', port={}, useTls={}", host, port, useTls)
             val rawSocket = aSocket(selectorManager).tcp().connect(host, port)
             return if (useTls) {
-                rawSocket.tls(coroutineContext = Dispatchers.IO)
+                rawSocket.tls(coroutineContext = Dispatchers.IO + tlsExceptionHandler)
             } else {
                 rawSocket
             }

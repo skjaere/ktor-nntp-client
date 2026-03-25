@@ -5,6 +5,7 @@ import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import kotlin.collections.ArrayDeque
+import java.io.IOException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -213,7 +214,21 @@ class NntpClientPool(
         val sample = Timer.start(registry)
         val deferred = CompletableDeferred<NntpClient>()
         val waiter = poolMutex.withLock {
-            val client = idleClients.removeFirstOrNull()
+            var client: NntpClient? = null
+            var checked = 0
+            val poolSize = idleClients.size
+            while (checked < poolSize) {
+                val candidate = idleClients.removeFirstOrNull() ?: break
+                checked++
+                if (candidate.connection.isChannelClosed) {
+                    logger.debug("Skipping dead connection (channel closed), scheduling reconnect")
+                    candidate.connection.scheduleReconnect()
+                    idleClients.addLast(candidate)
+                } else {
+                    client = candidate
+                    break
+                }
+            }
             if (client != null) {
                 deferred.complete(client)
                 return@withLock null
@@ -303,6 +318,12 @@ class NntpClientPool(
             returnToPool(client)
             returned = true
             return retryWithDifferentClient(priority, block)
+        } catch (e: IOException) {
+            logger.debug("I/O error ({}), scheduling reconnect and retrying: {}", e::class.simpleName, e.message)
+            client.connection.scheduleReconnect()
+            returnToPool(client)
+            returned = true
+            return retryWithDifferentClient(priority, block)
         } finally {
             if (!returned) returnToPool(client)
         }
@@ -320,6 +341,10 @@ class NntpClientPool(
             logger.debug("Retry also failed, scheduling reconnect: {}", e.message)
             client.connection.scheduleReconnect()
             throw e
+        } catch (e: IOException) {
+            logger.debug("Retry I/O error ({}), scheduling reconnect: {}", e::class.simpleName, e.message)
+            client.connection.scheduleReconnect()
+            throw NntpConnectionException("I/O error on retry: ${e.message}", e)
         } finally {
             returnToPool(client)
         }
