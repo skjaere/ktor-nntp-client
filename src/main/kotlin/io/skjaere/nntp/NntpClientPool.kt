@@ -48,6 +48,8 @@ class NntpClientPool(
     companion object {
         const val DEFAULT_KEEPALIVE_INTERVAL_MS = 60_000L
         const val DEFAULT_IDLE_GRACE_PERIOD_MS = 300_000L // 5 minutes
+        const val DEFAULT_SHRINK_IDLE_CYCLES = 2  // shrink after idle for this many keepalive cycles
+        const val MIN_POOL_SIZE = 1  // always keep at least one connection
         const val CONNECT_RETRY_BASE_DELAY_MS = 1_000L
         const val CONNECT_RETRY_MAX_DELAY_MS = 30_000L
         const val CONNECT_MAX_RETRIES = 5L
@@ -72,6 +74,8 @@ class NntpClientPool(
     private val idleClients = ArrayDeque<NntpClient>()
     private val waiters = PriorityQueue<PriorityWaiter>()
     private var waiterSequence = 0L
+    private var currentSize = 0  // total connections: idle + in-use + connecting
+    private var consecutiveAllIdleCycles = 0  // how many keepalive cycles all connections were idle
     private var closed = false
     private var keepaliveJob: Job? = null
 
@@ -89,7 +93,10 @@ class NntpClientPool(
         Gauge.builder("nntp.pool.idle", idleClients) { it.size.toDouble() }
             .tag("pool.name", poolName)
             .register(registry)
-        Gauge.builder("nntp.pool.active", idleClients) { maxConnections - it.size.toDouble() }
+        Gauge.builder("nntp.pool.active", this) { (it.currentSize - it.idleClients.size).toDouble() }
+            .tag("pool.name", poolName)
+            .register(registry)
+        Gauge.builder("nntp.pool.size", this) { it.currentSize.toDouble() }
             .tag("pool.name", poolName)
             .register(registry)
         Gauge.builder("nntp.pool.waiters", waiters) { it.size.toDouble() }
@@ -100,10 +107,19 @@ class NntpClientPool(
             .register(registry)
     }
 
-    private fun launchConnections() {
-        repeat(maxConnections) {
-            scope.launch {
-                connectWithRetry()?.let { addClientToPool(it) }
+    /**
+     * Launch a single new connection in the background.
+     * On success the client is dispatched to a waiter or parked idle.
+     * On failure [currentSize] is decremented so the slot can be reused.
+     * Must only be called after incrementing [currentSize] under [poolMutex].
+     */
+    private fun launchConnection() {
+        scope.launch {
+            val client = connectWithRetry()
+            if (client != null) {
+                addClientToPool(client)
+            } else {
+                poolMutex.withLock { currentSize-- }
             }
         }
     }
@@ -148,6 +164,8 @@ class NntpClientPool(
                 continue
             }
             val clients = drainIdle()
+            val allIdle = poolMutex.withLock { clients.size == currentSize }
+
             for (client in clients) {
                 try {
                     client.date()
@@ -157,6 +175,33 @@ class NntpClientPool(
                 } catch (_: Exception) {
                 }
                 returnToPool(client)
+            }
+
+            // Shrink: if all connections have been idle for multiple cycles, close excess
+            if (allIdle && clients.size > MIN_POOL_SIZE) {
+                consecutiveAllIdleCycles++
+                if (consecutiveAllIdleCycles >= DEFAULT_SHRINK_IDLE_CYCLES) {
+                    // Close half the excess connections (keep at least MIN_POOL_SIZE)
+                    val toClose = (clients.size - MIN_POOL_SIZE + 1) / 2
+                    if (toClose > 0) {
+                        val removed = poolMutex.withLock {
+                            val removing = mutableListOf<NntpClient>()
+                            repeat(toClose) {
+                                val client = idleClients.removeLastOrNull() ?: return@repeat
+                                removing.add(client)
+                            }
+                            currentSize -= removing.size
+                            removing
+                        }
+                        for (client in removed) {
+                            runCatching { client.close() }
+                        }
+                        logger.info("Shrunk pool by {} connections (now {})", removed.size, currentSize)
+                        consecutiveAllIdleCycles = 0
+                    }
+                }
+            } else {
+                consecutiveAllIdleCycles = 0
             }
         }
     }
@@ -186,6 +231,7 @@ class NntpClientPool(
         for (client in clients) {
             runCatching { client.close() }
         }
+        poolMutex.withLock { currentSize -= clients.size }
         logger.info("Pool is now sleeping ({} connections closed)", clients.size)
     }
 
@@ -200,11 +246,10 @@ class NntpClientPool(
             true
         }
         if (!shouldWake) return
-        logger.info("Waking pool, reconnecting {} connections", maxConnections)
+        logger.info("Waking pool (connections will be created on demand, max={})", maxConnections)
         // Drain any stale clients returned after sleep (from in-flight withClient calls)
         val stale = drainIdle()
         stale.forEach { runCatching { it.close() } }
-        launchConnections()
         lastActivityMs = System.currentTimeMillis()
         startKeepalive()
     }
@@ -235,6 +280,11 @@ class NntpClientPool(
             }
             val w = PriorityWaiter(priority, deferred, waiterSequence++)
             waiters.add(w)
+            // Launch a new connection if we haven't reached the max
+            if (currentSize < maxConnections) {
+                currentSize++
+                launchConnection()
+            }
             w
         }
         if (waiter == null) {
@@ -308,6 +358,7 @@ class NntpClientPool(
     suspend fun <T> withClient(priority: Int = 0, block: suspend (NntpClient) -> T): T {
         if (sleeping) doWake()
         lastActivityMs = System.currentTimeMillis()
+        consecutiveAllIdleCycles = 0
         val client = acquire(priority)
         var returned = false
         try {
@@ -426,11 +477,13 @@ class NntpClientPool(
                 for (client in idleClients) {
                     runCatching { client.close() }
                 }
+                currentSize -= idleClients.size
                 idleClients.clear()
             }
         }
         registry.find("nntp.pool.idle").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
         registry.find("nntp.pool.active").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
+        registry.find("nntp.pool.size").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
         registry.find("nntp.pool.waiters").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
         registry.find("nntp.pool.sleeping").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
         registry.find("nntp.pool.acquire").tag("pool.name", poolName).timers().forEach { timer ->

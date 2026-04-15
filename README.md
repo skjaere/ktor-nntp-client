@@ -9,9 +9,13 @@ A Kotlin NNTP (Network News Transfer Protocol) client library built on Ktor's as
 ## Features
 
 - Full RFC 3977 NNTP command support
-- Connection pool with automatic reconnection, keepalive, sleep/wake, and priority scheduling
+- Connection pool with lazy initialization, automatic reconnection, keepalive, sleep/wake, and priority scheduling
+- Lazy connection creation -- connections are opened on demand up to `maxConnections`, not all at once
+- Automatic pool shrinking -- excess idle connections are closed when demand drops
 - Idle connection keepalive with configurable interval
 - Automatic sleep after configurable idle grace period, with transparent wake-on-demand
+- Dead connection detection -- closed channels are detected at acquire time before leasing
+- I/O error recovery -- TLS/socket exceptions trigger automatic reconnect and retry
 - Flow-based streaming yEnc body decoding
 - Lightweight yEnc header retrieval without downloading the full body
 - SIMD-accelerated yEnc decoding via rapidyenc native library
@@ -44,7 +48,7 @@ dependencies {
 
 ### Connection Pool (Recommended)
 
-`NntpClientPool` manages a pool of connections with automatic reconnection. This is the recommended way to use the library.
+`NntpClientPool` manages a pool of connections with lazy initialization, automatic reconnection, and retry. This is the recommended way to use the library.
 
 ```kotlin
 val selectorManager = SelectorManager(Dispatchers.IO)
@@ -61,16 +65,15 @@ val pool = NntpClientPool(
     keepaliveIntervalMs = 60_000,   // send DATE every 60s to keep connections alive (default)
     idleGracePeriodMs = 300_000     // sleep after 5 minutes of inactivity (default)
 )
-pool.connect()
 
-// All commands are delegated through the pool
+// No connect() call needed -- connections are created lazily on first use
 val group = pool.group("alt.binaries.test")
 println("Articles: ${group.count}, range: ${group.low}-${group.high}")
 
 pool.close()
 ```
 
-After operations that consume partial data (like `bodyYencHeaders`), the pool automatically reconnects the underlying connection and re-authenticates before reusing it. Callers don't need to manage connection state.
+Connections are created on demand as requests come in, up to `maxConnections`. When demand drops, excess idle connections are automatically closed over time. If a connection fails (server close, TLS error), the pool transparently reconnects and retries with a different connection.
 
 ### Direct Connection
 
@@ -160,13 +163,13 @@ if (headers.part != null) {
     println("Byte range: ${headers.partBegin}-${headers.partEnd}")
 }
 
-// Subsequent commands work immediately — the pool handles reconnection transparently
+// Subsequent commands work immediately -- the pool handles reconnection transparently
 val nextHeaders = pool.bodyYencHeaders("<another-message-id@host>")
 ```
 
 ### Concurrent Downloads
 
-With the connection pool, concurrent downloads are handled automatically:
+With the connection pool, concurrent downloads are handled automatically. Connections scale up to `maxConnections` as concurrent requests arrive:
 
 ```kotlin
 val pool = NntpClientPool(
@@ -176,7 +179,6 @@ val pool = NntpClientPool(
     maxConnections = 10,
     scope = scope
 )
-pool.connect()
 
 coroutineScope {
     messageIds.map { msgId ->
@@ -193,17 +195,19 @@ coroutineScope {
 }
 ```
 
-### Keepalive and Sleep/Wake
+### Keepalive, Sleep/Wake, and Pool Shrinking
 
-The pool periodically sends `DATE` commands to keep connections alive. If no activity occurs within the idle grace period, the pool automatically closes all connections (sleeps). The next `withClient` call transparently wakes the pool by reconnecting.
+The pool periodically sends `DATE` commands to keep connections alive. If no activity occurs within the idle grace period, the pool automatically closes all connections (sleeps). The next `withClient` call transparently wakes the pool.
+
+When demand drops, the pool gradually shrinks by closing excess idle connections. After 2 consecutive keepalive cycles where all connections are idle, the pool closes half the excess (keeping at least 1). This continues until the pool reaches minimum size. New connections are created again on demand when traffic increases.
 
 You can also control sleep/wake explicitly:
 
 ```kotlin
-// Manually sleep — closes all idle connections
+// Manually sleep -- closes all idle connections
 pool.sleep()
 
-// Manually wake — reconnects all connections
+// Manually wake -- re-enables the pool (connections created on demand)
 pool.wake()
 ```
 
@@ -214,10 +218,10 @@ Set `keepaliveIntervalMs = 0` to disable keepalive, and `idleGracePeriodMs = 0` 
 When all pool connections are in use, waiting callers are served by priority. Higher `Int` values mean higher priority. Within the same priority level, callers are served in FIFO order.
 
 ```kotlin
-// Default priority (0) — backward compatible
+// Default priority (0) -- backward compatible
 val result = pool.stat("<message-id@host>")
 
-// Higher priority — served before default-priority waiters
+// Higher priority -- served before default-priority waiters
 val urgent = pool.article("<important@host>", priority = 10)
 
 // Also works with withClient directly
@@ -248,10 +252,9 @@ client.close()
 
 | Method | Description |
 |--------|-------------|
-| `connect()` | Initialize pool connections |
 | `withClient(priority = 0, block)` | Borrow a client with optional priority, execute block, return client to pool |
 | `sleep()` | Close all idle connections and stop keepalive |
-| `wake()` | Reconnect all connections and restart keepalive |
+| `wake()` | Re-enable the pool (connections created on demand) |
 | `bodyYenc(messageId/number, priority = 0)` | Stream yEnc decoded body as `Flow<YencEvent>` |
 | `bodyYencHeaders(messageId/number, priority = 0)` | Retrieve yEnc headers only |
 | `group(name, priority = 0)` | Select newsgroup |
@@ -291,12 +294,26 @@ client.close()
 | `date()` | Server date |
 | `quit()` | Close session |
 
+### Metrics
+
+The pool exposes the following Micrometer gauges (tagged with `pool.name`):
+
+| Metric | Description |
+|--------|-------------|
+| `nntp.pool.idle` | Number of idle connections |
+| `nntp.pool.active` | Number of connections currently in use |
+| `nntp.pool.size` | Total connections (idle + active + connecting) |
+| `nntp.pool.waiters` | Number of callers waiting for a connection |
+| `nntp.pool.sleeping` | 1 if pool is sleeping, 0 otherwise |
+| `nntp.pool.acquire` | Timer for connection acquire latency (tagged by priority) |
+
 ### Thread Safety
 
 - `NntpClientPool` is safe for concurrent use from multiple coroutines
 - The pool uses `supervisorScope` to isolate failures and `NonCancellable` to ensure connections are always returned
 - When all connections are busy, waiting coroutines are dispatched by priority (higher first, FIFO within same priority). Cancelled waiters are cleaned up without leaking connections.
 - After `bodyYencHeaders()` or a cancelled `bodyYenc()`, the connection automatically reconnects in the background and re-authenticates if credentials were provided
+- I/O errors (e.g., `ClosedWriteChannelException` from TLS) trigger automatic reconnect and retry with a different connection
 - Each `NntpClient` instance is safe for sequential use from any coroutine
 - A single `SelectorManager` can be shared across all connections
 
@@ -310,6 +327,6 @@ client.close()
 
 ## Dependencies
 
-- Ktor Network 3.4.0
-- rapidyenc-kotlin-wrapper 0.1.0
+- Ktor Network 3.4.1
+- rapidyenc-kotlin-wrapper 0.1.3
 - Kotlin Coroutines 1.10.1
