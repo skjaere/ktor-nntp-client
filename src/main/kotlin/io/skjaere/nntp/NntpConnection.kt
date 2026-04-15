@@ -17,6 +17,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -49,6 +50,8 @@ class NntpConnection private constructor(
     private var password: String? = null
 
     companion object {
+        private const val RECONNECT_MAX_ATTEMPTS = 3
+        private const val RECONNECT_RETRY_DELAY_MS = 2_000L
         private val log = LoggerFactory.getLogger(NntpConnection::class.java)
         suspend fun connect(
             host: String,
@@ -167,19 +170,7 @@ class NntpConnection private constructor(
                     }
 
                     log.debug("Reconnecting to host='{}', port={}", host, port)
-                    val newSocket = openSocket(host, port, selectorManager, useTls)
-                    readChannel = newSocket.openReadChannel()
-                    writeChannel = newSocket.openWriteChannel(autoFlush = true)
-                    socket = newSocket
-                    // Read and discard welcome message
-                    readChannel.readLine()
-
-                    // Re-authenticate if credentials are stored
-                    val user = username
-                    val pass = password
-                    if (user != null && pass != null) {
-                        performAuth(user, pass)
-                    }
+                    reconnectWithRetry()
 
                     deferred.complete(Unit)
                 } catch (e: Exception) {
@@ -190,6 +181,40 @@ class NntpConnection private constructor(
                 }
             }
         }
+    }
+
+    private suspend fun reconnectWithRetry() {
+        var lastException: Exception? = null
+        for (attempt in 1..RECONNECT_MAX_ATTEMPTS) {
+            try {
+                val newSocket = openSocket(host, port, selectorManager, useTls)
+                readChannel = newSocket.openReadChannel()
+                writeChannel = newSocket.openWriteChannel(autoFlush = true)
+                socket = newSocket
+                // Read and discard welcome message
+                readChannel.readLine()
+
+                // Re-authenticate if credentials are stored
+                val user = username
+                val pass = password
+                if (user != null && pass != null) {
+                    performAuth(user, pass)
+                }
+                return
+            } catch (e: NntpAuthenticationException) {
+                // Server may still count old connection as active — back off and retry
+                lastException = e
+                log.debug(
+                    "Reconnect attempt {}/{} failed ({}), retrying in {}ms",
+                    attempt, RECONNECT_MAX_ATTEMPTS, e.message, RECONNECT_RETRY_DELAY_MS * attempt
+                )
+                delay(RECONNECT_RETRY_DELAY_MS * attempt)
+            }
+        }
+        throw NntpConnectionException(
+            "Reconnect failed after $RECONNECT_MAX_ATTEMPTS attempts: ${lastException?.message}",
+            lastException
+        )
     }
 
     suspend fun command(cmd: String): NntpResponse = commandMutex.withLock {
