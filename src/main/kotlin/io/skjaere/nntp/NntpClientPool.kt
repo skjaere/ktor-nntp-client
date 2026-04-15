@@ -119,11 +119,18 @@ class NntpClientPool(
      */
     private fun launchConnection() {
         scope.launch {
-            val client = connectWithRetry()
+            val client: NntpClient? = try {
+                connectWithRetry()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn("Connection attempt failed permanently: {}", e.message)
+                null
+            }
             if (client != null) {
-                addClientToPool(client)
+                withContext(NonCancellable) { addClientToPool(client) }
             } else {
-                poolMutex.withLock { currentSize-- }
+                withContext(NonCancellable) { poolMutex.withLock { currentSize-- } }
             }
         }
     }
@@ -340,7 +347,12 @@ class NntpClientPool(
 
     private suspend fun addClientToPool(client: NntpClient) {
         poolMutex.withLock {
-            dispatchOrPark(client)
+            if (closed) {
+                currentSize--
+                runCatching { client.close() }
+            } else {
+                dispatchOrPark(client)
+            }
         }
     }
 
@@ -352,18 +364,19 @@ class NntpClientPool(
         consecutiveAllIdleCycles = 0
         return supervisorScope {
             flow {
-                val client = acquire(priority)
+                var client: NntpClient? = null
                 try {
+                    client = acquire(priority)
                     client.connection.ensureConnected()
                     emit(block(client))
                 } catch (e: NntpConnectionException) {
-                    client.connection.scheduleReconnect()
+                    client?.connection?.scheduleReconnect()
                     throw e
                 } catch (e: IOException) {
-                    client.connection.scheduleReconnect()
+                    client?.connection?.scheduleReconnect()
                     throw e
                 } finally {
-                    returnToPool(client)
+                    client?.let { returnToPool(it) }
                 }
             }.retry(commandRetries.toLong()) { e ->
                 val retryable = e is NntpConnectionException || e is IOException
