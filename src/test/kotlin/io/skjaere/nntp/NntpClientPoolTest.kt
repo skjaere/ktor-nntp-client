@@ -1,6 +1,8 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.*
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import io.skjaere.yenc.RapidYenc
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -823,6 +825,102 @@ class NntpClientPoolTest {
             assertTrue(result is StatResult.Found)
         } finally {
             pool.close()
+        }
+    }
+
+    @Test
+    @Timeout(45, unit = TimeUnit.SECONDS)
+    fun `currentSize decrements when all connection retries fail`() = runBlocking {
+        // Server that immediately refuses connections
+        serverSocket.close()
+        serverSocket = ServerSocket(0)
+        val closedPort = serverSocket.localPort
+        serverSocket.close()
+
+        val registry = SimpleMeterRegistry()
+        Metrics.addRegistry(registry)
+        try {
+            val pool = NntpClientPool(
+                host = "localhost",
+                port = closedPort,
+                selectorManager = selectorManager,
+                maxConnections = 2,
+                scope = poolScope,
+                keepaliveIntervalMs = 0,
+                idleGracePeriodMs = 0
+            )
+            pool.wake()
+
+            val poolName = "localhost:$closedPort"
+
+            // Trigger a connection attempt, then cancel the caller immediately.
+            // This leaves the background launchConnection running.
+            val job = launch {
+                pool.withClient { delay(Long.MAX_VALUE) }
+            }
+            delay(200) // let acquire trigger launchConnection
+            job.cancel()
+
+            // connectWithRetry does up to 5 retries with exponential backoff (1+2+4+8+16=31s).
+            // After all retries fail, launchConnection should decrement currentSize.
+            delay(35_000)
+
+            val sizeGauge = registry.find("nntp.pool.size").tag("pool.name", poolName).gauge()
+            assertEquals(0.0, sizeGauge?.value() ?: -1.0, "currentSize should be 0 after failed connections")
+
+            pool.close()
+        } finally {
+            Metrics.removeRegistry(registry)
+        }
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `cancelled withClient does not leak connections`() = runBlocking {
+        launchCommandServer(maxAccepts = 10)
+
+        val registry = SimpleMeterRegistry()
+        Metrics.addRegistry(registry)
+        try {
+            val pool = NntpClientPool(
+                host = "localhost",
+                port = serverSocket.localPort,
+                selectorManager = selectorManager,
+                maxConnections = 2,
+                scope = poolScope,
+                keepaliveIntervalMs = 0,
+                idleGracePeriodMs = 0
+            )
+            pool.wake()
+
+            val poolName = "localhost:${serverSocket.localPort}"
+
+            // Launch many concurrent withClient calls and cancel them
+            repeat(5) {
+                val job = launch {
+                    pool.withClient {
+                        delay(Long.MAX_VALUE) // block forever
+                    }
+                }
+                delay(100)
+                job.cancel()
+                delay(50)
+            }
+
+            // All connections should be returned — pool should still work
+            val result = pool.stat("<test@msg>")
+            assertTrue(result is StatResult.Found)
+
+            // idle + active should equal size (no leaked slots)
+            val sizeGauge = registry.find("nntp.pool.size").tag("pool.name", poolName).gauge()
+            val idleGauge = registry.find("nntp.pool.idle").tag("pool.name", poolName).gauge()
+            val size = sizeGauge?.value() ?: -1.0
+            val idle = idleGauge?.value() ?: -1.0
+            assertTrue(idle > 0, "Should have idle connections, got idle=$idle size=$size")
+
+            pool.close()
+        } finally {
+            Metrics.removeRegistry(registry)
         }
     }
 
