@@ -5,7 +5,7 @@ import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import kotlin.collections.ArrayDeque
-import java.io.IOException
+import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -16,6 +16,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.retry
@@ -29,6 +30,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
 import java.io.Closeable
+import java.io.IOException
 import java.nio.channels.UnresolvedAddressException
 import java.util.PriorityQueue
 
@@ -42,7 +44,8 @@ class NntpClientPool(
     private val maxConnections: Int,
     private val scope: CoroutineScope,
     private val keepaliveIntervalMs: Long = DEFAULT_KEEPALIVE_INTERVAL_MS,
-    private val idleGracePeriodMs: Long = DEFAULT_IDLE_GRACE_PERIOD_MS
+    private val idleGracePeriodMs: Long = DEFAULT_IDLE_GRACE_PERIOD_MS,
+    private val commandRetries: Int = DEFAULT_COMMAND_RETRIES
 ) : Closeable {
 
     companion object {
@@ -54,6 +57,7 @@ class NntpClientPool(
         const val CONNECT_RETRY_MAX_DELAY_MS = 30_000L
         const val CONNECT_MAX_RETRIES = 5L
         const val ACQUIRE_TIMEOUT_MS = 30_000L
+        const val DEFAULT_COMMAND_RETRIES = 1
     }
 
     private class PriorityWaiter(
@@ -137,6 +141,7 @@ class NntpClientPool(
             when (e) {
                 is UnresolvedAddressException ->
                     logger.error("Failed to resolve host '{}:{}': {}", host, port, e.message)
+
                 else ->
                     logger.warn("Failed to connect to {}:{}: {}", host, port, e.message)
             }
@@ -154,7 +159,7 @@ class NntpClientPool(
 
     private suspend fun keepaliveLoop() {
         while (currentCoroutineContext().isActive) {
-            delay(keepaliveIntervalMs)
+            delay(keepaliveIntervalMs.milliseconds)
             if (sleeping) continue
             if (idleGracePeriodMs > 0 &&
                 System.currentTimeMillis() - lastActivityMs > idleGracePeriodMs
@@ -259,21 +264,7 @@ class NntpClientPool(
         val sample = Timer.start(registry)
         val deferred = CompletableDeferred<NntpClient>()
         val waiter = poolMutex.withLock {
-            var client: NntpClient? = null
-            var checked = 0
-            val poolSize = idleClients.size
-            while (checked < poolSize) {
-                val candidate = idleClients.removeFirstOrNull() ?: break
-                checked++
-                if (candidate.connection.isChannelClosed) {
-                    logger.debug("Skipping dead connection (channel closed), scheduling reconnect")
-                    candidate.connection.scheduleReconnect()
-                    idleClients.addLast(candidate)
-                } else {
-                    client = candidate
-                    break
-                }
-            }
+            val client = idleClients.removeFirstOrNull()
             if (client != null) {
                 deferred.complete(client)
                 return@withLock null
@@ -293,7 +284,7 @@ class NntpClientPool(
         }
         // Await outside the lock with timeout
         try {
-            val client = withTimeoutOrNull(ACQUIRE_TIMEOUT_MS) { deferred.await() }
+            val client = withTimeoutOrNull(ACQUIRE_TIMEOUT_MS.milliseconds) { deferred.await() }
             if (client != null) {
                 recordAcquire(sample, priority)
                 return client
@@ -359,45 +350,28 @@ class NntpClientPool(
         if (sleeping) doWake()
         lastActivityMs = System.currentTimeMillis()
         consecutiveAllIdleCycles = 0
-        val client = acquire(priority)
-        var returned = false
-        try {
-            return supervisorScope { block(client) }
-        } catch (e: NntpConnectionException) {
-            logger.debug("Connection failed, scheduling reconnect and retrying: {}", e.message)
-            client.connection.scheduleReconnect()
-            returnToPool(client)
-            returned = true
-            return retryWithDifferentClient(priority, block)
-        } catch (e: IOException) {
-            logger.debug("I/O error ({}), scheduling reconnect and retrying: {}", e::class.simpleName, e.message)
-            client.connection.scheduleReconnect()
-            returnToPool(client)
-            returned = true
-            return retryWithDifferentClient(priority, block)
-        } finally {
-            if (!returned) returnToPool(client)
-        }
-    }
-
-    private suspend fun <T> retryWithDifferentClient(
-        priority: Int,
-        block: suspend (NntpClient) -> T
-    ): T {
-        val client = acquire(priority)
-        try {
-            client.connection.ensureConnected()
-            return supervisorScope { block(client) }
-        } catch (e: NntpConnectionException) {
-            logger.debug("Retry also failed, scheduling reconnect: {}", e.message)
-            client.connection.scheduleReconnect()
-            throw e
-        } catch (e: IOException) {
-            logger.debug("Retry I/O error ({}), scheduling reconnect: {}", e::class.simpleName, e.message)
-            client.connection.scheduleReconnect()
-            throw NntpConnectionException("I/O error on retry: ${e.message}", e)
-        } finally {
-            returnToPool(client)
+        return supervisorScope {
+            flow {
+                val client = acquire(priority)
+                try {
+                    client.connection.ensureConnected()
+                    emit(block(client))
+                } catch (e: NntpConnectionException) {
+                    client.connection.scheduleReconnect()
+                    throw e
+                } catch (e: IOException) {
+                    client.connection.scheduleReconnect()
+                    throw e
+                } finally {
+                    returnToPool(client)
+                }
+            }.retry(commandRetries.toLong()) { e ->
+                val retryable = e is NntpConnectionException || e is IOException
+                if (retryable) {
+                    logger.debug("Command failed ({}), retrying: {}", e::class.simpleName, e.message)
+                }
+                retryable
+            }.first()
         }
     }
 

@@ -37,7 +37,6 @@ class NntpConnection private constructor(
 ) : Closeable {
 
     internal val commandMutex = Mutex()
-    val isChannelClosed: Boolean get() = writeChannel.isClosedForWrite
     @Volatile
     private var reconnecting: CompletableDeferred<Unit>? = null
     @Volatile

@@ -7,6 +7,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -300,8 +301,8 @@ class NntpClientPoolTest {
     @Test
     @Timeout(15, unit = TimeUnit.SECONDS)
     fun `both connections dead propagates exception`() = runBlocking {
-        // Server accepts 2 initial connections, then kills all reconnect attempts
-        val sockets = launchCommandServer(maxAccepts = 2)
+        // Server accepts 2 initial connections + reconnect attempts that will be killed
+        val sockets = launchCommandServer(maxAccepts = 10)
 
         val pool = NntpClientPool(
             host = "localhost",
@@ -314,10 +315,14 @@ class NntpClientPoolTest {
         )
         pool.wake()
 
-        // Kill both server-side sockets
+        // Prime both connections by using them
+        pool.stat("<test@msg>")
+        pool.stat("<test@msg>")
+        // Wait for both connections to be established
         delay(100)
+
+        // Kill both server-side sockets and close the server
         sockets.forEach { it.close() }
-        // Close the server so reconnects fail
         serverSocket.close()
 
         delay(200) // let TCP state settle
@@ -354,6 +359,146 @@ class NntpClientPoolTest {
             // ensureConnected() waits for reconnect to complete.
             val result = pool.stat("<test@msg>")
             assertTrue(result is StatResult.Found)
+        } finally {
+            pool.close()
+        }
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `multiple retries succeeds when last attempt works`() = runBlocking {
+        // Server that fails the first 2 STAT attempts (closes connection), then succeeds on the 3rd
+        val failCount = java.util.concurrent.atomic.AtomicInteger(2)
+        // Accept: connections for each attempt + reconnects
+        launchCommandServer(maxAccepts = 6, failStatOnce = AtomicBoolean(false))
+
+        // Override: use a custom server that fails N times
+        serverSocket.close()
+        serverSocket = ServerSocket(0)
+        Thread {
+            var accepted = 0
+            while (accepted < 6) {
+                try {
+                    val client = serverSocket.accept()
+                    Thread {
+                        try {
+                            val reader = BufferedReader(InputStreamReader(client.getInputStream()))
+                            val out = client.getOutputStream()
+                            out.write("200 welcome\r\n".toByteArray())
+                            out.flush()
+                            while (!client.isClosed) {
+                                val cmd = reader.readLine() ?: break
+                                when {
+                                    cmd == "DATE" -> {
+                                        out.write("111 20260224120000\r\n".toByteArray())
+                                        out.flush()
+                                    }
+                                    cmd.startsWith("STAT") -> {
+                                        if (failCount.getAndDecrement() > 0) {
+                                            client.close()
+                                            break
+                                        }
+                                        out.write("223 0 <test@msg> article exists\r\n".toByteArray())
+                                        out.flush()
+                                    }
+                                    cmd == "QUIT" -> {
+                                        out.write("205 bye\r\n".toByteArray())
+                                        out.flush()
+                                        break
+                                    }
+                                    else -> {
+                                        out.write("500 unknown command\r\n".toByteArray())
+                                        out.flush()
+                                    }
+                                }
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }.start()
+                    accepted++
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }.start()
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 2,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0,
+            commandRetries = 3  // allow up to 3 retries (4 total attempts)
+        )
+        pool.wake()
+
+        try {
+            // First 2 attempts fail, third succeeds — should not throw
+            val result = pool.stat("<test@msg>")
+            assertTrue(result is StatResult.Found)
+        } finally {
+            pool.close()
+        }
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `exhausted retries propagates exception`() = runBlocking {
+        // Server that always kills the connection on STAT
+        serverSocket.close()
+        serverSocket = ServerSocket(0)
+        Thread {
+            var accepted = 0
+            while (accepted < 10) {
+                try {
+                    val client = serverSocket.accept()
+                    Thread {
+                        try {
+                            val reader = BufferedReader(InputStreamReader(client.getInputStream()))
+                            val out = client.getOutputStream()
+                            out.write("200 welcome\r\n".toByteArray())
+                            out.flush()
+                            while (!client.isClosed) {
+                                val cmd = reader.readLine() ?: break
+                                when {
+                                    cmd.startsWith("STAT") -> {
+                                        client.close()
+                                        break
+                                    }
+                                    else -> {
+                                        out.write("500 unknown command\r\n".toByteArray())
+                                        out.flush()
+                                    }
+                                }
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }.start()
+                    accepted++
+                } catch (_: Exception) {
+                    break
+                }
+            }
+        }.start()
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 2,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0,
+            commandRetries = 2  // 3 total attempts, all will fail
+        )
+        pool.wake()
+
+        try {
+            assertFailsWith<NntpConnectionException> {
+                pool.stat("<test@msg>")
+            }
         } finally {
             pool.close()
         }
