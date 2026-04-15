@@ -8,6 +8,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -118,10 +119,13 @@ class NntpClientPoolMetricsTest {
         try {
             val poolName = "localhost:${serverSocket.localPort}"
 
-            // Ensure both connections are established by checking out and returning each
-            pool.withClient { _ -> }
-            pool.withClient { _ -> }
-            // Allow second connection to settle into idle pool
+            // Ensure both connections are established by checking out concurrently
+            val gate = CompletableDeferred<Unit>()
+            listOf(
+                async { pool.withClient { gate.await() } },
+                async { pool.withClient { gate.await() } }
+            ).also { gate.complete(Unit) }.awaitAll()
+            // Allow connections to settle into idle pool
             delay(100)
 
             val idleGauge = registry.find("nntp.pool.idle").tag("pool.name", poolName).gauge()
