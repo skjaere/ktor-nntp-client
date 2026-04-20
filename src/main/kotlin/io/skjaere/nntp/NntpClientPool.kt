@@ -45,13 +45,14 @@ class NntpClientPool(
     private val scope: CoroutineScope,
     private val keepaliveIntervalMs: Long = DEFAULT_KEEPALIVE_INTERVAL_MS,
     private val idleGracePeriodMs: Long = DEFAULT_IDLE_GRACE_PERIOD_MS,
+    private val idleEvictionTimeoutMs: Long = DEFAULT_IDLE_EVICTION_TIMEOUT_MS,
     private val commandRetries: Int = DEFAULT_COMMAND_RETRIES
 ) : Closeable {
 
     companion object {
         const val DEFAULT_KEEPALIVE_INTERVAL_MS = 60_000L
         const val DEFAULT_IDLE_GRACE_PERIOD_MS = 300_000L // 5 minutes
-        const val DEFAULT_SHRINK_IDLE_CYCLES = 2  // shrink after idle for this many keepalive cycles
+        const val DEFAULT_IDLE_EVICTION_TIMEOUT_MS = 180_000L // 3 minutes
         const val MIN_POOL_SIZE = 1  // always keep at least one connection
         const val CONNECT_RETRY_BASE_DELAY_MS = 1_000L
         const val CONNECT_RETRY_MAX_DELAY_MS = 30_000L
@@ -59,6 +60,8 @@ class NntpClientPool(
         const val ACQUIRE_TIMEOUT_MS = 30_000L
         const val DEFAULT_COMMAND_RETRIES = 1
     }
+
+    private data class IdleEntry(val client: NntpClient, val returnedAtMs: Long)
 
     private class PriorityWaiter(
         val priority: Int,
@@ -75,11 +78,10 @@ class NntpClientPool(
 
     private val logger = LoggerFactory.getLogger(NntpClientPool::class.java)
     private val poolMutex = Mutex()
-    private val idleClients = ArrayDeque<NntpClient>()
+    private val idleClients = ArrayDeque<IdleEntry>()
     private val waiters = PriorityQueue<PriorityWaiter>()
     private var waiterSequence = 0L
     private var currentSize = 0  // total connections: idle + in-use + connecting
-    private var consecutiveAllIdleCycles = 0  // how many keepalive cycles all connections were idle
     private var closed = false
     private var keepaliveJob: Job? = null
 
@@ -175,54 +177,62 @@ class NntpClientPool(
                 doSleep()
                 continue
             }
-            val clients = drainIdle()
-            val allIdle = poolMutex.withLock { clients.size == currentSize }
-
-            for (client in clients) {
+            evictIdleConnections()
+            val entries = drainIdle()
+            for (entry in entries) {
                 try {
-                    client.date()
+                    entry.client.date()
                 } catch (e: NntpConnectionException) {
                     logger.debug("Keepalive failed, scheduling reconnect: {}", e.message)
-                    client.connection.scheduleReconnect()
+                    entry.client.connection.scheduleReconnect()
                 } catch (_: Exception) {
                 }
-                returnToPool(client)
-            }
-
-            // Shrink: if all connections have been idle for multiple cycles, close excess
-            if (allIdle && clients.size > MIN_POOL_SIZE) {
-                consecutiveAllIdleCycles++
-                if (consecutiveAllIdleCycles >= DEFAULT_SHRINK_IDLE_CYCLES) {
-                    // Close half the excess connections (keep at least MIN_POOL_SIZE)
-                    val toClose = (clients.size - MIN_POOL_SIZE + 1) / 2
-                    if (toClose > 0) {
-                        val removed = poolMutex.withLock {
-                            val removing = mutableListOf<NntpClient>()
-                            repeat(toClose) {
-                                val client = idleClients.removeLastOrNull() ?: return@repeat
-                                removing.add(client)
-                            }
-                            currentSize -= removing.size
-                            removing
-                        }
-                        for (client in removed) {
-                            runCatching { client.close() }
-                        }
-                        logger.info("Shrunk pool by {} connections (now {})", removed.size, currentSize)
-                        consecutiveAllIdleCycles = 0
-                    }
-                }
-            } else {
-                consecutiveAllIdleCycles = 0
+                // Preserve the original idle timestamp so keepalive itself doesn't reset eviction.
+                returnToPool(entry.client, entry.returnedAtMs)
             }
         }
     }
 
-    private suspend fun drainIdle(): List<NntpClient> {
+    /**
+     * Closes individual idle connections that have been sitting unused for longer than
+     * [idleEvictionTimeoutMs], keeping at least [MIN_POOL_SIZE] connections. Unlike the
+     * previous "shrink only when everything is idle" heuristic, this survives intermittent
+     * background traffic (e.g. health-check probes) that would otherwise pin the pool at
+     * its peak size forever.
+     */
+    private suspend fun evictIdleConnections() {
+        if (idleEvictionTimeoutMs <= 0) return
+        val now = System.currentTimeMillis()
+        val evicted = poolMutex.withLock {
+            val keepFloor = MIN_POOL_SIZE.coerceAtLeast(0)
+            val removed = mutableListOf<IdleEntry>()
+            // Oldest idle entries sit at the head of the deque (we addLast on return),
+            // so scan from the front. Stop once the remaining pool would dip below the floor.
+            while (idleClients.isNotEmpty() && currentSize > keepFloor) {
+                val oldest = idleClients.first()
+                if (now - oldest.returnedAtMs < idleEvictionTimeoutMs) break
+                idleClients.removeFirst()
+                currentSize--
+                removed.add(oldest)
+            }
+            removed
+        }
+        for (entry in evicted) {
+            runCatching { entry.client.close() }
+        }
+        if (evicted.isNotEmpty()) {
+            logger.info(
+                "Evicted {} idle connection(s) from pool (now {})",
+                evicted.size, currentSize
+            )
+        }
+    }
+
+    private suspend fun drainIdle(): List<IdleEntry> {
         poolMutex.withLock {
-            val clients = idleClients.toList()
+            val entries = idleClients.toList()
             idleClients.clear()
-            return clients
+            return entries
         }
     }
 
@@ -239,12 +249,12 @@ class NntpClientPool(
         if (!shouldSleep) return
         keepaliveJob?.cancel()
         keepaliveJob = null
-        val clients = drainIdle()
-        for (client in clients) {
-            runCatching { client.close() }
+        val entries = drainIdle()
+        for (entry in entries) {
+            runCatching { entry.client.close() }
         }
-        poolMutex.withLock { currentSize -= clients.size }
-        logger.info("Pool is now sleeping ({} connections closed)", clients.size)
+        poolMutex.withLock { currentSize -= entries.size }
+        logger.info("Pool is now sleeping ({} connections closed)", entries.size)
     }
 
     suspend fun wake() {
@@ -261,7 +271,7 @@ class NntpClientPool(
         logger.info("Waking pool (connections will be created on demand, max={})", maxConnections)
         // Drain any stale clients returned after sleep (from in-flight withClient calls)
         val stale = drainIdle()
-        stale.forEach { runCatching { it.close() } }
+        stale.forEach { runCatching { it.client.close() } }
         lastActivityMs = System.currentTimeMillis()
         startKeepalive()
     }
@@ -271,9 +281,9 @@ class NntpClientPool(
         val sample = Timer.start(registry)
         val deferred = CompletableDeferred<NntpClient>()
         val waiter = poolMutex.withLock {
-            val client = idleClients.removeFirstOrNull()
-            if (client != null) {
-                deferred.complete(client)
+            val entry = idleClients.removeFirstOrNull()
+            if (entry != null) {
+                deferred.complete(entry.client)
                 return@withLock null
             }
             val w = PriorityWaiter(priority, deferred, waiterSequence++)
@@ -334,15 +344,16 @@ class NntpClientPool(
 
     /**
      * Called under [poolMutex]: dispatch the client to the highest-priority waiter,
-     * skipping cancelled waiters. If no waiters, park in [idleClients].
+     * skipping cancelled waiters. If no waiters, park in [idleClients] with the given
+     * idle timestamp (defaults to now).
      */
-    private fun dispatchOrPark(client: NntpClient) {
+    private fun dispatchOrPark(client: NntpClient, returnedAtMs: Long = System.currentTimeMillis()) {
         while (true) {
             val waiter = waiters.poll() ?: break
             if (waiter.deferred.complete(client)) return
             // Waiter was cancelled, try next
         }
-        idleClients.addLast(client)
+        idleClients.addLast(IdleEntry(client, returnedAtMs))
     }
 
     private suspend fun addClientToPool(client: NntpClient) {
@@ -361,7 +372,6 @@ class NntpClientPool(
     suspend fun <T> withClient(priority: Int = 0, block: suspend (NntpClient) -> T): T {
         if (sleeping) doWake()
         lastActivityMs = System.currentTimeMillis()
-        consecutiveAllIdleCycles = 0
         return supervisorScope {
             flow {
                 var client: NntpClient? = null
@@ -388,13 +398,13 @@ class NntpClientPool(
         }
     }
 
-    private suspend fun returnToPool(client: NntpClient) {
+    private suspend fun returnToPool(client: NntpClient, returnedAtMs: Long = System.currentTimeMillis()) {
         withContext(NonCancellable) {
             poolMutex.withLock {
                 if (closed) {
                     runCatching { client.close() }
                 } else {
-                    dispatchOrPark(client)
+                    dispatchOrPark(client, returnedAtMs)
                 }
             }
         }
@@ -461,8 +471,8 @@ class NntpClientPool(
                     )
                 }
                 // Close all idle clients
-                for (client in idleClients) {
-                    runCatching { client.close() }
+                for (entry in idleClients) {
+                    runCatching { entry.client.close() }
                 }
                 currentSize -= idleClients.size
                 idleClients.clear()
