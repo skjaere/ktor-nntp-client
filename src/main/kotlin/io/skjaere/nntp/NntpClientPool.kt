@@ -284,8 +284,15 @@ class NntpClientPool(
         }
         if (!shouldWake) return
         logger.info("Waking pool (connections will be created on demand, max={})", maxConnections)
-        // Drain any stale clients returned after sleep (from in-flight withClient calls)
-        val stale = drainIdle()
+        // Defensive cleanup: with returnToPool now honoring `sleeping`, idleClients should
+        // already be empty here. Any stragglers get closed AND decremented so currentSize
+        // doesn't leak slots across sleep/wake cycles.
+        val stale = poolMutex.withLock {
+            val entries = idleClients.toList()
+            idleClients.clear()
+            currentSize -= entries.size
+            entries
+        }
         stale.forEach { runCatching { it.client.close() } }
         lastActivityMs = System.currentTimeMillis()
         startKeepalive()
@@ -418,13 +425,24 @@ class NntpClientPool(
 
     private suspend fun returnToPool(client: NntpClient, returnedAtMs: Long = System.currentTimeMillis()) {
         withContext(NonCancellable) {
-            poolMutex.withLock {
-                if (closed) {
-                    runCatching { client.close() }
-                } else {
-                    dispatchOrPark(client, returnedAtMs)
+            val toClose = poolMutex.withLock {
+                when {
+                    closed -> client
+                    // If the pool is sleeping, an in-flight withClient that finishes now must
+                    // not park its client — otherwise doSleep leaves an open socket in idleClients
+                    // and doWake cleans it up without decrementing currentSize, silently leaking a
+                    // pool slot on every sleep/wake cycle with concurrent traffic.
+                    sleeping -> {
+                        currentSize--
+                        client
+                    }
+                    else -> {
+                        dispatchOrPark(client, returnedAtMs)
+                        null
+                    }
                 }
             }
+            if (toClose != null) runCatching { toClose.close() }
         }
     }
 
