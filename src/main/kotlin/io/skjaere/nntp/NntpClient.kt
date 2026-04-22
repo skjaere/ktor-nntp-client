@@ -302,16 +302,9 @@ class NntpClient(
     }
 
     private fun fetchBodyYenc(cmd: String): Flow<YencEvent> = channelFlow {
-        val response = try {
-            connection.commandRaw(cmd)
-        } catch (e: Exception) {
-            // commandRaw locks the mutex before sending the command.
-            // If cancelled mid-flight (e.g., during readResponse), the mutex
-            // is left locked and the TCP stream is dirty.
-            connection.scheduleReconnect()
-            connection.commandMutex.unlock()
-            throw e
-        }
+        // commandRaw releases the mutex and schedules a reconnect itself on failure,
+        // including cancellation while suspended in lock().
+        val response = connection.commandRaw(cmd)
         if (response.code != 222) {
             connection.commandMutex.unlock()
             if (response.code == 430) {
