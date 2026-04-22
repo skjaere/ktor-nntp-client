@@ -228,25 +228,41 @@ class NntpClient(
 
     // --- Posting ---
 
-    suspend fun post(article: String): NntpResponse {
-        val initialResponse = connection.command(NntpCommand.POST)
-        if (initialResponse.code != 340) {
-            throw NntpProtocolException("POST failed: ${initialResponse.code} ${initialResponse.message}", initialResponse)
+    suspend fun post(article: String): NntpResponse =
+        sendArticle(NntpCommand.POST, expectedContinueCode = 340, label = "POST", article = article)
+
+    suspend fun ihave(messageId: String, article: String): NntpResponse =
+        sendArticle(NntpCommand.ihave(messageId), expectedContinueCode = 335, label = "IHAVE", article = article)
+
+    private suspend fun sendArticle(
+        cmd: String,
+        expectedContinueCode: Int,
+        label: String,
+        article: String
+    ): NntpResponse {
+        // commandRaw holds commandMutex through the whole article transfer so a concurrent
+        // command on the same connection can't interleave its bytes with our body.
+        val initialResponse = connection.commandRaw(cmd)
+        try {
+            if (initialResponse.code != expectedContinueCode) {
+                throw NntpProtocolException(
+                    "$label failed: ${initialResponse.code} ${initialResponse.message}",
+                    initialResponse
+                )
+            }
+            connection.writeLine(dotStuff(article))
+            connection.writeLine(".")
+            return connection.readResponse()
+        } finally {
+            connection.commandMutex.unlock()
         }
-        connection.writeLine(article)
-        connection.writeLine(".")
-        return connection.readResponse()
     }
 
-    suspend fun ihave(messageId: String, article: String): NntpResponse {
-        val initialResponse = connection.command(NntpCommand.ihave(messageId))
-        if (initialResponse.code != 335) {
-            throw NntpProtocolException("IHAVE failed: ${initialResponse.code} ${initialResponse.message}", initialResponse)
-        }
-        connection.writeLine(article)
-        connection.writeLine(".")
-        return connection.readResponse()
-    }
+    // RFC 3977 §3.1.1: any line in a multi-line data block that begins with "." must
+    // be prefixed with an additional "." so the server's unstuff pass recovers the
+    // original bytes and does not mistake an in-body "." for the block terminator.
+    private fun dotStuff(article: String): String =
+        article.split("\r\n").joinToString("\r\n") { if (it.startsWith(".")) ".$it" else it }
 
     // --- Server info ---
 
