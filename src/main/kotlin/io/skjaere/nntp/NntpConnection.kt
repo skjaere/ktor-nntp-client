@@ -237,13 +237,21 @@ class NntpConnection private constructor(
     /**
      * Send a command and read the initial status line.
      * The caller is responsible for consuming any remaining data from [rawReadChannel].
-     * The command mutex is NOT released - the caller must release it via [commandMutex].
+     * On success the command mutex is held and the caller MUST release it via [commandMutex].
+     * On failure (including cancellation after the lock is acquired) the mutex is released
+     * here; callers must not attempt to unlock it themselves.
      */
     suspend fun commandRaw(cmd: String): NntpResponse {
         commandMutex.lock()
-        ensureConnected()
-        writeLine(cmd)
-        return readResponse()
+        try {
+            ensureConnected()
+            writeLine(cmd)
+            return readResponse()
+        } catch (e: Throwable) {
+            scheduleReconnect()
+            commandMutex.unlock()
+            throw e
+        }
     }
 
     suspend fun readResponse(): NntpResponse {
