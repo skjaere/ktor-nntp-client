@@ -200,8 +200,13 @@ class NntpConnection private constructor(
                     performAuth(user, pass)
                 }
                 return
-            } catch (e: NntpAuthenticationException) {
-                // Server may still count old connection as active — back off and retry
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+                // Transient: auth (server still counting old connection), DNS
+                // (UnresolvedAddressException), TCP (ConnectException / SocketTimeout),
+                // TLS handshake, or welcome-line EOF. All get the backoff the loop was
+                // designed for; CancellationException is rethrown above.
                 lastException = e
                 log.debug(
                     "Reconnect attempt {}/{} failed ({}), retrying in {}ms",
