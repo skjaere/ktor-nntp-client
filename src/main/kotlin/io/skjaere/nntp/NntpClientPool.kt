@@ -53,6 +53,7 @@ class NntpClientPool(
         const val DEFAULT_KEEPALIVE_INTERVAL_MS = 60_000L
         const val DEFAULT_IDLE_GRACE_PERIOD_MS = 300_000L // 5 minutes
         const val DEFAULT_IDLE_EVICTION_TIMEOUT_MS = 180_000L // 3 minutes
+        const val KEEPALIVE_COMMAND_TIMEOUT_MS = 10_000L // bound per-connection DATE so a hung socket can't stall eviction
         const val MIN_POOL_SIZE = 1  // always keep at least one connection
         const val CONNECT_RETRY_BASE_DELAY_MS = 1_000L
         const val CONNECT_RETRY_MAX_DELAY_MS = 30_000L
@@ -180,12 +181,26 @@ class NntpClientPool(
             evictIdleConnections()
             val entries = drainIdle()
             for (entry in entries) {
-                try {
-                    entry.client.date()
-                } catch (e: NntpConnectionException) {
-                    logger.debug("Keepalive failed, scheduling reconnect: {}", e.message)
-                    entry.client.connection.scheduleReconnect()
-                } catch (_: Exception) {
+                val completed = withTimeoutOrNull(KEEPALIVE_COMMAND_TIMEOUT_MS.milliseconds) {
+                    try {
+                        entry.client.date()
+                        true
+                    } catch (e: NntpConnectionException) {
+                        logger.debug("Keepalive failed, scheduling reconnect: {}", e.message)
+                        entry.client.connection.scheduleReconnect()
+                        true
+                    } catch (@Suppress("TooGenericExceptionCaught") _: Exception) {
+                        true
+                    }
+                }
+                if (completed == null) {
+                    // DATE hung — socket is half-broken. Schedule reconnect and keep going
+                    // so a single stuck connection can't block eviction or the grace-period check.
+                    logger.debug(
+                        "Keepalive DATE timed out after {}ms; scheduling reconnect",
+                        KEEPALIVE_COMMAND_TIMEOUT_MS
+                    )
+                    runCatching { entry.client.connection.scheduleReconnect() }
                 }
                 // Preserve the original idle timestamp so keepalive itself doesn't reset eviction.
                 returnToPool(entry.client, entry.returnedAtMs)
@@ -221,7 +236,7 @@ class NntpClientPool(
             runCatching { entry.client.close() }
         }
         if (evicted.isNotEmpty()) {
-            logger.info(
+            logger.debug(
                 "Evicted {} idle connection(s) from pool (now {})",
                 evicted.size, currentSize
             )
@@ -281,7 +296,10 @@ class NntpClientPool(
         val sample = Timer.start(registry)
         val deferred = CompletableDeferred<NntpClient>()
         val waiter = poolMutex.withLock {
-            val entry = idleClients.removeFirstOrNull()
+            // LIFO: take the most-recently-used connection. Under steady-state
+            // trickle traffic, this keeps the "hot" connections refreshed at the
+            // tail while older connections age out at the head.
+            val entry = idleClients.removeLastOrNull()
             if (entry != null) {
                 deferred.complete(entry.client)
                 return@withLock null
