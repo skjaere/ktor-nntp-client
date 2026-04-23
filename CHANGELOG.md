@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.4.2...v0.5.0) (2026-04-23)
+
+
+### Features
+
+* configurable command retries with Flow.retry() in withClient ([af32736](https://github.com/skjaere/ktor-nntp-client/commit/af327360a000f6429e633b8098c5b988fe220428))
+* lazy pool initialization with on-demand connections and automatic shrinking ([1e419e2](https://github.com/skjaere/ktor-nntp-client/commit/1e419e20e0f4cbaa03d91f3ae49c67f92adbde73))
+* **pool:** LIFO idle reuse and bounded keepalive DATE ([644a6f6](https://github.com/skjaere/ktor-nntp-client/commit/644a6f6ea2a74566dedddd683dcecbad202dd88b))
+* **pool:** per-connection idle eviction ([2186845](https://github.com/skjaere/ktor-nntp-client/commit/2186845734a6c48846f47e89fe82edbd5978adfb))
+
+
+### Bug Fixes
+
+* connection pool currentSize leak when connection retries are exhausted ([4bef9dc](https://github.com/skjaere/ktor-nntp-client/commit/4bef9dc60c096e9d059d6f315c92bfd7f01939b0))
+* **connection:** retry reconnect on transient network errors, not just auth ([0025d41](https://github.com/skjaere/ktor-nntp-client/commit/0025d41a91a28fad712a4d018932628e2bb0a1e0))
+* handle ClosedWriteChannelException from TLS layer in connection pool ([7b6a3ec](https://github.com/skjaere/ktor-nntp-client/commit/7b6a3ec59995e0e626ce220a6738ce085bfc4c41))
+* **nntp:** dot-stuff article body and hold mutex across post/ihave ([abcfdeb](https://github.com/skjaere/ktor-nntp-client/commit/abcfdeb49a362daa56cd6896c13bef832445aca9))
+* **pool:** stop leaking slots when withClient returns during sleep ([9f9c28d](https://github.com/skjaere/ktor-nntp-client/commit/9f9c28d1d6ad9d38b07fe1e03887ea5fbbf85de4))
+* release commandRaw mutex inside commandRaw on failure ([b1a8249](https://github.com/skjaere/ktor-nntp-client/commit/b1a8249c08abc92ed07a9abea7f92f76183b20f7))
+
 ## [0.4.2](https://github.com/skjaere/ktor-nntp-client/compare/v0.4.1...v0.4.2) (2026-03-18)
 
 
