@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.5.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.4.2...v0.5.0) (2026-04-23)
+
+
+### Features
+
+* configurable command retries with Flow.retry() in withClient
+* lazy pool initialization with on-demand connections and automatic shrinking
+* **pool:** LIFO idle reuse and bounded keepalive DATE
+* **pool:** per-connection idle eviction
+
+
+### Bug Fixes
+
+* connection pool currentSize leak when connection retries are exhausted
+* **connection:** retry reconnect on transient network errors, not just auth
+* handle ClosedWriteChannelException from TLS layer in connection pool
+* **nntp:** dot-stuff article body and hold mutex across post/ihave
+* **pool:** stop leaking slots when withClient returns during sleep
+* release commandRaw mutex inside commandRaw on failure
+
 ## [0.4.2](https://github.com/skjaere/ktor-nntp-client/compare/v0.4.1...v0.4.2) (2026-03-18)
 
 
