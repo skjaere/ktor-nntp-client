@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/skjaere/ktor-nntp-client/compare/v0.5.0...v0.5.1) (2026-04-25)
+
+
+### Bug Fixes
+
+* **deps:** bump rapidyenc-kotlin-wrapper to v0.2.0
+
 ## [0.5.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.4.2...v0.5.0) (2026-04-23)
 
 
