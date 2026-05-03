@@ -169,10 +169,17 @@ class NntpClientPoolMetricsTest {
 
         try {
             val poolName = "localhost:${serverSocket.localPort}"
-            val waitersGauge = registry.find("nntp.pool.waiters").tag("pool.name", poolName).gauge()
-            assertNotNull(waitersGauge)
+            // Per-priority gauges — sum across priorities for a total-waiters check.
+            // Pool init pre-registers priority=0; ensurePriorityGauges fires for other
+            // priorities the first time a client is acquired or a waiter enqueued at
+            // that priority.
+            fun totalWaiters(): Double =
+                registry.find("nntp.pool.waiters")
+                    .tag("pool.name", poolName)
+                    .gauges()
+                    .sumOf { it.value() }
 
-            assertEquals(0.0, waitersGauge.value())
+            assertEquals(0.0, totalWaiters())
 
             val gate = CompletableDeferred<Unit>()
             val waiterReady = CompletableDeferred<Unit>()
@@ -195,14 +202,14 @@ class NntpClientPoolMetricsTest {
             }
 
             delay(200) // let the waiter enqueue
-            assertEquals(1.0, waitersGauge.value())
+            assertEquals(1.0, totalWaiters())
 
             // Release
             gate.complete(Unit)
             holder.await()
             waiter.await()
 
-            assertEquals(0.0, waitersGauge.value())
+            assertEquals(0.0, totalWaiters())
         } finally {
             pool.close()
         }
