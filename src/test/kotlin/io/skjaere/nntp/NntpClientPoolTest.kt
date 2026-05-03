@@ -1,6 +1,7 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.*
+import io.ktor.utils.io.readAvailable
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import io.skjaere.yenc.RapidYenc
@@ -161,81 +162,14 @@ class NntpClientPoolTest {
         return acceptedSockets
     }
 
-    @Test
-    @Timeout(10, unit = TimeUnit.SECONDS)
-    fun `bodyYencHeaders unlocks mutex - raw client, no supervisorScope`() = runBlocking {
-        val data = "Test data".toByteArray()
-        launchMultiConnectionServer(1, listOf(data to "test.bin"))
-
-        val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
-        try {
-            val headers = client.bodyYencHeaders("<test@msg>")
-            assertEquals("test.bin", headers.name)
-
-            delay(500) // let async cleanup finish
-            assertFalse(client.connection.commandMutex.isLocked, "Mutex should be unlocked (raw, no supervisor)")
-        } finally {
-            client.close()
-        }
-    }
-
-    @Test
-    @Timeout(10, unit = TimeUnit.SECONDS)
-    fun `bodyYencHeaders unlocks mutex - raw client, inside supervisorScope`() = runBlocking {
-        val data = "Test data".toByteArray()
-        launchMultiConnectionServer(1, listOf(data to "test.bin"))
-
-        val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
-        try {
-            supervisorScope {
-                val headers = client.bodyYencHeaders("<test@msg>")
-                assertEquals("test.bin", headers.name)
-            }
-
-            delay(500)
-            assertFalse(client.connection.commandMutex.isLocked, "Mutex should be unlocked (raw, inside supervisor)")
-        } finally {
-            client.close()
-        }
-    }
-
-    @Test
-    @Timeout(10, unit = TimeUnit.SECONDS)
-    fun `bodyYencHeaders twice through pool does not deadlock`() = runBlocking {
-        val data1 = "First article data".toByteArray()
-        val data2 = "Second article data".toByteArray()
-
-        launchMultiConnectionServer(2, listOf(
-            data1 to "first.bin",
-            data2 to "second.bin"
-        ))
-
-        val pool = NntpClientPool(
-            host = "localhost",
-            port = serverSocket.localPort,
-            selectorManager = selectorManager,
-            maxConnections = 1,
-            scope = poolScope
-        )
-        pool.wake()
-
-        try {
-            val headers1 = pool.bodyYencHeaders("<article-1@test>")
-            assertEquals("first.bin", headers1.name)
-
-            val headers2 = pool.bodyYencHeaders("<article-2@test>")
-            assertEquals("second.bin", headers2.name)
-        } finally {
-            pool.close()
-        }
-    }
 
     // --- New tests for keepalive, retry, sleep/wake ---
 
     @Test
     @Timeout(30, unit = TimeUnit.SECONDS)
-    fun `keepalive detects dead connection and reconnects`() = runBlocking {
-        // Server accepts: initial connection + reconnection after keepalive detects dead
+    fun `keepalive detects dead connection and discards`() = runBlocking {
+        // Server accepts: initial connection + replacement spawned after keepalive
+        // discards the dead one (the next acquire opens a fresh client).
         val sockets = launchCommandServer(maxAccepts = 2)
 
         val pool = NntpClientPool(
@@ -301,9 +235,13 @@ class NntpClientPoolTest {
     }
 
     @Test
-    @Timeout(15, unit = TimeUnit.SECONDS)
+    @Timeout(45, unit = TimeUnit.SECONDS)
     fun `both connections dead propagates exception`() = runBlocking {
-        // Server accepts 2 initial connections + reconnect attempts that will be killed
+        // Server accepts 2 initial connections; the rest will fail (server closed below).
+        // After both pooled clients are discarded, the next acquire spawns a fresh
+        // connection via connectWithRetry — which retries 5x with exponential backoff
+        // before giving up. Worst case ~30s of backoff + acquire timeout before the
+        // final NntpConnectionException surfaces.
         val sockets = launchCommandServer(maxAccepts = 10)
 
         val pool = NntpClientPool(
@@ -338,8 +276,8 @@ class NntpClientPoolTest {
 
     @Test
     @Timeout(15, unit = TimeUnit.SECONDS)
-    fun `pool size 1 waits for reconnect on retry`() = runBlocking {
-        // Accept: 1 initial + 1 reconnect
+    fun `pool size 1 acquires fresh connection on retry`() = runBlocking {
+        // Accept: 1 initial + 1 fresh (after the first one is discarded on STAT failure)
         val failOnce = AtomicBoolean(false)
         launchCommandServer(maxAccepts = 2, failStatOnce = failOnce)
 
@@ -357,8 +295,9 @@ class NntpClientPoolTest {
         try {
             failOnce.set(true)
 
-            // With pool size 1, retry gets the same (reconnecting) client.
-            // ensureConnected() waits for reconnect to complete.
+            // With pool size 1, the failing STAT discards the only client; the
+            // .retry inside withClient triggers a fresh acquire which spawns a
+            // replacement connection. The retry transparently succeeds.
             val result = pool.stat("<test@msg>")
             assertTrue(result is StatResult.Found)
         } finally {
@@ -921,6 +860,222 @@ class NntpClientPoolTest {
             pool.close()
         } finally {
             Metrics.removeRegistry(registry)
+        }
+    }
+
+    /**
+     * Repro for the production bug where the next op on a pooled connection reads
+     * yenc body bytes from a previous, cancelled-mid-stream op:
+     *
+     *   io.skjaere.nntp.NntpProtocolException: Invalid response code: <yenc-garbage>
+     *       at io.skjaere.nntp.NntpResponseKt.parseResponseLine(NntpResponse.kt:61)
+     *       at io.skjaere.nntp.NntpConnection.readResponse(NntpConnection.kt)
+     *       at io.skjaere.nntp.NntpConnection.commandRaw(NntpConnection.kt)
+     *       at io.skjaere.nntp.NntpClient$fetchBodyYenc$1.invokeSuspend(NntpClient.kt)
+     *
+     * Pool size = 1 forces both ops onto the same connection. The server sends a 222
+     * + partial body, then waits on a gate; the test cancels the first op via
+     * withTimeout while the body is mid-stream. After cancellation, the gate is
+     * released so the server finishes the body — giving the pool's background drain
+     * a chance to read the article terminator and return the connection clean.
+     *
+     * If drain works as designed, the second BODY succeeds.
+     * If drain doesn't actually flush the wire (the bug we keep seeing in prod),
+     * the second BODY's commandRaw throws NntpProtocolException reading yenc bytes.
+     */
+    @Test
+    @Timeout(20, unit = TimeUnit.SECONDS)
+    fun `cancelled body does not leak yenc bytes into next op on same pool`() = runBlocking {
+        val article1 = ByteArray(8192) { (it % 256).toByte() }
+        val article2 = "second article cleanly served".toByteArray()
+
+        Thread {
+            // Single accept — both client-side ops MUST share this socket.
+            val socket = serverSocket.accept()
+            socket.use { s ->
+                val reader = BufferedReader(InputStreamReader(s.getInputStream()))
+                val out = s.getOutputStream()
+                out.write("200 welcome\r\n".toByteArray())
+                out.flush()
+
+                // First BODY: send 222 + partial body, pause mid-body for 800 ms,
+                // then send the rest. The test cancels around 300 ms in (mid-pause)
+                // so the drain has to read what arrives after the pause.
+                val cmd1 = reader.readLine()
+                check(cmd1 != null && cmd1.startsWith("BODY")) { "expected BODY, got '$cmd1'" }
+                val full1 = buildYencArticle(article1, "first.bin")
+                out.write("222 body follows\r\n".toByteArray())
+                val firstChunkSize = 256
+                out.write(full1, 0, firstChunkSize)
+                out.flush()
+                Thread.sleep(800)
+                out.write(full1, firstChunkSize, full1.size - firstChunkSize)
+                out.flush()
+
+                // Second BODY
+                val cmd2 = reader.readLine()
+                check(cmd2 != null && cmd2.startsWith("BODY")) { "expected BODY, got '$cmd2'" }
+                out.write("222 body follows\r\n".toByteArray())
+                out.write(buildYencArticle(article2, "second.bin"))
+                out.flush()
+                // Keep the socket alive long enough for the test to finish the read.
+                Thread.sleep(2_000)
+            }
+        }.start()
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        pool.wake()
+
+        try {
+            // First op: collect bodyYenc with a tight timeout so cancellation lands
+            // while the server is paused mid-body. We expect the timeout to fire,
+            // the inline drain to run, and the connection to come back clean.
+            val firstThrew = AtomicBoolean(false)
+            try {
+                kotlinx.coroutines.withTimeout(300) {
+                    pool.bodyYenc("<first@test>").collect { event ->
+                        if (event is YencEvent.Body) {
+                            // Read a bit so we know the writer is engaged with the wire,
+                            // but don't drain — we want the cancellation to fire while
+                            // the writer is still mid-stream.
+                            val sink = ByteArray(64)
+                            event.data.readAvailable(sink)
+                        }
+                    }
+                }
+            } catch (@Suppress("TooGenericExceptionCaught") _: Exception) {
+                firstThrew.set(true)
+            }
+            assertTrue(firstThrew.get(), "first bodyYenc should have been cancelled by withTimeout")
+
+            // Second op: must succeed. If the connection still has yenc bytes from
+            // article1 pending, commandRaw will throw NntpProtocolException reading
+            // the garbage as a response code.
+            val secondBytes = ByteArray(article2.size)
+            var secondOffset = 0
+            pool.bodyYenc("<second@test>").collect { event ->
+                if (event is YencEvent.Body) {
+                    while (true) {
+                        val n = event.data.readAvailable(
+                            secondBytes, secondOffset, secondBytes.size - secondOffset
+                        )
+                        if (n == -1) break
+                        secondOffset += n
+                        if (secondOffset >= secondBytes.size) break
+                    }
+                }
+            }
+            assertEquals(
+                String(article2),
+                String(secondBytes.copyOf(secondOffset)),
+                "second body should have decoded cleanly — no yenc bleed-through from cancelled first op"
+            )
+        } finally {
+            pool.close()
+        }
+    }
+
+    /**
+     * Variant of the cancel-mid-body test that triggers cancellation via parent-scope
+     * cancel rather than withTimeout. In production, streamSegments cancels the
+     * downloader job from a finally block when the servlet output stream throws —
+     * a different propagation path than withTimeout's TimeoutCancellationException.
+     */
+    @Test
+    @Timeout(20, unit = TimeUnit.SECONDS)
+    fun `cancelled body via parent scope does not leak yenc bytes into next op`() = runBlocking {
+        val article1 = ByteArray(8192) { (it % 256).toByte() }
+        val article2 = "second article cleanly served".toByteArray()
+
+        Thread {
+            val socket = serverSocket.accept()
+            socket.use { s ->
+                val reader = BufferedReader(InputStreamReader(s.getInputStream()))
+                val out = s.getOutputStream()
+                out.write("200 welcome\r\n".toByteArray())
+                out.flush()
+
+                val cmd1 = reader.readLine()
+                check(cmd1 != null && cmd1.startsWith("BODY")) { "expected BODY, got '$cmd1'" }
+                val full1 = buildYencArticle(article1, "first.bin")
+                out.write("222 body follows\r\n".toByteArray())
+                out.write(full1, 0, 256)
+                out.flush()
+                Thread.sleep(800)
+                out.write(full1, 256, full1.size - 256)
+                out.flush()
+
+                val cmd2 = reader.readLine()
+                check(cmd2 != null && cmd2.startsWith("BODY")) { "expected BODY, got '$cmd2'" }
+                out.write("222 body follows\r\n".toByteArray())
+                out.write(buildYencArticle(article2, "second.bin"))
+                out.flush()
+                Thread.sleep(2_000)
+            }
+        }.start()
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        pool.wake()
+
+        try {
+            val collectorReady = CompletableDeferred<Unit>()
+            val collectorJob = launch {
+                pool.bodyYenc("<first@test>").collect { event ->
+                    if (event is YencEvent.Body) {
+                        collectorReady.complete(Unit)
+                        // Read a bit, then suspend so the server-side mid-body pause
+                        // can hold us in the middle of the body stream until the
+                        // parent scope is cancelled below.
+                        val sink = ByteArray(64)
+                        event.data.readAvailable(sink)
+                        delay(Long.MAX_VALUE)
+                    }
+                }
+            }
+            collectorReady.await()
+            // Cancel the parent scope — this is the propagation shape that happens
+            // in streamSegments when the servlet output throws.
+            collectorJob.cancel()
+            collectorJob.join()
+
+            // Second op on the same pool slot — must NOT see yenc bleed-through.
+            val secondBytes = ByteArray(article2.size)
+            var secondOffset = 0
+            pool.bodyYenc("<second@test>").collect { event ->
+                if (event is YencEvent.Body) {
+                    while (true) {
+                        val n = event.data.readAvailable(
+                            secondBytes, secondOffset, secondBytes.size - secondOffset
+                        )
+                        if (n == -1) break
+                        secondOffset += n
+                        if (secondOffset >= secondBytes.size) break
+                    }
+                }
+            }
+            assertEquals(
+                String(article2),
+                String(secondBytes.copyOf(secondOffset)),
+                "second body should have decoded cleanly — no yenc bleed-through"
+            )
+        } finally {
+            pool.close()
         }
     }
 

@@ -1,30 +1,25 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.*
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
-import kotlinx.coroutines.flow.filterIsInstance
-import kotlinx.coroutines.flow.first
 import java.io.Closeable
 
 class NntpClient(
-    val connection: NntpConnection,
-    private val scope: CoroutineScope
+    val connection: NntpConnection
 ) : Closeable {
 
     companion object {
+        private const val DEFAULT_QUIT_TIMEOUT_MS = 1000L
+
         suspend fun connect(
             host: String,
             port: Int,
             selectorManager: SelectorManager,
-            useTls: Boolean = false,
-            scope: CoroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+            useTls: Boolean = false
         ): NntpClient {
-            val connection = NntpConnection.connect(host, port, selectorManager, useTls, scope)
-            return NntpClient(connection, scope)
+            val connection = NntpConnection.connect(host, port, selectorManager, useTls)
+            return NntpClient(connection)
         }
 
         suspend fun connect(
@@ -33,11 +28,20 @@ class NntpClient(
             selectorManager: SelectorManager,
             useTls: Boolean = false,
             username: String,
-            password: String,
-            scope: CoroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+            password: String
         ): NntpClient {
-            val client = connect(host, port, selectorManager, useTls, scope)
-            client.authenticate(username, password)
+            val client = connect(host, port, selectorManager, useTls)
+            // The TCP+TLS+welcome handshake just succeeded; if AUTH fails (e.g. server
+            // returns 502 "Too many connections" on AUTHINFO PASS) we own a live socket
+            // that nothing else holds a reference to. Without this catch the JVM hangs
+            // onto the FD until GC — exactly the leak shape the single-socket-for-life
+            // refactor was meant to eliminate.
+            try {
+                client.authenticate(username, password)
+            } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
+                runCatching { client.close() }
+                throw e
+            }
             return client
         }
     }
@@ -113,14 +117,6 @@ class NntpClient(
 
     fun bodyYenc(number: Long): Flow<YencEvent> =
         fetchBodyYenc(NntpCommand.body(number))
-
-    // --- Yenc headers only ---
-
-    suspend fun bodyYencHeaders(messageId: String): YencHeaders =
-        bodyYenc(messageId).filterIsInstance<YencEvent.Headers>().first().yencHeaders
-
-    suspend fun bodyYencHeaders(number: Long): YencHeaders =
-        bodyYenc(number).filterIsInstance<YencEvent.Headers>().first().yencHeaders
 
     // --- Group selection ---
 
@@ -240,22 +236,16 @@ class NntpClient(
         label: String,
         article: String
     ): NntpResponse {
-        // commandRaw holds commandMutex through the whole article transfer so a concurrent
-        // command on the same connection can't interleave its bytes with our body.
         val initialResponse = connection.commandRaw(cmd)
-        try {
-            if (initialResponse.code != expectedContinueCode) {
-                throw NntpProtocolException(
-                    "$label failed: ${initialResponse.code} ${initialResponse.message}",
-                    initialResponse
-                )
-            }
-            connection.writeLine(dotStuff(article))
-            connection.writeLine(".")
-            return connection.readResponse()
-        } finally {
-            connection.commandMutex.unlock()
+        if (initialResponse.code != expectedContinueCode) {
+            throw NntpProtocolException(
+                "$label failed: ${initialResponse.code} ${initialResponse.message}",
+                initialResponse
+            )
         }
+        connection.writeLine(dotStuff(article))
+        connection.writeLine(".")
+        return connection.readResponse()
     }
 
     // RFC 3977 §3.1.1: any line in a multi-line data block that begins with "." must
@@ -280,6 +270,11 @@ class NntpClient(
 
     override fun close() {
         connection.close()
+    }
+
+    /** Graceful close: send QUIT (bounded by [timeoutMs]) before tearing the socket down. */
+    suspend fun shutdown(timeoutMs: Long = DEFAULT_QUIT_TIMEOUT_MS) {
+        connection.shutdown(timeoutMs)
     }
 
     // --- Private helpers ---
@@ -318,11 +313,20 @@ class NntpClient(
     }
 
     private fun fetchBodyYenc(cmd: String): Flow<YencEvent> = channelFlow {
-        // commandRaw releases the mutex and schedules a reconnect itself on failure,
-        // including cancellation while suspended in lock().
+        // Set the flag BEFORE issuing the command. Once BODY is on the wire the server
+        // WILL send a response (222+body, or 430/5xx single line); if a cancellation
+        // lands between this writeLine and the readResponse below, we still have to
+        // tell the drain that the wire is dirty. Setting the flag only AFTER receiving
+        // 222 was a real bug — the cancellation between commandRaw returning and the
+        // flag-set was a tight but reachable window in production.
+        connection.markBodyInProgress()
         val response = connection.commandRaw(cmd)
         if (response.code != 222) {
-            connection.commandMutex.unlock()
+            // Non-222 means the server has finished responding with a single line and
+            // the wire is now clean. Clear the flag so the next op's drain (or
+            // subsequent commandRaw) sees a clean state. Then surface the protocol
+            // error.
+            connection.markBodyConsumed()
             if (response.code == 430) {
                 throw ArticleNotFoundException(
                     "Article not found: ${response.code} ${response.message}",
@@ -334,6 +338,10 @@ class NntpClient(
                 response
             )
         }
+        // 222 received — body bytes about to flow. The matching markBodyConsumed runs
+        // inside the YencDecoder writer once the article terminator is read off the
+        // wire (NOT here, because decode returns as soon as it has sent the Body event
+        // while the writer is still streaming body bytes asynchronously).
         with(YencDecoder) { decode(connection) }
     }
 }
