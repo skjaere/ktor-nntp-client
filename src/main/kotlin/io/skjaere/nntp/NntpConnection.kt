@@ -12,6 +12,8 @@ import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.readByte
 import io.ktor.utils.io.readLine
 import io.ktor.utils.io.writeStringUtf8
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.Timer
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
@@ -167,13 +169,20 @@ class NntpConnection private constructor(
      * for this connection and discards it.
      */
     suspend fun command(cmd: String): NntpResponse {
+        val sample = Timer.start(registry)
         writeLine(cmd)
-        return readResponse()
+        val response = readResponse()
+        sample.stop(ttfbTimer(cmd))
+        return response
     }
 
     suspend fun commandMultiLine(cmd: String): Pair<NntpResponse, List<String>> {
+        val sample = Timer.start(registry)
         writeLine(cmd)
         val response = readResponse()
+        // Stop the timer at the status line — that's "first byte of response".
+        // The data lines that follow on a 1xx/2xx response are the body, not TTFB.
+        sample.stop(ttfbTimer(cmd))
         return if (response.code in 100..299) {
             Pair(response, readMultiLineData())
         } else {
@@ -189,9 +198,20 @@ class NntpConnection private constructor(
      * operation.
      */
     suspend fun commandRaw(cmd: String): NntpResponse {
+        val sample = Timer.start(registry)
         writeLine(cmd)
-        return readResponse()
+        val response = readResponse()
+        sample.stop(ttfbTimer(cmd))
+        return response
     }
+
+    private val registry = Metrics.globalRegistry
+
+    private fun ttfbTimer(cmd: String): Timer = Timer.builder("nntp.command.ttfb")
+        .description("Time from sending an NNTP command to receiving the first byte of the response status line")
+        .publishPercentileHistogram()
+        .tag("command", cmd.substringBefore(' ').uppercase())
+        .register(registry)
 
     suspend fun readResponse(): NntpResponse {
         val line = readChannel.readLine()
