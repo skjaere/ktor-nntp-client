@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.5.1...v0.6.0) (2026-05-09)
+
+
+### Features
+
+* **metrics:** record TTFB on NNTP commands tagged by command verb ([be534db](https://github.com/skjaere/ktor-nntp-client/commit/be534dbfe0e27eded8a1cb7105f9fb96c9606325))
+
+
+### Performance Improvements
+
+* **yenc:** use direct ByteBuffer overloads to avoid JNA Memory churn ([8b057c9](https://github.com/skjaere/ktor-nntp-client/commit/8b057c93b62347f99bc9f34e2d3bb7a373f7dc2a))
+
 ## [0.5.1](https://github.com/skjaere/ktor-nntp-client/compare/v0.5.0...v0.5.1) (2026-04-25)
 
 
