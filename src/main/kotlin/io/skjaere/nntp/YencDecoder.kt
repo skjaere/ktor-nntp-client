@@ -4,10 +4,16 @@ import io.ktor.utils.io.*
 import io.skjaere.yenc.RapidYenc
 import io.skjaere.yenc.RapidYencDecoderEnd
 import io.skjaere.yenc.RapidYencDecoderState
+import java.nio.ByteBuffer
 import kotlinx.coroutines.channels.ProducerScope
 
 internal object YencDecoder {
     private const val BUFFER_SIZE = 131072
+
+    // Decode-side buffers are 2× socket buffer to absorb (a) a partial article line
+    // carried across iterations after `srcBuf.compact()` plus a fresh `BUFFER_SIZE`
+    // socket read, and (b) the worst-case decoded output (yEnc encoded ≈ source size).
+    private const val DECODE_BUFFER_SIZE = BUFFER_SIZE * 2
 
     /**
      * Stream a yenc-encoded BODY response into the producer scope. Caller has exclusive
@@ -52,42 +58,88 @@ internal object YencDecoder {
         send(YencEvent.Body(writerJob.channel))
     }
 
+    /**
+     * Read pump for one BODY response. Reuses three buffers across the article instead
+     * of allocating per-chunk:
+     *
+     *   - [readBuf]  — heap ByteArray sized to one socket read; reused indefinitely
+     *   - [srcBuf]   — direct ByteBuffer fed to the yEnc decoder; carries any unconsumed
+     *                  tail across iterations via [java.nio.ByteBuffer.compact]
+     *   - [destBuf]  — direct ByteBuffer where rapidyenc writes decoded output
+     *   - [writeBuf] — heap ByteArray for the ktor channel write, sized to destBuf
+     *
+     * The previous implementation called [RapidYenc.decodeIncremental] with a [ByteArray]
+     * source, which the wrapper then copied into a fresh JNA `Memory` (raw `malloc`)
+     * twice per call (src + dest workspaces), plus three small pointer/state holders,
+     * plus another `Memory` per [RapidYenc.crc32] call. That allocator pressure was
+     * invisible to NMT and `jvm.buffer.memory.used` and accumulated in glibc's per-thread
+     * arenas (untracked anon RSS that never got returned to the OS).
+     *
+     * Routing through the direct-`ByteBuffer` overloads keeps the workspace footprint
+     * inside JVM-tracked direct memory (capped via `-XX:MaxDirectMemorySize` if needed)
+     * and reuses the same backing native pages for every chunk.
+     */
     private fun ProducerScope<YencEvent>.launchWriterJob(
         connection: NntpConnection,
         firstDataBytes: ByteArray?
     ): WriterJob = writer(autoFlush = true) {
-        val buffer = ByteArray(BUFFER_SIZE)
+        val readBuf = ByteArray(BUFFER_SIZE)
+        val writeBuf = ByteArray(DECODE_BUFFER_SIZE)
+        val srcBuf = ByteBuffer.allocateDirect(DECODE_BUFFER_SIZE)
+        val destBuf = ByteBuffer.allocateDirect(DECODE_BUFFER_SIZE)
         var decoderState = RapidYencDecoderState.CRLF
         var crc = 0u
-        var pendingBytes: ByteArray? = firstDataBytes
+        var eof = false
+
+        firstDataBytes?.let { srcBuf.put(it) }
 
         while (true) {
-            @Suppress("UNNECESSARY_NOT_NULL_ASSERTION")
-            val rawChunk: ByteArray = if (pendingBytes != null) {
-                val tmp = pendingBytes!!
-                pendingBytes = null
-                tmp
-            } else {
-                val bytesRead = connection.rawReadChannel.readAvailable(buffer)
-                if (bytesRead == -1) break
-                buffer.copyOf(bytesRead)
+            // Top up srcBuf from the socket if there's room and we haven't seen EOF yet.
+            // We don't bypass the read on the iteration where firstDataBytes was seeded —
+            // it's fine to read more on top of it. The decoder will consume what it can
+            // and compact the rest.
+            if (!eof && srcBuf.position() < srcBuf.capacity()) {
+                val readLimit = minOf(readBuf.size, srcBuf.capacity() - srcBuf.position())
+                val n = connection.rawReadChannel.readAvailable(readBuf, 0, readLimit)
+                if (n == -1) {
+                    eof = true
+                    if (srcBuf.position() == 0) break
+                } else if (n > 0) {
+                    srcBuf.put(readBuf, 0, n)
+                } else {
+                    // n == 0: nothing immediately available; if we have buffered data,
+                    // proceed to decode it; otherwise keep waiting.
+                    if (srcBuf.position() == 0) continue
+                }
             }
 
-            val result = RapidYenc.decodeIncremental(rawChunk, decoderState)
+            srcBuf.flip()
+            destBuf.clear()
+            val result = RapidYenc.decodeIncremental(srcBuf, destBuf, decoderState)
 
-            if (result.data.isNotEmpty()) {
-                channel.writeFully(result.data)
-                crc = RapidYenc.crc32(result.data, initCrc = crc)
+            if (result.bytesWritten > 0) {
+                destBuf.flip()
+                val outLen = destBuf.remaining()
+                // CRC over the still-direct buffer (no copy), then drain into a heap
+                // ByteArray for the ktor channel write — ktor 3.x's stable cross-version
+                // write surface is ByteArray-based, and the per-iteration heap copy here
+                // is reusable + bounded so it's cheap relative to what we removed.
+                crc = RapidYenc.crc32(destBuf, length = outLen, initCrc = crc)
+                destBuf.get(writeBuf, 0, outLen)
+                channel.writeFully(writeBuf, 0, outLen)
             }
 
             decoderState = result.state
 
             when (result.end) {
                 RapidYencDecoderEnd.CONTROL -> {
-                    // Found =yend line — parse trailer for CRC validation
-                    val remaining = rawChunk.copyOfRange(
-                        result.bytesConsumed.toInt(), rawChunk.size
-                    )
+                    // Found =yend line — parse trailer for CRC validation. The unconsumed
+                    // tail of srcBuf (from its current position to limit) is the bytes
+                    // after =yend, including potentially the trailer line and the article
+                    // terminator. Pull them out as a ByteArray so the rest of this branch
+                    // can stay character-oriented.
+                    val remaining = ByteArray(srcBuf.remaining())
+                    srcBuf.get(remaining)
                     val remainingStr = String(remaining, Charsets.ISO_8859_1)
                     val yendLine = remainingStr.lines()
                         .firstOrNull { it.startsWith("=yend") }
@@ -133,7 +185,10 @@ internal object YencDecoder {
                 }
 
                 RapidYencDecoderEnd.NONE -> {
-                    // Continue reading
+                    // Move any unconsumed bytes to the front so the next iteration
+                    // can append a fresh socket read after them.
+                    srcBuf.compact()
+                    if (eof && srcBuf.position() == 0) break
                 }
             }
         }
