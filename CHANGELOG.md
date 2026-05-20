@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.5.1...v0.6.0) (2026-05-20)
+
+
+### Features
+
+* **metrics:** record TTFB on NNTP commands tagged by command verb ([be534db](https://github.com/skjaere/ktor-nntp-client/commit/be534dbfe0e27eded8a1cb7105f9fb96c9606325))
+* **metrics:** rename command timer to ack_latency, add body.duration ([a932ae0](https://github.com/skjaere/ktor-nntp-client/commit/a932ae05c9a8c636e12df271f56d3941f6ec5873))
+
+
+### Bug Fixes
+
+* **connection:** don't mis-classify yenc body as a 430 single-line response ([b44d629](https://github.com/skjaere/ktor-nntp-client/commit/b44d629b55497dbcfc1352e3a7c7448aecca6e95))
+
+
+### Performance Improvements
+
+* **yenc:** use direct ByteBuffer overloads to avoid JNA Memory churn ([8b057c9](https://github.com/skjaere/ktor-nntp-client/commit/8b057c93b62347f99bc9f34e2d3bb7a373f7dc2a))
+
 ## [0.5.1](https://github.com/skjaere/ktor-nntp-client/compare/v0.5.0...v0.5.1) (2026-04-25)
 
 
