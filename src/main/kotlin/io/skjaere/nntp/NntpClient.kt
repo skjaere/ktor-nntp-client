@@ -321,6 +321,11 @@ class NntpClient(
         // flag-set was a tight but reachable window in production.
         connection.markBodyInProgress()
         val response = connection.commandRaw(cmd)
+        // The status line is now consumed off the wire; everything that follows
+        // (if 222) is yenc body. Tell the connection so a subsequent
+        // drainUntilArticleEnd doesn't try to re-parse a yenc data line as the
+        // status line.
+        connection.markBodyResponseRead()
         if (response.code != 222) {
             // Non-222 means the server has finished responding with a single line and
             // the wire is now clean. Clear the flag so the next op's drain (or

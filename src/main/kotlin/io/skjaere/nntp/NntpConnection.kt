@@ -15,7 +15,6 @@ import io.ktor.utils.io.writeStringUtf8
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import kotlinx.coroutines.CoroutineExceptionHandler
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
@@ -60,13 +59,39 @@ class NntpConnection private constructor(
     @Volatile
     private var bodyInProgress: Boolean = false
 
+    // Sub-state of [bodyInProgress]: `false` between BODY-command write and reading
+    // its status line (the response line hasn't been read yet); `true` once we've
+    // read the 222 ack and the wire is now carrying yenc body bytes. Lets
+    // [drainUntilArticleEnd] tell apart "drain a pre-response BODY" (where the
+    // first \r\n-terminated line is genuinely the status line) from "drain a
+    // body-streaming BODY" (where any \r\n is just an inter-line yenc terminator).
+    // Without this flag, a yenc body that happened to start with 3 ASCII digits
+    // followed by \r\n would falsely match the single-line fast-path, return
+    // "wire is clean" while body bytes were still queued, and pollute the
+    // connection on its next reuse.
+    @Volatile
+    private var bodyResponseRead: Boolean = false
+
     internal fun markBodyInProgress() {
         bodyInProgress = true
+        bodyResponseRead = false
         log.debug("conn={} markBodyInProgress", id)
+    }
+
+    /**
+     * Mark the BODY response status line as read. Called by [io.skjaere.nntp.NntpClient.fetchBodyYenc]
+     * immediately after `commandRaw(BODY ...)` returns — at that point any subsequent bytes
+     * on the wire are body content, not a status line. Used by [drainUntilArticleEnd] to
+     * skip the single-line-response heuristic when we're already past the status line.
+     */
+    internal fun markBodyResponseRead() {
+        bodyResponseRead = true
+        log.debug("conn={} markBodyResponseRead", id)
     }
 
     internal fun markBodyConsumed() {
         bodyInProgress = false
+        bodyResponseRead = false
         log.debug("conn={} markBodyConsumed", id)
     }
 
@@ -121,7 +146,7 @@ class NntpConnection private constructor(
                 // TLS handshake can fail (cert mismatch, server abort, network); the raw
                 // TCP socket below is already open and would otherwise leak.
                 try {
-                    rawSocket.tls(coroutineContext = Dispatchers.IO + tlsExceptionHandler)
+                    rawSocket.tls(coroutineContext = tlsExceptionHandler)
                 } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
                     runCatching { rawSocket.close() }
                     throw e
@@ -300,12 +325,19 @@ class NntpConnection private constructor(
         // Sliding window of just enough bytes to detect the 5-byte terminator across
         // chunk boundaries. Bounded — we never accumulate the whole body in memory.
         var window = ""
+        // If the BODY command's status line has *already* been read, every subsequent
+        // byte on the wire is yenc body — skip the single-line-response heuristic
+        // entirely. Without this guard, yenc data lines that happen to start with 3
+        // ASCII digits + \r\n would falsely match the heuristic, return "wire clean",
+        // and leave body bytes queued for the next caller (the corrupt-response-line
+        // symptom in production).
+        val responseAlreadyRead = bodyResponseRead
         // Until we see the first \r\n we don't yet know if this is a single-line
         // response or a multi-line body, so we accumulate the prefix to inspect the
         // first line in full. Capped at a few bytes — we only need the 3-digit code
         // and the line terminator.
         val firstLineProbe = StringBuilder()
-        var firstLineDecided = false
+        var firstLineDecided = responseAlreadyRead
         var totalRead = 0L
 
         while (true) {
@@ -328,6 +360,7 @@ class NntpConnection private constructor(
                         // bytes after firstLineProbe are surplus, but for a compliant
                         // NNTP server there shouldn't be any (no pipelining).
                         bodyInProgress = false
+                        bodyResponseRead = false
                         log.debug(
                             "conn={} drain: single-line {} response; wire clean after {} bytes",
                             id, code, totalRead
@@ -342,6 +375,7 @@ class NntpConnection private constructor(
             window = (window + chunk).takeLast(8)
             if (window.contains("\r\n.\r\n")) {
                 bodyInProgress = false
+                bodyResponseRead = false
                 log.debug("conn={} drain: success after {} bytes", id, totalRead)
                 return true
             }
