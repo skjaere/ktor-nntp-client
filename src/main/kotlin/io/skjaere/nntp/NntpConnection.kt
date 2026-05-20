@@ -72,9 +72,18 @@ class NntpConnection private constructor(
     @Volatile
     private var bodyResponseRead: Boolean = false
 
+    // Timer sample paired with [bodyInProgress]. Started in markBodyInProgress (just
+    // before the BODY command goes on the wire), stopped in markBodyConsumed (after
+    // the article terminator is consumed, or immediately for a 430-style fast-path).
+    // Records into [bodyDurationTimer]; captures full BODY round-trip including yenc
+    // body bytes, unlike [ackLatencyTimer] which stops at the status line.
+    @Volatile
+    private var bodyStartSample: Timer.Sample? = null
+
     internal fun markBodyInProgress() {
         bodyInProgress = true
         bodyResponseRead = false
+        bodyStartSample = Timer.start(registry)
         log.debug("conn={} markBodyInProgress", id)
     }
 
@@ -92,6 +101,8 @@ class NntpConnection private constructor(
     internal fun markBodyConsumed() {
         bodyInProgress = false
         bodyResponseRead = false
+        bodyStartSample?.stop(bodyDurationTimer)
+        bodyStartSample = null
         log.debug("conn={} markBodyConsumed", id)
     }
 
@@ -197,7 +208,7 @@ class NntpConnection private constructor(
         val sample = Timer.start(registry)
         writeLine(cmd)
         val response = readResponse()
-        sample.stop(ttfbTimer(cmd))
+        sample.stop(ackLatencyTimer(cmd))
         return response
     }
 
@@ -207,7 +218,7 @@ class NntpConnection private constructor(
         val response = readResponse()
         // Stop the timer at the status line — that's "first byte of response".
         // The data lines that follow on a 1xx/2xx response are the body, not TTFB.
-        sample.stop(ttfbTimer(cmd))
+        sample.stop(ackLatencyTimer(cmd))
         return if (response.code in 100..299) {
             Pair(response, readMultiLineData())
         } else {
@@ -226,16 +237,30 @@ class NntpConnection private constructor(
         val sample = Timer.start(registry)
         writeLine(cmd)
         val response = readResponse()
-        sample.stop(ttfbTimer(cmd))
+        sample.stop(ackLatencyTimer(cmd))
         return response
     }
 
     private val registry = Metrics.globalRegistry
 
-    private fun ttfbTimer(cmd: String): Timer = Timer.builder("nntp.command.ttfb")
+    // Status-line ack latency: command write -> first byte of response status line.
+    // Excludes any body that follows (use bodyDurationTimer for that). For BODY this
+    // captures the server's command-acknowledgement delay only — *not* the time spent
+    // streaming body bytes back.
+    private fun ackLatencyTimer(cmd: String): Timer = Timer.builder("nntp.command.ack_latency")
         .description("Time from sending an NNTP command to receiving the first byte of the response status line")
         .publishPercentileHistogram()
         .tag("command", cmd.substringBefore(' ').uppercase())
+        .register(registry)
+
+    // Full BODY round-trip: command write -> article terminator consumed off the wire.
+    // Started in markBodyInProgress, stopped in markBodyConsumed. Captures the
+    // body-transfer phase that ack latency misses; together they bracket the slow-ack
+    // vs slow-body failure modes when an upstream provider degrades.
+    private val bodyDurationTimer: Timer = Timer.builder("nntp.body.duration")
+        .description("Full BODY round-trip: command write to article terminator consumed off the wire")
+        .publishPercentileHistogram()
+        .tag("pool.name", "$host:$port")
         .register(registry)
 
     suspend fun readResponse(): NntpResponse {
