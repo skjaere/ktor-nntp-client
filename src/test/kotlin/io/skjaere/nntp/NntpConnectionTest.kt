@@ -170,4 +170,63 @@ class NntpConnectionTest {
         assertEquals(emptyList(), lines)
         connection.close()
     }
+
+    /**
+     * Regression for the wire-corruption bug behind the prod `NntpProtocolException:
+     * Invalid response code: <binary garbage>` reports. drainUntilArticleEnd's
+     * single-line fast-path checked whether the first \r\n-terminated chunk
+     * looked like a 3-digit non-222 status code. yenc data lines occasionally
+     * start with three ASCII digits + \r\n purely by chance; the drain would
+     * declare the wire clean while body bytes were still queued, the connection
+     * would be returned to the pool, and the next reader would read those body
+     * bytes as the next response. Fix: drainUntilArticleEnd now skips the
+     * single-line heuristic when markBodyResponseRead has already been called,
+     * because we know the status line is past us and any further \r\n is just a
+     * yenc inter-line terminator.
+     *
+     * Reproducer: simulate a body whose first chunk starts with "430\r\n…" —
+     * exactly the kind of byte sequence the old code would mis-classify as a
+     * single-line `430` response. The terminator `\r\n.\r\n` is later in the
+     * stream; drain must keep reading until then.
+     */
+    @Test
+    fun `drainUntilArticleEnd does not mis-classify body bytes as a 430 response after status line is read`() =
+        runTest {
+            // Server side: send welcome, accept BODY, respond 222 + body that begins
+            // with "430\r\n..." (the bug repro), terminate properly with \r\n.\r\n.
+            launch(Dispatchers.IO) {
+                acceptAndHandle { reader, writer ->
+                    writer.print("200 welcome\r\n")
+                    writer.flush()
+                    reader.readLine() // BODY <id>
+                    // 222 ack, then a yenc-shaped body whose first data line is "430..."
+                    // (followed by enough bytes to overrun firstLineProbe's 3-digit check),
+                    // then a properly-terminated article ending.
+                    writer.print("222 0 <abc@host> body follows\r\n")
+                    writer.print("430 not really a status line\r\n")
+                    writer.print("=ybegin part=1 line=128 size=10 name=x\r\n")
+                    writer.print("=yend size=10 part=1\r\n")
+                    writer.print(".\r\n")
+                    writer.flush()
+                }
+            }
+
+            val connection = NntpConnection.connect(
+                "localhost", serverSocket.localPort, selectorManager
+            )
+
+            // Simulate the fetchBodyYenc handshake: mark in-progress, write BODY,
+            // read the 222 status line, mark response-read, then drain to article-end.
+            connection.markBodyInProgress()
+            val response = connection.commandRaw("BODY <abc@host>")
+            assertEquals(222, response.code)
+            connection.markBodyResponseRead()
+
+            // Drain MUST consume bytes through the actual `\r\n.\r\n` terminator —
+            // it must NOT take the single-line fast-path on the first "430\r\n"
+            // line, which is yenc body data after the response.
+            val drained = connection.drainUntilArticleEnd()
+            assertEquals(true, drained, "drain should report success, not a false 430-fast-path bail-out")
+            connection.close()
+        }
 }
