@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.6.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.5.1...v0.6.0) (2026-05-20)
+
+
+### Features
+
+* **metrics:** record TTFB on NNTP commands tagged by command verb
+* **metrics:** rename command timer to ack_latency, add body.duration
+
+
+### Bug Fixes
+
+* **connection:** don't mis-classify yenc body as a 430 single-line response
+
+
+### Performance Improvements
+
+* **yenc:** use direct ByteBuffer overloads to avoid JNA Memory churn
+
 ## [0.5.1](https://github.com/skjaere/ktor-nntp-client/compare/v0.5.0...v0.5.1) (2026-04-25)
 
 
