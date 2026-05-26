@@ -1,6 +1,7 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.SelectorManager
+import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
@@ -138,6 +139,17 @@ class NntpClientPool(
         Gauge.builder("nntp.pool.size", this) { it.currentSize.toDouble() }
             .tag("pool.name", poolName)
             .register(registry)
+        // Connections whose slot has been reserved (`currentSize` bumped) but that
+        // haven't yet completed `launchConnection` — i.e. stuck in TLS handshake,
+        // AUTHINFO, or the connect-retry backoff. Without this gauge the only way
+        // to see "pool is wedged producing connections it can't finish" is the
+        // derived value `size − idle − active`, which doesn't surface on a
+        // single panel. Read is lock-free and may briefly race with the maps;
+        // coerced to ≥0 to avoid transient negative values during mutation.
+        Gauge.builder("nntp.pool.connecting", this) { pool ->
+            (pool.currentSize - pool.idleClients.size - pool.activeClients.size)
+                .coerceAtLeast(0).toDouble()
+        }.tag("pool.name", poolName).register(registry)
         Gauge.builder("nntp.pool.sleeping", this) { if (it.sleeping) 1.0 else 0.0 }
             .tag("pool.name", poolName)
             .register(registry)
@@ -149,6 +161,23 @@ class NntpClientPool(
         // metric, so the lazily-registered priority-tagged ones would silently
         // disappear from the scrape).
         ensurePriorityGauges(0)
+    }
+
+    private fun recordAcquireFailure(priority: Int, reason: String) {
+        Counter.builder("nntp.pool.acquire.failures")
+            .tag("pool.name", poolName)
+            .tag("priority", priority.toString())
+            .tag("reason", reason)
+            .register(registry)
+            .increment()
+    }
+
+    private fun recordConnectAttempt(outcome: String) {
+        Counter.builder("nntp.pool.connect.attempts")
+            .tag("pool.name", poolName)
+            .tag("outcome", outcome)
+            .register(registry)
+            .increment()
     }
 
     private fun ensurePriorityGauges(priority: Int) {
@@ -203,8 +232,10 @@ class NntpClientPool(
                 null
             }
             if (client != null) {
+                recordConnectAttempt("success")
                 withContext(NonCancellable) { addClientToPool(client) }
             } else {
+                recordConnectAttempt("failure")
                 withContext(NonCancellable) { poolMutex.withLock { currentSize-- } }
             }
         }
@@ -455,6 +486,7 @@ class NntpClientPool(
                     // deferred completed exceptionally
                 }
             }
+            recordAcquireFailure(priority, "timeout")
             throw NntpConnectionException(
                 "Timed out waiting for connection to $host:$port (${ACQUIRE_TIMEOUT_MS}ms)"
             )
@@ -750,10 +782,15 @@ class NntpClientPool(
         // active and waiters are now multi-tag (priority); clear every series for this pool
         registry.find("nntp.pool.active").tag("pool.name", poolName).gauges().forEach { registry.remove(it.id) }
         registry.find("nntp.pool.size").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
+        registry.find("nntp.pool.connecting").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
         registry.find("nntp.pool.waiters").tag("pool.name", poolName).gauges().forEach { registry.remove(it.id) }
         registry.find("nntp.pool.sleeping").tag("pool.name", poolName).gauge()?.id?.let(registry::remove)
         registry.find("nntp.pool.acquire").tag("pool.name", poolName).timers().forEach { timer ->
             registry.remove(timer.id)
         }
+        registry.find("nntp.pool.acquire.failures").tag("pool.name", poolName)
+            .counters().forEach { registry.remove(it.id) }
+        registry.find("nntp.pool.connect.attempts").tag("pool.name", poolName)
+            .counters().forEach { registry.remove(it.id) }
     }
 }
