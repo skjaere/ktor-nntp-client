@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.6.0...v0.7.0) (2026-05-26)
+
+
+### Features
+
+* **metrics:** pool connecting gauge, acquire-failure + connect-attempt counters ([bffcad9](https://github.com/skjaere/ktor-nntp-client/commit/bffcad98a3ae3683db358b9777301d8d113ffa2c))
+
 ## [0.6.0](https://github.com/skjaere/ktor-nntp-client/compare/v0.5.1...v0.6.0) (2026-05-20)
 
 
