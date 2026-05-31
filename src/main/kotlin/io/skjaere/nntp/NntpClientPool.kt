@@ -84,6 +84,17 @@ class NntpClientPool(
         // the per-connection default so an unresponsive socket doesn't drag shutdown out — clients
         // run their QUITs in parallel, so this caps the overall shutdown wall time, not a serial sum.
         const val POOL_CLOSE_QUIT_TIMEOUT_MS = 1500L
+
+        // Upper bound on the cancellation-recovery drain. drainUntilArticleEnd's job is to
+        // read the rest of a half-consumed body so the connection can be reused — but it
+        // runs under withContext(NonCancellable), so a server that stops sending bytes after
+        // a cancelled fetch (article missing post-status, network glitch mid-body, etc.) will
+        // pin the calling coroutine on `readAvailable` indefinitely. That coroutine still
+        // holds the pool slot via activeClients, so each leaked drain permanently removes
+        // one connection from circulation. A 3-second cap is well above the worst-case
+        // drain on a healthy wire (~one yenc-segment worth of bytes ≈ 750 KB) and well below
+        // any reasonable client patience for "we already cancelled this anyway".
+        const val DRAIN_TIMEOUT_MS = 3_000L
     }
 
     private data class IdleEntry(val client: NntpClient, val returnedAtMs: Long)
@@ -604,14 +615,26 @@ class NntpClientPool(
                                 "conn={} cancellation mid-block, draining inline",
                                 c.connection.id
                             )
+                            // Nested withTimeoutOrNull inside NonCancellable: the outer
+                            // context blocks PARENT cancellation from reaching us, but the
+                            // timeout's own Job (a child of NonCancellable) can still cancel
+                            // the inner readAvailable on expiry. Without this bound, a server
+                            // that stops sending after a cancelled fetch pins the drain
+                            // coroutine forever — and the connection along with it — because
+                            // readAvailable just keeps waiting for bytes that will never come.
+                            // On timeout we treat the wire as unrecoverable: mark dead so the
+                            // finally below discards the client and frees its pool slot.
                             val drained = withContext(NonCancellable) {
-                                runCatching { c.connection.drainUntilArticleEnd() }
-                                    .getOrDefault(false)
+                                runCatching {
+                                    withTimeoutOrNull(DRAIN_TIMEOUT_MS) {
+                                        c.connection.drainUntilArticleEnd()
+                                    } ?: false
+                                }.getOrDefault(false)
                             }
                             if (!drained) {
                                 logger.debug(
-                                    "conn={} drain failed; will discard in finally",
-                                    c.connection.id
+                                    "conn={} drain failed or timed out after {}ms; will discard in finally",
+                                    c.connection.id, DRAIN_TIMEOUT_MS,
                                 )
                                 dead = true
                             }
