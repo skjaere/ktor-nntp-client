@@ -29,10 +29,11 @@ dependencies {
     testImplementation(libs.testcontainers.junit.jupiter)
 }
 
+kotlin {
+    jvmToolchain(17)
+}
+
 java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(25)
-    }
     withSourcesJar()
 }
 
@@ -45,5 +46,20 @@ publishing {
         create<MavenPublication>("maven") {
             from(components["java"])
         }
+    }
+}
+
+// Main targets JVM 17 so Android consumers can dex the classes. The mock-nntp-server
+// test dependency is published for JVM 25 only, so test configurations resolve and
+// run against a JDK 25 toolchain instead.
+listOf("testCompileClasspath", "testRuntimeClasspath").forEach { name -> configurations.named(name) {
+    attributes {
+        attribute(TargetJvmVersion.TARGET_JVM_VERSION_ATTRIBUTE, 25)
+    }
+} }
+
+tasks.withType<Test>().configureEach {
+    javaLauncher = javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(25)
     }
 }
