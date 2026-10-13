@@ -587,6 +587,14 @@ class NntpClientPool(
 
     suspend fun <T> withClient(block: suspend (NntpClient) -> T): T = withClient(0, block)
 
+    /** [NntpClient.statPipelined] on one pooled connection, acquired at [priority]. */
+    suspend fun statPipelined(
+        messageIds: List<String>,
+        priority: Int = 0,
+        window: Int = 64,
+        onResult: ((index: Int, result: StatResult) -> Unit)? = null,
+    ): List<StatResult> = withClient(priority) { it.statPipelined(messageIds, window, onResult) }
+
     suspend fun <T> withClient(priority: Int = 0, block: suspend (NntpClient) -> T): T {
         if (sleeping) doWake()
         lastActivityMs = System.currentTimeMillis()

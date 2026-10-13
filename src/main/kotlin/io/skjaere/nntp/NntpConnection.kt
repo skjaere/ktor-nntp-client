@@ -81,6 +81,21 @@ class NntpConnection private constructor(
     @Volatile
     private var bodyStartSample: Timer.Sample? = null
 
+    /**
+     * Status lines still owed by the server for pipelined single-line commands (see
+     * [NntpClient.statPipelined]). A cancellation mid-pipeline leaves these on the wire;
+     * [drainUntilArticleEnd] reads them off before the connection is reused.
+     */
+    private var pendingStatusLines: Int = 0
+
+    internal fun markPipelined(lines: Int) {
+        pendingStatusLines += lines
+    }
+
+    internal fun markPipelineAnswered() {
+        if (pendingStatusLines > 0) pendingStatusLines--
+    }
+
     internal fun markBodyInProgress() {
         bodyInProgress = true
         bodyResponseRead = false
@@ -323,6 +338,11 @@ class NntpConnection private constructor(
         writeChannel.writeStringUtf8("$line\r\n")
     }
 
+    /** Writes several command lines in one write (one flush), for pipelining. */
+    suspend fun writeLines(lines: List<String>) {
+        writeChannel.writeStringUtf8(lines.joinToString("") { "$it\r\n" })
+    }
+
     /**
      * Recover a reusable connection after a body operation was cancelled with bytes
      * still in flight on the wire. Handles both shapes the server may have produced
@@ -341,6 +361,14 @@ class NntpConnection private constructor(
      *   the server closed mid-stream (EOF) without giving us a clean state.
      */
     suspend fun drainUntilArticleEnd(): Boolean {
+        // Pipelined STATs never overlap a BODY: read off the status lines still owed.
+        while (pendingStatusLines > 0) {
+            readChannel.readLine() ?: run {
+                log.debug("conn={} drain: EOF with {} pipelined responses outstanding", id, pendingStatusLines)
+                return false
+            }
+            pendingStatusLines--
+        }
         // Fast-path: protocol-state check. If no body operation is in flight, the
         // wire is line-protocol clean and there's nothing to drain. Set by
         // fetchBodyYenc BEFORE issuing the BODY command (so the flag is true even

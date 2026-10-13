@@ -98,6 +98,56 @@ class NntpClient(
         return fetchStat(NntpCommand.stat(messageId))
     }
 
+    /**
+     * STATs many articles with pipelining (RFC 3977 §3.5): commands are sent in batches
+     * with up to [window] awaiting an answer, and answers are read in order. One round
+     * trip per batch instead of per article, for health checks over thousands of articles.
+     *
+     * Results are in the order of [messageIds]. A response other than 223/430 doesn't stop
+     * the pipeline (its answers are still owed); the first such error is thrown at the end.
+     *
+     * [onResult] is called as each answer arrives, in order, with its index in [messageIds]:
+     * for progress reporting, or to react to the first missing article without waiting for
+     * the rest. It runs on the reading coroutine, so keep it cheap.
+     */
+    suspend fun statPipelined(
+        messageIds: List<String>,
+        window: Int = 64,
+        onResult: ((index: Int, result: StatResult) -> Unit)? = null,
+    ): List<StatResult> {
+        require(window > 0) { "window must be > 0, got $window" }
+        val results = ArrayList<StatResult>(messageIds.size)
+        var sent = 0
+        var firstError: NntpProtocolException? = null
+        while (results.size < messageIds.size) {
+            val outstanding = sent - results.size
+            // Top up once half the window has been answered: few large writes, never idle.
+            if (sent < messageIds.size && outstanding <= window / 2) {
+                val batch = messageIds.subList(sent, minOf(messageIds.size, sent + window - outstanding))
+                connection.markPipelined(batch.size)
+                connection.writeLines(batch.map { "STAT $it" })
+                sent += batch.size
+            }
+            val response = connection.readResponse()
+            connection.markPipelineAnswered()
+            val result = when (response.code) {
+                430 -> StatResult.NotFound(response.code, response.message)
+                223 -> {
+                    val (code, number, messageId) = parseArticleResponseLine("${response.code} ${response.message}")
+                    StatResult.Found(code, response.message, number, messageId)
+                }
+                else -> {
+                    if (firstError == null) firstError = NntpProtocolException("STAT failed: ${response.code} ${response.message}", response)
+                    StatResult.NotFound(response.code, response.message)
+                }
+            }
+            onResult?.invoke(results.size, result)
+            results += result
+        }
+        firstError?.let { throw it }
+        return results
+    }
+
     suspend fun stat(number: Long): StatResult {
         return fetchStat(NntpCommand.stat(number))
     }
