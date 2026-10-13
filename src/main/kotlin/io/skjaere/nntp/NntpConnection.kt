@@ -15,6 +15,7 @@ import io.ktor.utils.io.writeStringUtf8
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
@@ -141,7 +142,13 @@ class NntpConnection private constructor(
             }
         }
 
-        private val tlsExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        // Ktor's TLS actors run in this context. With CBC cipher suites they call
+        // generateNonce(), which runBlocking-waits on a nonce producer that runs on
+        // Dispatchers.Default. If the actors also ran on Default, a few concurrent handshakes
+        // would occupy every Default worker (one per CPU core, so 4 on many phones) and the
+        // producer could never run: a deadlock that surfaces as connect timeouts. IO threads
+        // are meant for blocking calls and leave Default's workers free.
+        private val tlsContext = Dispatchers.IO + CoroutineExceptionHandler { _, throwable ->
             log.debug("TLS actor terminated: {}", throwable.message)
         }
 
@@ -157,7 +164,7 @@ class NntpConnection private constructor(
                 // TLS handshake can fail (cert mismatch, server abort, network); the raw
                 // TCP socket below is already open and would otherwise leak.
                 try {
-                    rawSocket.tls(coroutineContext = tlsExceptionHandler)
+                    rawSocket.tls(coroutineContext = tlsContext)
                 } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
                     runCatching { rawSocket.close() }
                     throw e
