@@ -95,6 +95,21 @@ class NntpClientPool(
         // drain on a healthy wire (~one yenc-segment worth of bytes ≈ 750 KB) and well below
         // any reasonable client patience for "we already cancelled this anyway".
         const val DRAIN_TIMEOUT_MS = 3_000L
+
+        // Upper bound on a single TCP+TLS+welcome+AUTHINFO handshake. NntpConnection.connect
+        // does `readChannel.readLine()` to consume the welcome banner, and NntpConnection's
+        // performAuth does two more `readResponse()` -> readLine() calls for AUTHINFO USER
+        // and AUTHINFO PASS — none of which have an internal time bound. When the server is
+        // alive at TCP level but slow/silent at the protocol level (account session limit
+        // hit, throttling, post-handshake stall), these reads suspend indefinitely, leaving
+        // the launchConnection coroutine pinned in "connecting" state with the pool slot
+        // permanently reserved. Connect-with-retry's exponential backoff doesn't help here
+        // because the inner attempt never returns to be retried.
+        //
+        // 20 s is loose enough to cover worst-case healthy handshakes (TCP ~3 s + TLS ~1 s +
+        // welcome <0.1 s + AUTHINFO round-trips <1 s = ~5 s healthy, ~10 s degraded) and
+        // strict enough to keep one stalled peer from indefinitely consuming a slot.
+        const val CONNECT_TIMEOUT_MS = 20_000L
     }
 
     private data class IdleEntry(val client: NntpClient, val returnedAtMs: Long)
@@ -255,12 +270,22 @@ class NntpClientPool(
     private suspend fun connectWithRetry(): NntpClient? {
         var delayMs = CONNECT_RETRY_BASE_DELAY_MS
         return flow {
-            emit(
+            // Bound each individual connect attempt. The inner NntpClient.connect path has
+            // three unbounded readLine() suspends (welcome + AUTHINFO USER ack + AUTHINFO
+            // PASS ack); without this wrapper, a silent-but-alive server pins the attempt
+            // forever and the existing .retry below never gets a chance to fire. On
+            // expiry we surface as NntpConnectionException so the same retry path that
+            // handles real connect failures (IO errors, EOF mid-handshake, etc.) treats
+            // a timed-out attempt the same way.
+            val client = withTimeoutOrNull(CONNECT_TIMEOUT_MS) {
                 if (username != null && password != null)
                     NntpClient.connect(host, port, selectorManager, useTls, username, password)
                 else
                     NntpClient.connect(host, port, selectorManager, useTls)
+            } ?: throw NntpConnectionException(
+                "Connect to $host:$port timed out after ${CONNECT_TIMEOUT_MS}ms"
             )
+            emit(client)
         }.retry(CONNECT_MAX_RETRIES) { e ->
             when (e) {
                 is UnresolvedAddressException ->
