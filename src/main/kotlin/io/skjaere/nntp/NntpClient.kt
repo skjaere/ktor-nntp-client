@@ -3,6 +3,7 @@ package io.skjaere.nntp
 import io.ktor.network.selector.*
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.flow
 import java.io.Closeable
 
 class NntpClient(
@@ -11,6 +12,11 @@ class NntpClient(
 
     companion object {
         private const val DEFAULT_QUIT_TIMEOUT_MS = 1000L
+
+        // A lookup by an id that can't be one ([NntpCommand.isMessageId]) isn't sent: no article
+        // has that id, so it gets the command's not-found outcome, as if the server said 430.
+        private val NOT_A_MESSAGE_ID = NntpResponse(430, "Not a message-id, not sent")
+        private val NOT_A_MESSAGE_ID_STAT = StatResult.NotFound(NOT_A_MESSAGE_ID.code, NOT_A_MESSAGE_ID.message)
 
         suspend fun connect(
             host: String,
@@ -71,6 +77,7 @@ class NntpClient(
     // --- Article retrieval ---
 
     suspend fun article(messageId: String): ArticleResponse {
+        checkMessageId(messageId)
         return fetchArticle(NntpCommand.article(messageId), 220)
     }
 
@@ -79,6 +86,7 @@ class NntpClient(
     }
 
     suspend fun head(messageId: String): ArticleResponse {
+        checkMessageId(messageId)
         return fetchArticle(NntpCommand.head(messageId), 221)
     }
 
@@ -87,6 +95,7 @@ class NntpClient(
     }
 
     suspend fun body(messageId: String): ArticleResponse {
+        checkMessageId(messageId)
         return fetchArticle(NntpCommand.body(messageId), 222)
     }
 
@@ -95,6 +104,7 @@ class NntpClient(
     }
 
     suspend fun stat(messageId: String): StatResult {
+        if (!NntpCommand.isMessageId(messageId)) return NOT_A_MESSAGE_ID_STAT
         return fetchStat(NntpCommand.stat(messageId))
     }
 
@@ -109,6 +119,10 @@ class NntpClient(
      * [onResult] is called as each answer arrives, in order, with its index in [messageIds]:
      * for progress reporting, or to react to the first missing article without waiting for
      * the rest. It runs on the reading coroutine, so keep it cheap.
+     *
+     * An id that can't be a message-id ([NntpCommand.isMessageId]) is never sent: it gets a
+     * [StatResult.NotFound] in its place, so it can't put extra commands on the wire and shift
+     * the others' answers.
      */
     suspend fun statPipelined(
         messageIds: List<String>,
@@ -116,20 +130,30 @@ class NntpClient(
         onResult: ((index: Int, result: StatResult) -> Unit)? = null,
     ): List<StatResult> {
         require(window > 0) { "window must be > 0, got $window" }
+        // Indices of the ids that go on the wire, in order; [sent] and [answered] count these.
+        val toSend = messageIds.indices.filter { NntpCommand.isMessageId(messageIds[it]) }
         val results = ArrayList<StatResult>(messageIds.size)
         var sent = 0
+        var answered = 0
         var firstError: NntpProtocolException? = null
         while (results.size < messageIds.size) {
-            val outstanding = sent - results.size
+            if (toSend.getOrNull(answered) != results.size) {
+                onResult?.invoke(results.size, NOT_A_MESSAGE_ID_STAT)
+                results += NOT_A_MESSAGE_ID_STAT
+                continue
+            }
+            val outstanding = sent - answered
             // Top up once half the window has been answered: few large writes, never idle.
-            if (sent < messageIds.size && outstanding <= window / 2) {
-                val batch = messageIds.subList(sent, minOf(messageIds.size, sent + window - outstanding))
-                connection.markPipelined(batch.size)
-                connection.writeLines(batch.map { "STAT $it" })
-                sent += batch.size
+            if (sent < toSend.size && outstanding <= window / 2) {
+                val lines = toSend.subList(sent, minOf(toSend.size, sent + window - outstanding))
+                    .map { NntpCommand.stat(messageIds[it]) }
+                connection.markPipelined(lines.size)
+                connection.writeLines(lines)
+                sent += lines.size
             }
             val response = connection.readResponse()
             connection.markPipelineAnswered()
+            answered++
             val result = when (response.code) {
                 430 -> StatResult.NotFound(response.code, response.message)
                 223 -> {
@@ -163,7 +187,8 @@ class NntpClient(
     // --- Yenc body ---
 
     fun bodyYenc(messageId: String): Flow<YencEvent> =
-        fetchBodyYenc(NntpCommand.body(messageId))
+        if (NntpCommand.isMessageId(messageId)) fetchBodyYenc(NntpCommand.body(messageId))
+        else flow { checkMessageId(messageId) }
 
     fun bodyYenc(number: Long): Flow<YencEvent> =
         fetchBodyYenc(NntpCommand.body(number))
@@ -233,6 +258,7 @@ class NntpClient(
     }
 
     suspend fun over(messageId: String): List<String> {
+        checkMessageId(messageId)
         val (response, lines) = connection.commandMultiLine(NntpCommand.over(messageId))
         if (response.code != 224) {
             throw NntpProtocolException("OVER failed: ${response.code} ${response.message}", response)
@@ -257,6 +283,7 @@ class NntpClient(
     }
 
     suspend fun hdr(field: String, messageId: String): List<String> {
+        checkMessageId(messageId)
         val (response, lines) = connection.commandMultiLine(NntpCommand.hdr(field, messageId))
         if (response.code != 225) {
             throw NntpProtocolException("HDR failed: ${response.code} ${response.message}", response)
@@ -328,6 +355,16 @@ class NntpClient(
     }
 
     // --- Private helpers ---
+
+    /** Throws the not-found of a lookup by [messageId], without sending it, when it can't be one. */
+    private fun checkMessageId(messageId: String) {
+        if (!NntpCommand.isMessageId(messageId)) {
+            throw ArticleNotFoundException(
+                "Article not found: ${NOT_A_MESSAGE_ID.code} ${NOT_A_MESSAGE_ID.message}",
+                NOT_A_MESSAGE_ID
+            )
+        }
+    }
 
     private suspend fun fetchArticle(cmd: String, expectedCode: Int): ArticleResponse {
         val (response, lines) = connection.commandMultiLine(cmd)
