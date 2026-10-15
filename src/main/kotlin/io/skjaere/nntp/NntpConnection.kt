@@ -44,7 +44,9 @@ class NntpConnection private constructor(
     private val readChannel: ByteReadChannel,
     private val writeChannel: ByteWriteChannel,
     val welcomeResponse: NntpResponse,
-    private val readTimeoutMs: Long
+    private val readTimeoutMs: Long,
+    // The pool.name tag of this connection's metrics.
+    private val poolName: String
 ) : Closeable {
 
     /**
@@ -271,6 +273,17 @@ class NntpConnection private constructor(
             useTls: Boolean = false,
             readTimeoutMs: Long = DEFAULT_READ_TIMEOUT_MS,
             verifyHostname: Boolean = true
+        ): NntpConnection = connect(host, port, selectorManager, useTls, readTimeoutMs, verifyHostname, "$host:$port")
+
+        /** As the public [connect]; [poolName] is the pool.name tag of the connection's metrics. */
+        internal suspend fun connect(
+            host: String,
+            port: Int,
+            selectorManager: SelectorManager,
+            useTls: Boolean,
+            readTimeoutMs: Long,
+            verifyHostname: Boolean,
+            poolName: String
         ): NntpConnection {
             val socket = try {
                 openSocket(host, port, selectorManager, useTls, verifyHostname)
@@ -297,7 +310,7 @@ class NntpConnection private constructor(
                     )
                 }
                 return NntpConnection(
-                    host, port, socket, readChannel, writeChannel, welcomeResponse, readTimeoutMs
+                    host, port, socket, readChannel, writeChannel, welcomeResponse, readTimeoutMs, poolName
                 )
             } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
                 runCatching { socket.socketContext.cancel() }
@@ -463,7 +476,7 @@ class NntpConnection private constructor(
     private val bodyDurationTimer: Timer = Timer.builder("nntp.body.duration")
         .description("Full BODY round-trip: command write to article terminator consumed off the wire")
         .publishPercentileHistogram()
-        .tag("pool.name", "$host:$port")
+        .tag("pool.name", poolName)
         .register(registry)
 
     /** [withReadTimeout] with this connection's read timeout. A read that fails is its [failure]. */

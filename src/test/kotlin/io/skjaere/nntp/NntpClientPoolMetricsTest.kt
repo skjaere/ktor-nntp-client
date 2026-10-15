@@ -314,4 +314,43 @@ class NntpClientPoolMetricsTest {
         assertEquals(null, idleGauge)
         assertEquals(null, acquireTimer)
     }
+
+    /**
+     * Two pools on one server (two accounts, say) keep their metrics apart under their own names,
+     * their connections' too, and closing one leaves the other's.
+     */
+    @Test
+    @Timeout(10, unit = TimeUnit.SECONDS)
+    fun `a pool's name tags its metrics and its connections'`() = runBlocking<Unit> {
+        launchCommandServer(maxAccepts = 10)
+        fun pool(name: String) = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0,
+            name = name,
+        )
+        val first = pool("first")
+        val second = pool("second")
+        listOf(first, second).forEach { pool ->
+            pool.wake()
+            pool.withClient { }
+        }
+        fun size(name: String) = registry.find("nntp.pool.size").tag("pool.name", name).gauge()?.value()
+        fun bodyTimer(name: String) = registry.find("nntp.body.duration").tag("pool.name", name).timer()
+
+        assertEquals(1.0, size("first"))
+        assertEquals(1.0, size("second"))
+        assertNotNull(bodyTimer("first"))
+        assertNotNull(bodyTimer("second"))
+        assertEquals(null, size("localhost:${serverSocket.localPort}"))
+
+        second.close()
+        assertEquals(null, size("second"))
+        assertEquals(1.0, size("first"))
+        first.close()
+    }
 }

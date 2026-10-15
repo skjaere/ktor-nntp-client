@@ -65,7 +65,11 @@ class NntpClientPool(
     // How long a read waits for the server's next bytes; see NntpConnection.connect.
     private val readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS,
     // With useTls, check the certificate names host and send it as SNI; see NntpConnection.connect.
-    private val verifyHostname: Boolean = true
+    private val verifyHostname: Boolean = true,
+    // The pool.name tag of this pool's metrics and its connections'. Pools on one server (two
+    // accounts, say) need a name each: a meter is shared by its name and tags, and close()
+    // removes those of its pool's name.
+    name: String = "$host:$port"
 ) : Closeable {
 
     companion object {
@@ -188,7 +192,7 @@ class NntpClientPool(
      */
     val connectionsOpened: Long get() = opened.get()
 
-    private val poolName = "$host:$port"
+    private val poolName = name
 
     private val registry = Metrics.globalRegistry
 
@@ -374,10 +378,9 @@ class NntpClientPool(
                 // connect failures (IO errors, EOF mid-handshake, etc.) treats a timed-out
                 // attempt the same way.
                 return connectWithin(CONNECT_TIMEOUT_MS) {
-                    if (username != null && password != null)
-                        NntpClient.connect(host, port, selectorManager, useTls, username, password, readTimeoutMs, verifyHostname)
-                    else
-                        NntpClient.connect(host, port, selectorManager, useTls, readTimeoutMs, verifyHostname)
+                    NntpClient.connect(
+                        host, port, selectorManager, useTls, username, password, readTimeoutMs, verifyHostname, poolName
+                    )
                 } ?: throw NntpConnectionException(
                     "Connect to $host:$port timed out after ${CONNECT_TIMEOUT_MS}ms"
                 )

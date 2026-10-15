@@ -303,7 +303,7 @@ client.close()
 
 ### Metrics
 
-The pool exposes the following Micrometer meters (tagged with `pool.name`):
+The pool exposes the following Micrometer meters, tagged with `pool.name`: the pool's `name`, `host:port` by default. Pools on one server (two accounts, say) need a `name` each, as meters with the same name and tags are shared, and `close()` removes its pool name's meters.
 
 | Metric | Description |
 |--------|-------------|
