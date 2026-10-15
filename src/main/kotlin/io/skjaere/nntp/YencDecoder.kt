@@ -117,7 +117,7 @@ internal object YencDecoder {
             // and compact the rest.
             if (!eof && srcBuf.position() < srcBuf.capacity()) {
                 val readLimit = minOf(readBuf.size, srcBuf.capacity() - srcBuf.position())
-                val n = connection.rawReadChannel.readAvailable(readBuf, 0, readLimit)
+                val n = connection.readAvailable(readBuf, 0, readLimit)
                 if (n == -1) {
                     eof = true
                     if (srcBuf.position() == 0) throw closedMidArticle()
@@ -239,7 +239,7 @@ internal object YencDecoder {
         val buffer = ByteArray(BUFFER_SIZE)
         val accumulator = StringBuilder(str)
         while (true) {
-            val bytesRead = connection.rawReadChannel.readAvailable(buffer)
+            val bytesRead = connection.readAvailable(buffer)
             if (bytesRead == -1) return false
             accumulator.append(String(buffer, 0, bytesRead, Charsets.ISO_8859_1))
             if (accumulator.contains("\r\n.\r\n")) return true

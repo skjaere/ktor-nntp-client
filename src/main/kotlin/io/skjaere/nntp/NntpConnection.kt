@@ -14,12 +14,16 @@ import io.ktor.utils.io.readLine
 import io.ktor.utils.io.writeStringUtf8
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
 import java.io.Closeable
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Owns exactly one socket for its lifetime. Open in [connect], close in [close]. Never
@@ -36,7 +40,8 @@ class NntpConnection private constructor(
     private val socket: Socket,
     private val readChannel: ByteReadChannel,
     private val writeChannel: ByteWriteChannel,
-    val welcomeResponse: NntpResponse
+    val welcomeResponse: NntpResponse,
+    private val readTimeoutMs: Long
 ) : Closeable {
 
     /**
@@ -150,11 +155,64 @@ class NntpConnection private constructor(
         private val log = LoggerFactory.getLogger(NntpConnection::class.java)
         private val NEXT_CONNECTION_ID = java.util.concurrent.atomic.AtomicLong(0)
 
+        /** Default for how long a read waits for the server's next bytes (see [connect]). */
+        const val DEFAULT_READ_TIMEOUT_MS = 30_000L
+
+        // Fires read timeouts on a real clock. A coroutine timeout would follow the caller's
+        // dispatcher, and on a test dispatcher's virtual clock it expires at once while a
+        // read waits on the network.
+        private val readTimeouts = ScheduledThreadPoolExecutor(1) { task ->
+            Thread(task, "nntp-read-timeout").apply { isDaemon = true }
+        }.apply { removeOnCancelPolicy = true }
+
+        /**
+         * Runs [read] on [channel], failing it with [NntpConnectionException] if it gets no
+         * bytes for [timeoutMs]. On expiry the channel is cancelled, which ends the
+         * connection: a server that went silent mid-response leaves the wire unusable.
+         */
+        private suspend fun <T> withReadTimeout(
+            channel: ByteReadChannel,
+            timeoutMs: Long,
+            host: String,
+            port: Int,
+            read: suspend () -> T
+        ): T {
+            if (timeoutMs <= 0) return read()
+            fun timedOut() = "No data from $host:$port for ${timeoutMs}ms"
+            // Settled by whichever comes first: the read finishing or the timer cancelling it.
+            val settled = AtomicBoolean(false)
+            val timer = readTimeouts.schedule({
+                if (settled.compareAndSet(false, true)) channel.cancel(NntpConnectionException(timedOut()))
+            }, timeoutMs, TimeUnit.MILLISECONDS)
+            val result = try {
+                read()
+            } catch (e: CancellationException) {
+                settled.set(true)
+                throw e
+            } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
+                if (settled.compareAndSet(false, true)) throw e
+                throw NntpConnectionException(timedOut(), e)
+            } finally {
+                timer.cancel(false)
+            }
+            // The timer fired as the read finished: the channel is cancelled all the same.
+            if (!settled.compareAndSet(false, true)) throw NntpConnectionException(timedOut())
+            return result
+        }
+
+        /**
+         * @param readTimeoutMs how long a read may wait without receiving a byte before the
+         *   operation fails with [NntpConnectionException]: a stalled server, or a half-open
+         *   TCP connection after a network change. An idle timeout, not a deadline: a long
+         *   BODY or pipelined STAT batch that keeps receiving bytes never times out, and an
+         *   idle connection with no read pending is never affected. 0 or less disables it.
+         */
         suspend fun connect(
             host: String,
             port: Int,
             selectorManager: SelectorManager,
-            useTls: Boolean = false
+            useTls: Boolean = false,
+            readTimeoutMs: Long = DEFAULT_READ_TIMEOUT_MS
         ): NntpConnection {
             val socket = openSocket(host, port, selectorManager, useTls)
             // Anything that throws between openSocket and a successful return must close
@@ -162,7 +220,7 @@ class NntpConnection private constructor(
             try {
                 val readChannel = socket.openReadChannel()
                 val writeChannel = socket.openWriteChannel(autoFlush = true)
-                val welcomeLine = readChannel.readLine()
+                val welcomeLine = withReadTimeout(readChannel, readTimeoutMs, host, port) { readChannel.readLine() }
                     ?: throw NntpConnectionException("Connection closed before welcome message")
                 val welcomeResponse = parseResponseLine(welcomeLine)
                 if (welcomeResponse.code != 200 && welcomeResponse.code != 201) {
@@ -172,7 +230,7 @@ class NntpConnection private constructor(
                     )
                 }
                 return NntpConnection(
-                    host, port, socket, readChannel, writeChannel, welcomeResponse
+                    host, port, socket, readChannel, writeChannel, welcomeResponse, readTimeoutMs
                 )
             } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
                 runCatching { socket.socketContext.cancel() }
@@ -309,8 +367,16 @@ class NntpConnection private constructor(
         .tag("pool.name", "$host:$port")
         .register(registry)
 
+    /** [withReadTimeout] with this connection's read timeout. */
+    private suspend fun <T> timedRead(read: suspend () -> T): T =
+        withReadTimeout(readChannel, readTimeoutMs, host, port, read)
+
+    /** Reads what's available, up to [length] bytes, or -1 at EOF; bounded by the read timeout. */
+    internal suspend fun readAvailable(dst: ByteArray, offset: Int = 0, length: Int = dst.size - offset): Int =
+        timedRead { readChannel.readAvailable(dst, offset, length) }
+
     suspend fun readResponse(): NntpResponse {
-        val line = readChannel.readLine()
+        val line = timedRead { readChannel.readLine() }
             ?: throw NntpConnectionException("Connection closed unexpectedly")
         return parseResponseLine(line)
     }
@@ -318,7 +384,7 @@ class NntpConnection private constructor(
     suspend fun readMultiLineData(): List<String> {
         val lines = mutableListOf<String>()
         while (true) {
-            val line = readChannel.readLine()
+            val line = timedRead { readChannel.readLine() }
                 ?: throw NntpConnectionException("Connection closed during multi-line read")
             if (line == ".") break
             // Dot-unstuffing: lines starting with ".." have leading dot removed
@@ -332,7 +398,7 @@ class NntpConnection private constructor(
     }
 
     suspend fun readLine(): String {
-        return readChannel.readLine()
+        return timedRead { readChannel.readLine() }
             ?: throw NntpConnectionException("Connection closed unexpectedly")
     }
 
@@ -341,21 +407,21 @@ class NntpConnection private constructor(
      * Returns the line content without the trailing CRLF.
      * Use this for reading data that may contain non-ASCII bytes (e.g., yenc-encoded data).
      */
-    suspend fun readRawLine(): ByteArray {
+    suspend fun readRawLine(): ByteArray = timedRead {
         val buffer = java.io.ByteArrayOutputStream()
         var prevByte: Int = -1
         while (true) {
             val byte = readChannel.readByte().toInt() and 0xFF
-            if (prevByte == '\r'.code && byte == '\n'.code) {
-                // Remove the trailing CR from buffer
-                val result = buffer.toByteArray()
-                return result.copyOf(result.size - 1)
-            }
+            if (prevByte == '\r'.code && byte == '\n'.code) break
             buffer.write(byte)
             prevByte = byte
         }
+        // Remove the trailing CR from buffer
+        val result = buffer.toByteArray()
+        result.copyOf(result.size - 1)
     }
 
+    /** The socket's read channel. Reads through it aren't bounded by the read timeout. */
     val rawReadChannel: ByteReadChannel get() = readChannel
 
     suspend fun writeLine(line: String) {
@@ -392,7 +458,7 @@ class NntpConnection private constructor(
         }
         // Pipelined STATs never overlap a BODY: read off the status lines still owed.
         while (pendingStatusLines > 0) {
-            readChannel.readLine() ?: run {
+            timedRead { readChannel.readLine() } ?: run {
                 log.debug("conn={} drain: EOF with {} pipelined responses outstanding", id, pendingStatusLines)
                 return false
             }
@@ -430,7 +496,7 @@ class NntpConnection private constructor(
         var totalRead = 0L
 
         while (true) {
-            val n = readChannel.readAvailable(buffer)
+            val n = readAvailable(buffer)
             if (n == -1) {
                 log.debug("conn={} drain: hit EOF after {} bytes (server closed)", id, totalRead)
                 return false

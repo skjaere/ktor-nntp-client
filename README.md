@@ -213,6 +213,10 @@ pool.wake()
 
 Set `keepaliveIntervalMs = 0` to disable keepalive, and `idleGracePeriodMs = 0` to disable automatic sleep.
 
+### Read Timeout
+
+A read that gets no bytes from the server for `readTimeoutMs` (30 s by default) fails with `NntpConnectionException`, and the pool discards the connection, so a stalled server or a connection left half-open by a network change can't hang a command. It is an idle timeout: a long `BODY` or pipelined `STAT` batch that keeps receiving bytes is never cut off, and idle pooled connections are not affected. Pass `readTimeoutMs` to `NntpClientPool` or `NntpClient.connect`; `0` disables it.
+
 ### Priority Scheduling
 
 When all pool connections are in use, waiting callers are served by priority. Higher `Int` values mean higher priority. Within the same priority level, callers are served in FIFO order.

@@ -58,7 +58,9 @@ class NntpClientPool(
     private val keepaliveIntervalMs: Long = DEFAULT_KEEPALIVE_INTERVAL_MS,
     private val idleGracePeriodMs: Long = DEFAULT_IDLE_GRACE_PERIOD_MS,
     private val idleEvictionTimeoutMs: Long = DEFAULT_IDLE_EVICTION_TIMEOUT_MS,
-    private val commandRetries: Int = DEFAULT_COMMAND_RETRIES
+    private val commandRetries: Int = DEFAULT_COMMAND_RETRIES,
+    // How long a read waits for the server's next bytes; see NntpConnection.connect.
+    private val readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS
 ) : Closeable {
 
     companion object {
@@ -99,12 +101,13 @@ class NntpClientPool(
         // Upper bound on a single TCP+TLS+welcome+AUTHINFO handshake. NntpConnection.connect
         // does `readChannel.readLine()` to consume the welcome banner, and NntpConnection's
         // performAuth does two more `readResponse()` -> readLine() calls for AUTHINFO USER
-        // and AUTHINFO PASS — none of which have an internal time bound. When the server is
-        // alive at TCP level but slow/silent at the protocol level (account session limit
-        // hit, throttling, post-handshake stall), these reads suspend indefinitely, leaving
-        // the launchConnection coroutine pinned in "connecting" state with the pool slot
-        // permanently reserved. Connect-with-retry's exponential backoff doesn't help here
-        // because the inner attempt never returns to be retried.
+        // and AUTHINFO PASS — each bounded only by the idle read timeout (readTimeoutMs),
+        // which a server trickling bytes never trips and which can be disabled. When the server
+        // is alive at TCP level but slow/silent at the protocol level (account session limit
+        // hit, throttling, post-handshake stall), these reads can suspend that long or
+        // indefinitely, leaving the launchConnection coroutine pinned in "connecting" state
+        // with the pool slot reserved. Connect-with-retry's exponential backoff doesn't help
+        // here because the inner attempt doesn't return to be retried.
         //
         // 20 s is loose enough to cover worst-case healthy handshakes (TCP ~3 s + TLS ~1 s +
         // welcome <0.1 s + AUTHINFO round-trips <1 s = ~5 s healthy, ~10 s degraded) and
@@ -279,9 +282,9 @@ class NntpClientPool(
             // a timed-out attempt the same way.
             val client = withTimeoutOrNull(CONNECT_TIMEOUT_MS) {
                 if (username != null && password != null)
-                    NntpClient.connect(host, port, selectorManager, useTls, username, password)
+                    NntpClient.connect(host, port, selectorManager, useTls, username, password, readTimeoutMs)
                 else
-                    NntpClient.connect(host, port, selectorManager, useTls)
+                    NntpClient.connect(host, port, selectorManager, useTls, readTimeoutMs)
             } ?: throw NntpConnectionException(
                 "Connect to $host:$port timed out after ${CONNECT_TIMEOUT_MS}ms"
             )
