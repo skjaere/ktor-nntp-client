@@ -27,6 +27,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.first
@@ -402,35 +403,66 @@ class NntpClientPool(
                 continue
             }
             evictIdleConnections()
-            val entries = drainIdle()
+            keepaliveSweep(drainIdle())
+        }
+    }
+
+    /**
+     * Sends DATE on each of [entries], idle connections taken out of the pool, and hands each
+     * back: to the pool if it answered, else discarded. Until then they're the sweep's alone,
+     * so when it's cancelled (by sleep, close, a new keepalive) the rest are handed back as
+     * they stand, under NonCancellable as in [withdraw]. Otherwise they'd never be closed, and
+     * would still count against maxConnections.
+     */
+    private suspend fun keepaliveSweep(entries: List<IdleEntry>) {
+        var checked = 0
+        try {
             for (entry in entries) {
-                var dead = false
-                val completed = withTimeoutOrNull(KEEPALIVE_COMMAND_TIMEOUT_MS.milliseconds) {
-                    try {
-                        entry.client.date()
-                        true
-                    } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
-                        logger.debug("Keepalive failed, discarding connection: {}", e.message)
-                        dead = true
-                        true
-                    }
-                }
-                if (completed == null) {
-                    // DATE hung — socket is half-broken. Discard so a single stuck connection
-                    // can't block eviction or the grace-period check.
-                    logger.debug(
-                        "Keepalive DATE timed out after {}ms; discarding connection",
-                        KEEPALIVE_COMMAND_TIMEOUT_MS
-                    )
-                    dead = true
-                }
-                if (dead) {
-                    discardClient(entry.client)
-                } else {
-                    // Preserve the original idle timestamp so keepalive itself doesn't reset eviction.
-                    returnToPool(entry.client, entry.returnedAtMs)
-                }
+                // Once cancelled, no more DATEs: one cut short costs its connection.
+                currentCoroutineContext().ensureActive()
+                val alive = answersKeepalive(entry.client)
+                checked++
+                handBack(entry, alive)
             }
+        } finally {
+            withContext(NonCancellable) {
+                // The one whose DATE was cut short still owes its answer, which isReusable sees.
+                entries.drop(checked).forEach { handBack(it, it.client.connection.isReusable) }
+            }
+        }
+    }
+
+    /** DATE on an idle connection: false if it failed or hung, and the connection should go. */
+    private suspend fun answersKeepalive(client: NntpClient): Boolean {
+        val answered = withTimeoutOrNull(KEEPALIVE_COMMAND_TIMEOUT_MS.milliseconds) {
+            try {
+                client.date()
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+                logger.debug("Keepalive failed, discarding connection: {}", e.message)
+                false
+            }
+        }
+        if (answered == null) {
+            // DATE hung — socket is half-broken. Discard so a single stuck connection
+            // can't block eviction or the grace-period check.
+            logger.debug(
+                "Keepalive DATE timed out after {}ms; discarding connection",
+                KEEPALIVE_COMMAND_TIMEOUT_MS
+            )
+        }
+        return answered == true
+    }
+
+    /** Puts a connection the keepalive took out back in the pool, or discards it. */
+    private suspend fun handBack(entry: IdleEntry, alive: Boolean) {
+        if (alive) {
+            // Preserve the original idle timestamp so keepalive itself doesn't reset eviction.
+            returnToPool(entry.client, entry.returnedAtMs)
+        } else {
+            discardClient(entry.client)
         }
     }
 
@@ -443,27 +475,31 @@ class NntpClientPool(
      */
     private suspend fun evictIdleConnections() {
         if (idleEvictionTimeoutMs <= 0) return
-        val now = System.currentTimeMillis()
-        val evicted = poolMutex.withLock {
-            val keepFloor = MIN_POOL_SIZE.coerceAtLeast(0)
-            val removed = mutableListOf<IdleEntry>()
-            // Oldest idle entries sit at the head of the deque (we addLast on return),
-            // so scan from the front. Stop once the remaining pool would dip below the floor.
-            while (idleClients.isNotEmpty() && currentSize > keepFloor) {
-                val oldest = idleClients.first()
-                if (now - oldest.returnedAtMs < idleEvictionTimeoutMs) break
-                idleClients.removeFirst()
-                currentSize--
-                removed.add(oldest)
+        // NonCancellable from taking connections out to closing them, as in withdraw: if the
+        // keepalive were cancelled in between (sleep and close cancel it), they'd never be closed.
+        withContext(NonCancellable) {
+            val now = System.currentTimeMillis()
+            val evicted = poolMutex.withLock {
+                val keepFloor = MIN_POOL_SIZE.coerceAtLeast(0)
+                val removed = mutableListOf<IdleEntry>()
+                // Oldest idle entries sit at the head of the deque (we addLast on return),
+                // so scan from the front. Stop once the remaining pool would dip below the floor.
+                while (idleClients.isNotEmpty() && currentSize > keepFloor) {
+                    val oldest = idleClients.first()
+                    if (now - oldest.returnedAtMs < idleEvictionTimeoutMs) break
+                    idleClients.removeFirst()
+                    currentSize--
+                    removed.add(oldest)
+                }
+                removed
             }
-            removed
-        }
-        shutdownGracefully(evicted.map { it.client })
-        if (evicted.isNotEmpty()) {
-            logger.debug(
-                "Evicted {} idle connection(s) from pool (now {})",
-                evicted.size, currentSize
-            )
+            shutdownGracefully(evicted.map { it.client })
+            if (evicted.isNotEmpty()) {
+                logger.debug(
+                    "Evicted {} idle connection(s) from pool (now {})",
+                    evicted.size, currentSize
+                )
+            }
         }
     }
 
@@ -541,15 +577,19 @@ class NntpClientPool(
         if (!shouldWake) return
         logger.info("Waking pool (connections will be created on demand, max={})", maxConnections)
         // Defensive cleanup: with returnToPool now honoring `sleeping`, idleClients should
-        // already be empty here. Any stragglers get closed AND decremented so currentSize
-        // doesn't leak slots across sleep/wake cycles.
-        val stale = poolMutex.withLock {
-            val entries = idleClients.toList()
-            idleClients.clear()
-            currentSize -= entries.size
-            entries
+        // already be empty here, but a connect still in flight at sleep parks its connection.
+        // Any stragglers get closed AND decremented so currentSize doesn't leak slots across
+        // sleep/wake cycles. NonCancellable from taking them out to closing them, as in
+        // withdraw: withClient wakes the pool in its caller's coroutine, which may be cancelled.
+        withContext(NonCancellable) {
+            val stale = poolMutex.withLock {
+                val entries = idleClients.toList()
+                idleClients.clear()
+                currentSize -= entries.size
+                entries
+            }
+            shutdownGracefully(stale.map { it.client })
         }
-        shutdownGracefully(stale.map { it.client })
         lastActivityMs = System.currentTimeMillis()
         startKeepalive()
     }
