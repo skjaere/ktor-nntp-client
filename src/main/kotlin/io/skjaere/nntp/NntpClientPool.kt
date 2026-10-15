@@ -30,7 +30,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.retry
 import kotlinx.coroutines.isActive
@@ -74,6 +73,14 @@ class NntpClientPool(
         const val CONNECT_RETRY_BASE_DELAY_MS = 1_000L
         const val CONNECT_RETRY_MAX_DELAY_MS = 30_000L
         const val CONNECT_MAX_RETRIES = 5L
+
+        // After a connect fails in a way a retry can't change (isPermanentConnectFailure), the
+        // pool opens no new connection for this long while it has another one, open or on its
+        // way: the acquires queued behind it are served as connections come back. Otherwise each
+        // queued acquire would start a login the server rejects, e.g. "502 Too many connections"
+        // when the account allows fewer connections than maxConnections.
+        const val CONNECT_REJECTED_BACKOFF_MS = 30_000L
+
         const val ACQUIRE_TIMEOUT_MS = 30_000L
         const val DEFAULT_COMMAND_RETRIES = 1
 
@@ -159,6 +166,10 @@ class NntpClientPool(
     private var lastActivityMs = System.currentTimeMillis()
 
     private val opened = AtomicLong()
+
+    // Until when new connections wait after a rejected connect; see CONNECT_REJECTED_BACKOFF_MS.
+    @Volatile
+    private var connectRejectedUntilMs = 0L
 
     /**
      * Connections this pool has opened (connected, greeted and logged in) since it was created.
@@ -261,26 +272,48 @@ class NntpClientPool(
      */
     private fun launchConnection() {
         scope.launch {
-            val client: NntpClient? = try {
+            val client = try {
                 connectWithRetry()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 logger.warn("Connection attempt failed permanently: {}", e.message)
-                null
-            }
-            if (client != null) {
-                opened.incrementAndGet()
-                recordConnectAttempt("success")
-                withContext(NonCancellable) { addClientToPool(client) }
-            } else {
                 recordConnectAttempt("failure")
-                withContext(NonCancellable) { poolMutex.withLock { currentSize-- } }
+                withContext(NonCancellable) { connectFailed(e) }
+                return@launch
+            }
+            opened.incrementAndGet()
+            recordConnectAttempt("success")
+            connectRejectedUntilMs = 0L
+            withContext(NonCancellable) { addClientToPool(client) }
+        }
+    }
+
+    /** Frees the slot of a connect that failed for good with [cause]. */
+    private suspend fun connectFailed(cause: Exception) {
+        poolMutex.withLock {
+            currentSize--
+            if (cause.isPermanentConnectFailure()) {
+                connectRejectedUntilMs = System.currentTimeMillis() + CONNECT_REJECTED_BACKOFF_MS
             }
         }
     }
 
-    private suspend fun connectWithRetry(): NntpClient? {
+    /**
+     * Under [poolMutex]: whether a waiter may have a new connection opened for it. Not at the
+     * maximum, nor while a rejected connect's back-off runs and another connection can serve
+     * the waiter (see [CONNECT_REJECTED_BACKOFF_MS]).
+     */
+    private fun canOpenConnection(): Boolean =
+        currentSize < maxConnections &&
+            (currentSize == 0 || System.currentTimeMillis() >= connectRejectedUntilMs)
+
+    /**
+     * Connects, retrying with exponential back-off (1 s doubling, at most [CONNECT_MAX_RETRIES]
+     * retries) a failure that may pass: refused, reset, timed out, a greeting other than 200/201.
+     * A failure a retry can't change ([isPermanentConnectFailure]) is thrown at once.
+     */
+    private suspend fun connectWithRetry(): NntpClient {
         var delayMs = CONNECT_RETRY_BASE_DELAY_MS
         return flow {
             // Bound each individual connect attempt. The inner NntpClient.connect path has
@@ -300,17 +333,15 @@ class NntpClientPool(
             )
             emit(client)
         }.retry(CONNECT_MAX_RETRIES) { e ->
-            when (e) {
-                is UnresolvedAddressException ->
-                    logger.error("Failed to resolve host '{}:{}': {}", host, port, e.message)
-
-                else ->
-                    logger.warn("Failed to connect to {}:{}: {}", host, port, e.message)
+            if (e.isPermanentConnectFailure()) {
+                logger.error("Failed to connect to {}:{}, not retrying: {}", host, port, e.message ?: e.toString())
+                return@retry false
             }
+            logger.warn("Failed to connect to {}:{}: {}", host, port, e.message)
             delay(delayMs)
             delayMs = (delayMs * 2).coerceAtMost(CONNECT_RETRY_MAX_DELAY_MS)
             true
-        }.firstOrNull()
+        }.first()
     }
 
     private fun startKeepalive() {
@@ -506,7 +537,7 @@ class NntpClientPool(
             waiters.add(w)
             incWaiter(priority)
             // Launch a new connection if we haven't reached the max
-            if (currentSize < maxConnections) {
+            if (canOpenConnection()) {
                 currentSize++
                 launchConnection()
             }
@@ -746,7 +777,7 @@ class NntpClientPool(
                 // so they're not left hanging until acquire-timeout. Without this kick,
                 // a discarded slot stays vacant unless a new acquire happens to walk the
                 // currentSize<max branch.
-                if (waiters.isNotEmpty() && currentSize < maxConnections && !closed && !sleeping) {
+                if (waiters.isNotEmpty() && canOpenConnection() && !closed && !sleeping) {
                     currentSize++
                     launchConnection()
                 }
@@ -873,3 +904,15 @@ class NntpClientPool(
             .counters().forEach { registry.remove(it.id) }
     }
 }
+
+// AUTHINFO answers that reject the login itself: 481 (rejected), 482 (out of sequence) and 502
+// (not allowed, e.g. too many connections for the account). Asking again gets the same answer.
+private val REJECTED_LOGIN_CODES = setOf(481, 482, 502)
+
+/**
+ * A connect failure a retry can't change: the server rejected the login, or the host name
+ * doesn't resolve. Anything else (refused, reset, timed out, a 400 greeting) may pass.
+ */
+private fun Throwable.isPermanentConnectFailure(): Boolean =
+    (this is NntpAuthenticationException && response?.code in REJECTED_LOGIN_CODES) ||
+        generateSequence(this) { it.cause }.any { it is UnresolvedAddressException }
