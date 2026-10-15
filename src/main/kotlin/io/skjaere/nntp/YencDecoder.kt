@@ -5,6 +5,7 @@ import io.skjaere.yenc.RapidYenc
 import io.skjaere.yenc.RapidYencDecoderEnd
 import io.skjaere.yenc.RapidYencDecoderState
 import java.nio.ByteBuffer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.channels.ProducerScope
 
 internal object YencDecoder {
@@ -18,9 +19,11 @@ internal object YencDecoder {
     /**
      * Stream a yenc-encoded BODY response into the producer scope. Caller has exclusive
      * ownership of [connection] for the whole BODY operation (one [NntpClientPool.withClient]
-     * = one connection lifetime). If anything throws — protocol error, EOF mid-stream,
-     * cancellation by the consumer — the exception propagates up; the pool sees the
-     * throw, doesn't return the connection to the pool, and discards it.
+     * = one connection lifetime). If the headers can't be read, the exception propagates
+     * up and the pool discards the connection. A failure of the body pump (socket error,
+     * the reader cancelling the Body channel) doesn't propagate: Ktor 3's writer keeps it
+     * in the Body channel, where the reader sees it, and completes normally. The pump marks
+     * the connection instead ([NntpConnection.markBodyFailed]), and the pool discards it.
      */
     suspend fun ProducerScope<YencEvent>.decode(
         connection: NntpConnection
@@ -83,6 +86,20 @@ internal object YencDecoder {
         connection: NntpConnection,
         firstDataBytes: ByteArray?
     ): WriterJob = writer(autoFlush = true) {
+        try {
+            pump(connection, firstDataBytes)
+        } catch (e: CancellationException) {
+            // The pool's withClient drains the rest of the article after a cancellation.
+            throw e
+        } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
+            // The writer only stores this in the Body channel, so mark the connection for
+            // the pool to see.
+            connection.markBodyFailed(e)
+            throw e
+        }
+    }
+
+    private suspend fun WriterScope.pump(connection: NntpConnection, firstDataBytes: ByteArray?) {
         val readBuf = ByteArray(BUFFER_SIZE)
         val writeBuf = ByteArray(DECODE_BUFFER_SIZE)
         val srcBuf = ByteBuffer.allocateDirect(DECODE_BUFFER_SIZE)

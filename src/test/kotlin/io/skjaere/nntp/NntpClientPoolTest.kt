@@ -1,7 +1,9 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.*
+import io.ktor.utils.io.cancel
 import io.ktor.utils.io.readAvailable
+import io.ktor.utils.io.toByteArray
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import io.skjaere.yenc.RapidYenc
@@ -27,7 +29,9 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
+import java.io.OutputStream
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.CopyOnWriteArrayList
@@ -194,17 +198,7 @@ class NntpClientPoolTest {
                             greet.await()
                             out.write("200 welcome\r\n".toByteArray())
                             out.flush()
-                            while (true) {
-                                val cmd = reader.readLine() ?: break
-                                val reply = when {
-                                    cmd.startsWith("STAT") -> "223 0 <test@msg> article exists"
-                                    cmd == "QUIT" -> "205 bye"
-                                    else -> "500 unknown command"
-                                }
-                                out.write("$reply\r\n".toByteArray())
-                                out.flush()
-                                if (cmd == "QUIT") break
-                            }
+                            answerCommands(reader, out)
                         } catch (_: Exception) {
                         }
                     }
@@ -212,6 +206,54 @@ class NntpClientPoolTest {
                 }.apply { isDaemon = true }.start()
             }
         }.apply { isDaemon = true }.start()
+    }
+
+    /** Answers STAT and QUIT on an open connection until the client quits or goes away. */
+    private fun answerCommands(reader: BufferedReader, out: OutputStream) {
+        while (true) {
+            val cmd = reader.readLine() ?: break
+            val reply = when {
+                cmd.startsWith("STAT") -> "223 0 <test@msg> article exists"
+                cmd == "QUIT" -> "205 bye"
+                else -> "500 unknown command"
+            }
+            out.write("$reply\r\n".toByteArray())
+            out.flush()
+            if (cmd == "QUIT") break
+        }
+    }
+
+    /**
+     * Greets every connection, hands the first to [first] and answers STAT and QUIT on the
+     * others. Returns the number of connections accepted so far.
+     */
+    private fun launchFirstConnectionServer(
+        first: (Socket, BufferedReader, OutputStream) -> Unit
+    ): AtomicInteger {
+        val accepted = AtomicInteger()
+        Thread {
+            while (true) {
+                val client = try {
+                    serverSocket.accept()
+                } catch (_: Exception) {
+                    break
+                }
+                val isFirst = accepted.incrementAndGet() == 1
+                Thread {
+                    client.use { socket ->
+                        try {
+                            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                            val out = socket.getOutputStream()
+                            out.write("200 welcome\r\n".toByteArray())
+                            out.flush()
+                            if (isFirst) first(socket, reader, out) else answerCommands(reader, out)
+                        } catch (_: Exception) {
+                        }
+                    }
+                }.apply { isDaemon = true }.start()
+            }
+        }.apply { isDaemon = true }.start()
+        return accepted
     }
 
     /** The pool's private lock, so a test can hold it the way a concurrent pool operation does. */
@@ -919,6 +961,114 @@ class NntpClientPoolTest {
         }
         assertTrue(closed.await(5, TimeUnit.SECONDS), "${closed.count} connection(s) were never closed")
     }
+
+    /**
+     * Ktor 3's writer keeps a failure of its block in the channel and completes normally, so
+     * when the yEnc pump failed mid-article (here the server resets the connection), the
+     * pool's withClient saw its block return and put the dead connection back in the pool,
+     * first in line for the next caller.
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a body pump that fails mid-article does not return its connection to the pool`() = runBlocking<Unit> {
+        val bodyStarted = CountDownLatch(1)
+        launchFirstConnectionServer { socket, reader, out ->
+            reader.readLine() // BODY
+            val article = buildYencArticle(ByteArray(64 * 1024) { (it % 256).toByte() }, "reset.bin")
+            out.write("222 body follows\r\n".toByteArray())
+            out.write(article, 0, article.size / 2)
+            out.flush()
+            bodyStarted.await()
+            socket.setSoLinger(true, 0) // closes with a reset, mid-article
+        }
+        val registry = SimpleMeterRegistry()
+        Metrics.addRegistry(registry)
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        val poolName = "localhost:${serverSocket.localPort}"
+        fun gauge(name: String) = registry.find(name).tag("pool.name", poolName).gauge()?.value()
+        pool.wake()
+        try {
+            pool.bodyYenc("<reset@test>").collect { event ->
+                if (event is YencEvent.Body) {
+                    bodyStarted.countDown()
+                    try {
+                        event.data.toByteArray()
+                    } catch (_: IOException) {
+                        // The reset reaches the reader; what matters here is the connection.
+                    }
+                }
+            }
+            assertEquals(0.0, gauge("nntp.pool.idle"), "the dead connection is idle in the pool")
+            assertEquals(0.0, gauge("nntp.pool.size"), "pool size")
+            assertTrue(pool.stat("<test@msg>") is StatResult.Found)
+        } finally {
+            pool.close()
+            Metrics.removeRegistry(registry)
+        }
+    }
+
+    /**
+     * A reader that cancels the Body channel to stop early makes the pump's next write fail,
+     * which Ktor 3's writer keeps in the channel, so withClient returned the connection with
+     * the rest of the article still on the wire: the next command read yEnc data as its
+     * status line.
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a body its reader cancels does not leave the rest of the article for the next command`() =
+        runBlocking<Unit> {
+            val bodyCancelled = CountDownLatch(1)
+            val accepted = launchFirstConnectionServer { _, reader, out ->
+                reader.readLine() // BODY
+                val article = buildYencArticle(ByteArray(64 * 1024) { (it % 256).toByte() }, "early.bin")
+                val third = article.size / 3
+                out.write("222 body follows\r\n".toByteArray())
+                out.write(article, 0, third)
+                out.flush()
+                bodyCancelled.await()
+                // More of the body, which the pump fails to write into the cancelled channel.
+                out.write(article, third, third)
+                out.flush()
+                // The rest goes out when the next command arrives, so a connection returned
+                // mid-article reads it as that command's status line.
+                reader.readLine() ?: return@launchFirstConnectionServer
+                out.write(article, 2 * third, article.size - 2 * third)
+                out.write("223 0 <test@msg> article exists\r\n".toByteArray())
+                out.flush()
+                answerCommands(reader, out)
+            }
+            val pool = NntpClientPool(
+                host = "localhost",
+                port = serverSocket.localPort,
+                selectorManager = selectorManager,
+                maxConnections = 1,
+                scope = poolScope,
+                keepaliveIntervalMs = 0,
+                idleGracePeriodMs = 0
+            )
+            pool.wake()
+            try {
+                pool.bodyYenc("<early@test>").collect { event ->
+                    if (event is YencEvent.Body) {
+                        event.data.cancel()
+                        bodyCancelled.countDown()
+                    }
+                }
+                val result = pool.stat("<test@msg>")
+                assertTrue(result is StatResult.Found)
+                assertEquals(2, accepted.get(), "the STAT should have needed a new connection")
+            } finally {
+                pool.close()
+            }
+        }
 
     @Test
     @Timeout(45, unit = TimeUnit.SECONDS)

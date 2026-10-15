@@ -619,6 +619,16 @@ class NntpClientPool(
                     poolMutex.withLock { activeClients[client] = priority }
                     incActive(priority)
                     val result = block(client)
+                    // A yEnc body's pump runs in Ktor's writer, which keeps its failure in the
+                    // Body channel and completes normally, so block can return with the body
+                    // unfinished: the socket dead or the rest of the article on the wire.
+                    if (!client.connection.isReusable) {
+                        logger.debug(
+                            "conn={} body left unfinished; will discard in finally",
+                            client.connection.id
+                        )
+                        dead = true
+                    }
                     blockCompleted = true
                     emit(result)
                 } catch (e: ArticleNotFoundException) {

@@ -122,6 +122,30 @@ class NntpConnection private constructor(
         log.debug("conn={} markBodyConsumed", id)
     }
 
+    // Why the body pump stopped before the article's end, if it did (see [markBodyFailed]).
+    @Volatile
+    private var bodyFailure: Throwable? = null
+
+    /**
+     * Records that the body pump failed with [cause]. Before the article's end, that leaves
+     * the socket dead or the rest of the article on the wire at a point nobody knows (the
+     * pump may have read bytes it never decoded), so the connection can't be reused or
+     * drained. After it (a CRC mismatch) the wire is clean and this does nothing.
+     */
+    internal fun markBodyFailed(cause: Throwable) {
+        if (!bodyInProgress) return
+        bodyFailure = cause
+        log.debug("conn={} markBodyFailed: {}", id, cause.toString())
+    }
+
+    /**
+     * False while a body is unfinished: its pump failed ([markBodyFailed]) or was stopped,
+     * or never ran. Ktor 3's writer keeps a pump failure in the Body channel and completes
+     * normally, so a block can return with the connection in this state.
+     */
+    internal val isReusable: Boolean
+        get() = !bodyInProgress && bodyFailure == null
+
     companion object {
         private val log = LoggerFactory.getLogger(NntpConnection::class.java)
         private val NEXT_CONNECTION_ID = java.util.concurrent.atomic.AtomicLong(0)
@@ -358,9 +382,14 @@ class NntpConnection private constructor(
      * reading until we see `\r\n.\r\n`.
      *
      * @return true if the wire is now clean and the connection is reusable, false if
-     *   the server closed mid-stream (EOF) without giving us a clean state.
+     *   the server closed mid-stream (EOF) without giving us a clean state, or the body
+     *   pump had already failed ([markBodyFailed]).
      */
     suspend fun drainUntilArticleEnd(): Boolean {
+        bodyFailure?.let {
+            log.debug("conn={} drain: body pump failed ({}), wire position unknown", id, it.toString())
+            return false
+        }
         // Pipelined STATs never overlap a BODY: read off the status lines still owed.
         while (pendingStatusLines > 0) {
             readChannel.readLine() ?: run {
