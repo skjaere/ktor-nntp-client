@@ -32,7 +32,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.retry
 import kotlinx.coroutines.flow.retryWhen
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -352,36 +351,44 @@ class NntpClientPool(
      * Connects, retrying with exponential back-off (1 s doubling, at most [CONNECT_MAX_RETRIES]
      * retries) a failure that may pass: refused, reset, timed out, a greeting other than 200/201.
      * A failure a retry can't change ([isPermanentConnectFailure]) is thrown at once.
+     *
+     * A loop rather than a retrying flow: a flow's emit checks for cancellation, and a connect
+     * cancelled there (close() cancels connects) would drop the client it had just opened.
+     * Nothing between [connectWithin] and the caller's NonCancellable hand-over checks.
      */
     private suspend fun connectWithRetry(): NntpClient {
         var delayMs = CONNECT_RETRY_BASE_DELAY_MS
-        return flow {
-            // Bound each individual connect attempt. The inner NntpClient.connect path has
-            // three unbounded readLine() suspends (welcome + AUTHINFO USER ack + AUTHINFO
-            // PASS ack); without this wrapper, a silent-but-alive server pins the attempt
-            // forever and the existing .retry below never gets a chance to fire. On
-            // expiry we surface as NntpConnectionException so the same retry path that
-            // handles real connect failures (IO errors, EOF mid-handshake, etc.) treats
-            // a timed-out attempt the same way.
-            val client = withTimeoutOrNull(CONNECT_TIMEOUT_MS) {
-                if (username != null && password != null)
-                    NntpClient.connect(host, port, selectorManager, useTls, username, password, readTimeoutMs, verifyHostname)
-                else
-                    NntpClient.connect(host, port, selectorManager, useTls, readTimeoutMs, verifyHostname)
-            } ?: throw NntpConnectionException(
-                "Connect to $host:$port timed out after ${CONNECT_TIMEOUT_MS}ms"
-            )
-            emit(client)
-        }.retry(CONNECT_MAX_RETRIES) { e ->
-            if (e.isPermanentConnectFailure()) {
-                logger.error("Failed to connect to {}:{}, not retrying: {}", host, port, e.message ?: e.toString())
-                return@retry false
+        var retries = 0L
+        while (true) {
+            try {
+                // Bound each individual connect attempt. The inner NntpClient.connect path has
+                // three unbounded readLine() suspends (welcome + AUTHINFO USER ack + AUTHINFO
+                // PASS ack); without this wrapper, a silent-but-alive server pins the attempt
+                // forever and the retry below never gets a chance to fire. On expiry we
+                // surface as NntpConnectionException so the same retry path that handles real
+                // connect failures (IO errors, EOF mid-handshake, etc.) treats a timed-out
+                // attempt the same way.
+                return connectWithin(CONNECT_TIMEOUT_MS) {
+                    if (username != null && password != null)
+                        NntpClient.connect(host, port, selectorManager, useTls, username, password, readTimeoutMs, verifyHostname)
+                    else
+                        NntpClient.connect(host, port, selectorManager, useTls, readTimeoutMs, verifyHostname)
+                } ?: throw NntpConnectionException(
+                    "Connect to $host:$port timed out after ${CONNECT_TIMEOUT_MS}ms"
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (e.isPermanentConnectFailure()) {
+                    logger.error("Failed to connect to {}:{}, not retrying: {}", host, port, e.message ?: e.toString())
+                    throw e
+                }
+                if (retries++ == CONNECT_MAX_RETRIES) throw e
+                logger.warn("Failed to connect to {}:{}: {}", host, port, e.message)
+                delay(delayMs)
+                delayMs = (delayMs * 2).coerceAtMost(CONNECT_RETRY_MAX_DELAY_MS)
             }
-            logger.warn("Failed to connect to {}:{}: {}", host, port, e.message)
-            delay(delayMs)
-            delayMs = (delayMs * 2).coerceAtMost(CONNECT_RETRY_MAX_DELAY_MS)
-            true
-        }.first()
+        }
     }
 
     private fun startKeepalive() {
@@ -1017,3 +1024,20 @@ private val REJECTED_LOGIN_CODES = setOf(481, 482, 502)
 private fun Throwable.isPermanentConnectFailure(): Boolean =
     (this is NntpAuthenticationException && response?.code in REJECTED_LOGIN_CODES) ||
         generateSequence(this) { it.cause }.any { it is UnresolvedAddressException || it is CertificateException }
+
+/**
+ * [connect], or null if it takes longer than [timeoutMs]. Whatever ends the wait, a client
+ * [connect] has opened is never dropped: withTimeoutOrNull alone discards the result of a block
+ * that finishes as its timeout fires (a connect's last step, after the server's answer, doesn't
+ * suspend), leaking a connected, logged-in session. Such a client is returned as if in time; if
+ * the caller is cancelled instead, it is closed.
+ */
+internal suspend fun <T : Closeable> connectWithin(timeoutMs: Long, connect: suspend () -> T): T? {
+    var connected: T? = null
+    try {
+        return withTimeoutOrNull(timeoutMs) { connect().also { connected = it } } ?: connected
+    } catch (e: CancellationException) {
+        connected?.let { runCatching { it.close() } }
+        throw e
+    }
+}

@@ -2,6 +2,7 @@ package io.skjaere.nntp
 
 import io.ktor.network.selector.SelectorManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
@@ -9,10 +10,14 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -20,6 +25,7 @@ import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import java.io.BufferedReader
+import java.io.Closeable
 import java.io.InputStreamReader
 import java.net.ServerSocket
 import java.util.concurrent.CountDownLatch
@@ -28,11 +34,13 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
  * The pool's life: once closed it serves nothing and opens nothing, and the work in flight at
- * close ends promptly.
+ * close ends promptly. A connect that finishes is never lost, whatever cancels it at the end.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class NntpPoolLifecycleTest {
@@ -209,6 +217,72 @@ class NntpPoolLifecycleTest {
         assertPoolScopeSettles("the connect")
         delay(1_500) // past the first retry's back-off
         assertEquals(1, server.accepted.get(), "connects after close")
+    }
+
+    // --- K16: the per-attempt connect timeout ---
+
+    private class FakeClient : Closeable {
+        @Volatile
+        var closed = false
+
+        override fun close() {
+            closed = true
+        }
+    }
+
+    /**
+     * Stands in for a connect: it waits on the network (suspends), then reads the server's last
+     * answer, and what's left (parsing it, building the client) runs without suspending. Here
+     * that last step waits, without suspending, until this attempt is cancelled (its timeout
+     * fired, or its caller was cancelled), and finishes all the same with [client].
+     */
+    private suspend fun finishAfterCancellation(client: FakeClient, started: CompletableDeferred<Unit>? = null): FakeClient {
+        // A block that never suspends keeps its result past the timeout (withTimeout's
+        // undispatched fast path); a real connect always suspends first.
+        yield()
+        val attempt = currentCoroutineContext().job
+        started?.complete(Unit)
+        val giveUpAt = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (attempt.isActive && System.nanoTime() < giveUpAt) Thread.sleep(5)
+        assertFalse(attempt.isActive, "the attempt was never cancelled")
+        return client
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a connect that finishes as its time runs out keeps its client`() = runBlocking<Unit> {
+        val client = FakeClient()
+        // Off runBlocking's thread, so the timeout fires while the connect is still running.
+        val connected = withContext(Dispatchers.Default) {
+            connectWithin(timeoutMs = 50) { finishAfterCancellation(client) }
+        }
+        assertSame(client, connected, "the client connected as the time ran out was dropped")
+        assertFalse(client.closed, "the client kept should be open")
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a connect that finishes as its caller is cancelled closes its client`() = runBlocking<Unit> {
+        val client = FakeClient()
+        val started = CompletableDeferred<Unit>()
+        val attempt = callers.launch {
+            connectWithin(timeoutMs = 60_000) { finishAfterCancellation(client, started) }
+        }
+        started.await()
+        attempt.cancel()
+        attempt.join()
+        assertTrue(client.closed, "the client connected as its caller was cancelled was never closed")
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a connect that does not finish in time gives up`() = runBlocking<Unit> {
+        val client = FakeClient()
+        val connected = connectWithin(timeoutMs = 50) {
+            delay(10_000)
+            client
+        }
+        assertNull(connected, "a connect still running at its deadline should give up")
     }
 
     private companion object {
