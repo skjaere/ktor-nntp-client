@@ -156,6 +156,9 @@ class NntpClientPool(
     private var closed = false
     private var keepaliveJob: Job? = null
 
+    // Connects under way (launchConnection), so close() can stop them: a closed pool opens nothing.
+    private val connects = ConcurrentHashMap.newKeySet<Job>()
+
     // Per-priority counters for the priority-tagged gauges. Updated atomically alongside
     // every add/remove of an active client or a waiter, so micrometer scrapes can read
     // them lock-free. We register a gauge lazily the first time we see a given priority,
@@ -273,10 +276,10 @@ class NntpClientPool(
      * Launch a single new connection in the background.
      * On success the client is dispatched to a waiter or parked idle.
      * On failure [currentSize] is decremented so the slot can be reused.
-     * Must only be called after incrementing [currentSize] under [poolMutex].
+     * Must only be called after incrementing [currentSize] under [poolMutex], on an open pool.
      */
     private fun launchConnection() {
-        scope.launch {
+        val job = scope.launch {
             val client = try {
                 connectWithRetry()
             } catch (e: CancellationException) {
@@ -292,6 +295,8 @@ class NntpClientPool(
             connectRejectedUntilMs = 0L
             withContext(NonCancellable) { addClientToPool(client) }
         }
+        connects.add(job)
+        job.invokeOnCompletion { connects.remove(job) }
     }
 
     /**
@@ -570,7 +575,8 @@ class NntpClientPool(
 
     private suspend fun doWake() {
         val shouldWake = poolMutex.withLock {
-            if (!sleeping) return@withLock false
+            // A closed pool stays shut: no keepalive, nothing to clean up.
+            if (!sleeping || closed) return@withLock false
             sleeping = false
             true
         }
@@ -599,6 +605,9 @@ class NntpClientPool(
         val sample = Timer.start(registry)
         val deferred = CompletableDeferred<NntpClient>()
         val waiter = poolMutex.withLock {
+            // As close() fails the acquires already waiting. Not retried by withClient, so work
+            // in flight at close ends here too, without a new connection.
+            check(!closed) { "Pool closed" }
             // LIFO: take the most-recently-used connection. Under steady-state
             // trickle traffic, this keeps the "hot" connections refreshed at the
             // tail while older connections age out at the head.
@@ -934,12 +943,19 @@ class NntpClientPool(
     suspend fun stat(number: Long, priority: Int = 0): StatResult =
         withClient(priority) { it.stat(number) }
 
+    /**
+     * Closes the pool for good. Acquires waiting now, and any made later, fail with
+     * IllegalStateException("Pool closed"), and connects under way are stopped. A command in
+     * flight fails as its connection closes; withClient's retry of it fails with "Pool closed".
+     */
     override fun close() {
-        keepaliveJob?.cancel()
-        keepaliveJob = null
         runBlocking {
-            val toShutdown = poolMutex.withLock {
+            val (idle, checkedOut) = poolMutex.withLock {
                 closed = true
+                keepaliveJob?.cancel()
+                keepaliveJob = null
+                // Nothing more is launched once closed is set (acquire and discardClient check it).
+                connects.forEach { it.cancel() }
                 // Complete all waiters exceptionally — we own the dequeue so we also own
                 // the per-priority decrement.
                 while (true) {
@@ -950,18 +966,21 @@ class NntpClientPool(
                     )
                 }
                 // Snapshot every client we own — both idle and currently checked-out.
-                // Active clients are cancelled mid-operation; their owning withClient
-                // unwinds via returnToPool which is a no-op once we've closed them here.
-                val all = idleClients.map { it.client } + activeClients.keys.toList()
+                // Checked-out clients fail mid-operation; their owning withClient unwinds
+                // via discardClient or returnToPool, which close them again (a no-op).
+                val idle = idleClients.map { it.client }
                 currentSize -= idleClients.size
                 idleClients.clear()
-                all
+                idle to activeClients.keys.toList()
             }
+            // A checked-out connection is its caller's: a QUIT here would read concurrently with
+            // the caller and take its answer. Closing it fails the caller's command instead.
+            checkedOut.forEach { client -> runCatching { client.close() } }
             // Best-effort QUIT in parallel, then hard-close. supervisorScope keeps one
             // bad client from sabotaging the rest of the drain.
-            if (toShutdown.isNotEmpty()) {
+            if (idle.isNotEmpty()) {
                 supervisorScope {
-                    toShutdown.forEach { client ->
+                    idle.forEach { client ->
                         launch {
                             runCatching { client.shutdown(POOL_CLOSE_QUIT_TIMEOUT_MS) }
                         }
