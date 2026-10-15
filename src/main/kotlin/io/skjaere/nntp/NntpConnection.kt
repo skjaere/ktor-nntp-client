@@ -21,6 +21,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
 import java.io.Closeable
+import java.io.IOException
+import java.nio.channels.UnresolvedAddressException
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -206,6 +208,8 @@ class NntpConnection private constructor(
          *   TCP connection after a network change. An idle timeout, not a deadline: a long
          *   BODY or pipelined STAT batch that keeps receiving bytes never times out, and an
          *   idle connection with no read pending is never affected. 0 or less disables it.
+         * @throws NntpConnectionException if the connection can't be opened: the host name
+         *   doesn't resolve, the connect is refused or fails, or the TLS handshake fails.
          */
         suspend fun connect(
             host: String,
@@ -214,7 +218,13 @@ class NntpConnection private constructor(
             useTls: Boolean = false,
             readTimeoutMs: Long = DEFAULT_READ_TIMEOUT_MS
         ): NntpConnection {
-            val socket = openSocket(host, port, selectorManager, useTls)
+            val socket = try {
+                openSocket(host, port, selectorManager, useTls)
+            } catch (e: UnresolvedAddressException) {
+                throw NntpConnectionException("Unknown host $host", e)
+            } catch (e: IOException) {
+                throw NntpConnectionException("Could not connect to $host:$port: ${e.message}", e)
+            }
             // Anything that throws between openSocket and a successful return must close
             // the socket; otherwise its FD is held by the JVM until process exit.
             try {

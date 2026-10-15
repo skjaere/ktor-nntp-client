@@ -10,10 +10,13 @@ import org.junit.jupiter.api.Test
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.PrintWriter
+import java.net.ConnectException
 import java.net.ServerSocket
 import java.net.Socket
+import java.nio.channels.UnresolvedAddressException
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertIs
 
 class NntpConnectionTest {
 
@@ -72,6 +75,25 @@ class NntpConnectionTest {
                 "localhost", serverSocket.localPort, selectorManager
             )
         }
+    }
+
+    @Test
+    fun `a refused connect fails with NntpConnectionException`() = runTest {
+        val port = serverSocket.localPort
+        serverSocket.close()
+
+        val e = assertFailsWith<NntpConnectionException> {
+            NntpConnection.connect("localhost", port, selectorManager)
+        }
+        assertIs<ConnectException>(e.cause, "cause")
+    }
+
+    @Test
+    fun `a host name that does not resolve fails with NntpConnectionException`() = runTest {
+        val e = assertFailsWith<NntpConnectionException> {
+            NntpConnection.connect("nntp-test.invalid", 119, selectorManager)
+        }
+        assertIs<UnresolvedAddressException>(e.cause, "cause")
     }
 
     @Test
