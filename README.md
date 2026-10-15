@@ -325,7 +325,7 @@ Connections also record `nntp.command.ack_latency`, the time from sending a comm
 - `NntpClientPool` is safe for concurrent use from multiple coroutines
 - The pool uses `supervisorScope` to isolate failures and `NonCancellable` to ensure connections are always returned
 - When all connections are busy, waiting coroutines are dispatched by priority (higher first, FIFO within same priority). Cancelled waiters are cleaned up without leaking connections.
-- A command cancelled before its answer was read (e.g. a cancelled `bodyYenc()` or `stat()`) has the rest of the answer read off before its connection is reused, for up to 3 s; a connection that can't be brought back in step that way (a multi-line answer cut short, a pipelined `STAT` batch owing many answers) is closed, and a new one is opened on demand
+- A command cancelled before its answer was read (e.g. a cancelled `bodyYenc()` or `stat()`) has the rest of the answer read off before its connection is reused, for up to 3 s; a cancelled `statPipelined()` returns at once and its answers are read off on the pool's scope. A connection that can't be brought back in step that way (a multi-line answer cut short, answers that don't come within the 3 s) is closed, and a new one is opened on demand
 - I/O errors (e.g., `ClosedWriteChannelException` from TLS) trigger automatic reconnect and retry with a different connection
 - Each `NntpClient` instance is safe for sequential use from any coroutine
 - A single `SelectorManager` can be shared across all connections

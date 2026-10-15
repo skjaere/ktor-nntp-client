@@ -22,6 +22,7 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -109,14 +110,6 @@ class NntpClientPool(
         // drain on a healthy wire (~one yenc-segment worth of bytes ≈ 750 KB) and well below
         // any reasonable client patience for "we already cancelled this anyway".
         const val DRAIN_TIMEOUT_MS = 3_000L
-
-        // A cancelled pipelined STAT batch (statPipelined) that still owes more answers than this
-        // is discarded instead of drained. The drain would hold the cancelled caller until the
-        // server had sent every one, up to DRAIN_TIMEOUT_MS: seconds on a provider slow to answer
-        // 430s, after an availability check stopped at its first missing article. A new
-        // connection costs less. A few are still read off, so a batch nearly done keeps its
-        // connection.
-        const val MAX_DRAINED_STAT_ANSWERS = 4
 
         // Upper bound on a single TCP+TLS+welcome+AUTHINFO handshake. NntpConnection.connect
         // does `readChannel.readLine()` to consume the welcome banner, and NntpConnection's
@@ -771,6 +764,8 @@ class NntpClientPool(
                 // flow on every successful op after emit. That must NOT mark the connection
                 // dead, otherwise every successful command discards its slot.
                 var blockCompleted = false
+                // Set once the connection is drainOnPoolScope's to hand back.
+                var handedOff = false
                 try {
                     client = acquire(priority)
                     logger.debug(
@@ -816,15 +811,18 @@ class NntpClientPool(
                     // simpler design: the caller waits for the drain, but we don't have
                     // to reason about a race between the drain and the next acquire of
                     // the same connection. The benign post-emit case (blockCompleted=true)
-                    // skips the drain entirely. A pipelined STAT batch that still owes many
-                    // answers isn't waited for: it's discarded (MAX_DRAINED_STAT_ANSWERS).
-                    val owed = client?.connection?.pipelinedAnswersOwed ?: 0
-                    if (!blockCompleted && owed > MAX_DRAINED_STAT_ANSWERS) {
+                    // skips the drain entirely. A pipelined STAT batch's answers are read off
+                    // without the caller (drainOnPoolScope): an availability check stops at its
+                    // first missing article with up to a window of them owed, which a server
+                    // slow to answer takes seconds to send.
+                    val pipelined = client?.takeIf { it.connection.pipelinedAnswersOwed > 0 }
+                    if (!blockCompleted && pipelined != null) {
                         logger.debug(
-                            "conn={} cancelled with {} pipelined answers owed; will discard in finally",
-                            client?.connection?.id, owed
+                            "conn={} cancelled with {} pipelined answers owed, draining on the pool's scope",
+                            pipelined.connection.id, pipelined.connection.pipelinedAnswersOwed
                         )
-                        dead = true
+                        drainOnPoolScope(pipelined)
+                        handedOff = true
                     } else if (!blockCompleted) {
                         client?.let { c ->
                             logger.debug(
@@ -877,8 +875,11 @@ class NntpClientPool(
                     throw e
                 } finally {
                     client?.let {
-                        if (dead) discardClient(it)
-                        else returnToPool(it)
+                        when {
+                            handedOff -> Unit
+                            dead -> discardClient(it)
+                            else -> returnToPool(it)
+                        }
                     }
                 }
             }.retryWhen { e, attempt ->
@@ -891,6 +892,39 @@ class NntpClientPool(
                 }
                 retryable
             }.first()
+        }
+    }
+
+    /**
+     * Reads off, on the pool's scope, what a cancelled command on [client] still owes (bounded by
+     * [DRAIN_TIMEOUT_MS]), then hands it back: to the pool if the wire is back in step, else
+     * discarded. Its cancelled caller doesn't wait. Until then the connection stays checked out,
+     * so nobody else gets it, and close() closes it under the drain as any in use.
+     */
+    private fun drainOnPoolScope(client: NntpClient) {
+        // UNDISPATCHED starts it even on a cancelled scope, and NonCancellable lets it finish:
+        // otherwise the connection would never be handed back, and its slot would be lost.
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            withContext(NonCancellable) {
+                val drained = try {
+                    withTimeoutOrNull(DRAIN_TIMEOUT_MS) { client.connection.drainUntilArticleEnd() } ?: false
+                } catch (e: CancellationException) {
+                    discardClient(client)
+                    throw e
+                } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
+                    logger.debug("conn={} drain failed: {}", client.connection.id, e.message)
+                    false
+                }
+                if (drained) {
+                    returnToPool(client)
+                } else {
+                    logger.debug(
+                        "conn={} drain failed or timed out after {}ms; discarding",
+                        client.connection.id, DRAIN_TIMEOUT_MS
+                    )
+                    discardClient(client)
+                }
+            }
         }
     }
 

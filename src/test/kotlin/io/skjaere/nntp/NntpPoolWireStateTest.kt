@@ -5,6 +5,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.AfterEach
@@ -244,9 +246,10 @@ class NntpPoolWireStateTest {
     // --- Cancelled pipelined STAT batches ---
 
     /**
-     * Reading off the answers a cancelled batch still owes holds the caller until the server
-     * has sent them all, up to the drain budget (NntpClientPool.DRAIN_TIMEOUT_MS): seconds on a
-     * server slow to answer. With many owed, the connection is discarded at once instead.
+     * Reading off the answers a cancelled batch still owes took until the server had sent them
+     * all, up to the drain budget (NntpClientPool.DRAIN_TIMEOUT_MS), and the caller waited for
+     * it: seconds on a server slow to answer. They're read off without the caller, and the
+     * connection is discarded if they don't all come within the budget.
      */
     @Test
     @Timeout(15, unit = TimeUnit.SECONDS)
@@ -291,7 +294,49 @@ class NntpPoolWireStateTest {
             pool.wake()
             try {
                 val ids = (0 until 3).map { "<a$it@test>" }
-                assertNull(withTimeoutOrNull(CANCEL_AFTER_MS) { pool.statPipelined(ids) })
+                val elapsed = measureTimeMillis {
+                    assertNull(withTimeoutOrNull(CANCEL_AFTER_MS) { pool.statPipelined(ids) })
+                }
+                assertTrue(elapsed < SLOW_ANSWER_MS, "the cancelled batch waited ${elapsed}ms for the answers it owed")
+
+                val next = pool.stat("<later@test>")
+                assertEquals("<later@test>", assertIs<StatResult.Found>(next).messageId, "the next STAT got $next")
+                assertEquals(1, accepted.get(), "the answers owed should have been read off and the connection reused")
+            } finally {
+                pool.close()
+            }
+        }
+
+    /**
+     * An availability check stops at its first missing article with the rest of its batch
+     * owed. A server that answers at once has them all on their way: they're read off and the
+     * connection reused, not reconnected for every check that stops early.
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a pipelined STAT batch stopped at its first answer, the rest coming at once, keeps its connection`() =
+        runBlocking<Unit> {
+            val accepted = launchServer { _, cmd, _, out ->
+                val id = cmd.removePrefix("STAT ")
+                out.send(if (id == "<a0@test>") "430 no such article" else "223 0 $id article exists")
+            }
+            val pool = pool()
+            pool.wake()
+            try {
+                val ids = (0 until 64).map { "<a$it@test>" }
+                val elapsed = measureTimeMillis {
+                    val check = launch {
+                        val context = coroutineContext
+                        pool.statPipelined(ids) { _, result ->
+                            // As a check does at its first missing article.
+                            if (result is StatResult.NotFound) context.cancel()
+                            context.ensureActive()
+                        }
+                    }
+                    check.join()
+                    assertTrue(check.isCancelled)
+                }
+                assertTrue(elapsed < 1_000, "the stopped batch held its caller for ${elapsed}ms")
 
                 val next = pool.stat("<later@test>")
                 assertEquals("<later@test>", assertIs<StatResult.Found>(next).messageId, "the next STAT got $next")
