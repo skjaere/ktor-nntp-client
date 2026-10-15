@@ -1,9 +1,12 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.SelectorManager
+import io.micrometer.core.instrument.Metrics
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -15,6 +18,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
@@ -41,6 +45,7 @@ import kotlin.test.assertTrue
 /**
  * The pool's life: once closed it serves nothing and opens nothing, and the work in flight at
  * close ends promptly. A connect that finishes is never lost, whatever cancels it at the end.
+ * Awake, it always has its keepalive.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class NntpPoolLifecycleTest {
@@ -123,7 +128,8 @@ class NntpPoolLifecycleTest {
 
     private fun pool(
         maxConnections: Int = 1,
-        keepaliveIntervalMs: Long = 0
+        keepaliveIntervalMs: Long = 0,
+        idleGracePeriodMs: Long = 0
     ) = NntpClientPool(
         host = "localhost",
         port = serverSocket.localPort,
@@ -131,10 +137,13 @@ class NntpPoolLifecycleTest {
         maxConnections = maxConnections,
         scope = poolScope,
         keepaliveIntervalMs = keepaliveIntervalMs,
-        idleGracePeriodMs = 0
+        idleGracePeriodMs = idleGracePeriodMs
     )
 
-    /** How [call] ended, within [PROMPT_MS]; null if it hadn't. A cancellation counts as an ending. */
+    /**
+     * How [call] ended: its failure, or null if it succeeded. Fails the test if it hasn't ended
+     * within [PROMPT_MS]; a cancellation counts as an ending.
+     */
     private suspend fun endingOf(call: Deferred<*>): Throwable? {
         assertNotNull(
             withTimeoutOrNull(PROMPT_MS) { call.join() },
@@ -283,6 +292,48 @@ class NntpPoolLifecycleTest {
             client
         }
         assertNull(connected, "a connect still running at its deadline should give up")
+    }
+
+    // --- K17: sleep and wake ---
+
+    /** The pool's private lock, so a test can hold it the way a concurrent pool operation does. */
+    private fun NntpClientPool.poolMutex(): Mutex =
+        NntpClientPool::class.java.getDeclaredField("poolMutex").apply { isAccessible = true }.get(this) as Mutex
+
+    /**
+     * A sleep and a wake that cross. The sleep cancelled the keepalive after releasing the lock,
+     * so it could cancel the keepalive a wake had just started: the pool stayed awake with no
+     * keepalive to check its connections, evict them or put it back to sleep. Here the wake runs
+     * (unconfined) inside the sleep's unlock, the narrowest form of a race between two threads.
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a wake that crosses a sleep keeps its keepalive`() = runBlocking<Unit> {
+        val registry = SimpleMeterRegistry()
+        Metrics.addRegistry(registry)
+        fun sleeping() = registry.find("nntp.pool.sleeping")
+            .tag("pool.name", "localhost:${serverSocket.localPort}").gauge()?.value()
+        val pool = pool(keepaliveIntervalMs = 100, idleGracePeriodMs = 300)
+        try {
+            pool.wake()
+            val lock = pool.poolMutex()
+            lock.lock()
+            // Both wait for the lock, the sleep first. This thread resumes the sleep; the sleep's
+            // unlock resumes the wake, which runs there and then, before the sleep goes on.
+            val sleep = launch(start = CoroutineStart.UNDISPATCHED) { pool.sleep() }
+            val wake = launch(Dispatchers.Unconfined) { pool.wake() }
+            lock.unlock()
+            sleep.join()
+            wake.join()
+            assertEquals(0.0, sleeping(), "the wake came last: the pool should be awake")
+
+            // An idle pool's keepalive puts it to sleep once the grace period has passed.
+            val slept = withTimeoutOrNull(3_000) { while (sleeping() != 1.0) delay(20) }
+            assertNotNull(slept, "the pool stayed awake with no keepalive to put it to sleep")
+        } finally {
+            pool.close()
+            Metrics.removeRegistry(registry)
+        }
     }
 
     private companion object {

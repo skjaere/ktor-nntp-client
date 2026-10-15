@@ -153,6 +153,9 @@ class NntpClientPool(
     private var waiterSequence = 0L
     private var currentSize = 0  // total connections: idle + in-use + connecting
     private var closed = false
+
+    // Running while the pool is awake and open. Started and cancelled under poolMutex, together
+    // with the change to sleeping or closed.
     private var keepaliveJob: Job? = null
 
     // Connects under way (launchConnection), so close() can stop them: a closed pool opens nothing.
@@ -354,7 +357,8 @@ class NntpClientPool(
      *
      * A loop rather than a retrying flow: a flow's emit checks for cancellation, and a connect
      * cancelled there (close() cancels connects) would drop the client it had just opened.
-     * Nothing between [connectWithin] and the caller's NonCancellable hand-over checks.
+     * Nothing between [connectWithin] returning and the caller's NonCancellable hand-over
+     * checks for cancellation.
      */
     private suspend fun connectWithRetry(): NntpClient {
         var delayMs = CONNECT_RETRY_BASE_DELAY_MS
@@ -391,6 +395,7 @@ class NntpClientPool(
         }
     }
 
+    /** Under [poolMutex], as the pool wakes. */
     private fun startKeepalive() {
         if (keepaliveIntervalMs <= 0) return
         keepaliveJob?.cancel()
@@ -558,6 +563,11 @@ class NntpClientPool(
                 return@withLock false
             }
             sleeping = true
+            // The keepalive stops and starts with the flag, under the lock. Cancelled after the
+            // lock, it could be the one a wake in between had just started: the pool would stay
+            // awake with no keepalive to check, evict or put it back to sleep.
+            keepaliveJob?.cancel()
+            keepaliveJob = null
             true
         }
         if (!shouldSleep) return
@@ -567,8 +577,6 @@ class NntpClientPool(
         // run to completion; the loop body's `if (sleeping) continue` guard above
         // stops keepalive from doing any further work the next time it ticks.
         withContext(NonCancellable) {
-            keepaliveJob?.cancel()
-            keepaliveJob = null
             val entries = drainIdle()
             shutdownGracefully(entries.map { it.client })
             poolMutex.withLock { currentSize -= entries.size }
@@ -585,6 +593,9 @@ class NntpClientPool(
             // A closed pool stays shut: no keepalive, nothing to clean up.
             if (!sleeping || closed) return@withLock false
             sleeping = false
+            // With the flag, under the lock: see doSleep.
+            lastActivityMs = System.currentTimeMillis()
+            startKeepalive()
             true
         }
         if (!shouldWake) return
@@ -603,8 +614,6 @@ class NntpClientPool(
             }
             shutdownGracefully(stale.map { it.client })
         }
-        lastActivityMs = System.currentTimeMillis()
-        startKeepalive()
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
