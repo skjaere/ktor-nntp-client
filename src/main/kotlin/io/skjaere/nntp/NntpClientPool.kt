@@ -504,41 +504,41 @@ class NntpClientPool(
             return deferred.getCompleted()
         }
         // Await outside the lock with timeout
-        try {
-            val client = withTimeoutOrNull(ACQUIRE_TIMEOUT_MS.milliseconds) { deferred.await() }
-            if (client != null) {
-                recordAcquire(sample, priority)
-                return client
-            }
-            // Timed out — remove waiter and fail. Decrement only if we actually pulled it
-            // out of the queue ourselves; if dispatchOrPark already polled it, the dispatch
-            // path already decremented.
-            val stillQueued = poolMutex.withLock { waiters.remove(waiter) }
-            if (stillQueued) decWaiter(priority)
-            if (deferred.isCompleted) {
-                try {
-                    addClientToPool(deferred.getCompleted())
-                } catch (_: IllegalStateException) {
-                    // deferred completed exceptionally
-                }
-            }
-            recordAcquireFailure(priority, "timeout")
-            throw NntpConnectionException(
-                "Timed out waiting for connection to $host:$port (${ACQUIRE_TIMEOUT_MS}ms)"
-            )
+        val client = try {
+            withTimeoutOrNull(ACQUIRE_TIMEOUT_MS.milliseconds) { deferred.await() }
         } catch (e: CancellationException) {
-            // On cancellation, remove from queue and handle race where client was already completed
-            val stillQueued = poolMutex.withLock { waiters.remove(waiter) }
-            if (stillQueued) decWaiter(priority)
-            // If the deferred was completed before we could cancel, return the client to the pool
-            if (deferred.isCompleted) {
-                try {
-                    addClientToPool(deferred.getCompleted())
-                } catch (_: IllegalStateException) {
-                    // deferred completed exceptionally, nothing to return
-                }
-            }
+            withdraw(waiter)
             throw e
+        }
+        if (client != null) {
+            recordAcquire(sample, priority)
+            return client
+        }
+        withdraw(waiter)
+        recordAcquireFailure(priority, "timeout")
+        throw NntpConnectionException(
+            "Timed out waiting for connection to $host:$port (${ACQUIRE_TIMEOUT_MS}ms)"
+        )
+    }
+
+    /**
+     * Takes [waiter] back after its acquire timed out or was cancelled. Cancelling its
+     * deferred first makes this atomic with [dispatchOrPark]: from then on complete() fails
+     * and the dispatcher moves on, so no connection can be handed to a waiter nobody awaits.
+     * If the deferred already held a client, it's ours and goes back to the pool. The rest
+     * runs under NonCancellable: the caller is usually cancelled already, and a contended
+     * Mutex.lock throws at once in a cancelled coroutine, which used to skip this cleanup.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private suspend fun withdraw(waiter: PriorityWaiter) {
+        waiter.deferred.cancel()
+        val delivered = if (waiter.deferred.isCancelled) null else waiter.deferred.getCompleted()
+        withContext(NonCancellable) {
+            // Decrement only if we pulled it out of the queue ourselves; if dispatchOrPark
+            // already polled it, the dispatch path already decremented.
+            val stillQueued = poolMutex.withLock { waiters.remove(waiter) }
+            if (stillQueued) decWaiter(waiter.priority)
+            delivered?.let { addClientToPool(it) }
         }
     }
 

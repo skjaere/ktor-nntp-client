@@ -8,14 +8,20 @@ import io.skjaere.yenc.RapidYenc
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -25,12 +31,16 @@ import java.io.InputStreamReader
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
+import kotlin.test.fail
 
 class NntpClientPoolTest {
 
@@ -161,6 +171,52 @@ class NntpClientPoolTest {
         }.start()
         return acceptedSockets
     }
+
+
+    /**
+     * A server whose connections wait for [greet] before sending the welcome, so the pool's
+     * connects stay in flight until the test lets them finish. Answers STAT and QUIT, and
+     * counts [closed] down as each connection ends.
+     */
+    private fun launchGatedServer(greet: CountDownLatch, closed: CountDownLatch) {
+        Thread {
+            while (true) {
+                val client = try {
+                    serverSocket.accept()
+                } catch (_: Exception) {
+                    break
+                }
+                Thread {
+                    client.use { socket ->
+                        try {
+                            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                            val out = socket.getOutputStream()
+                            greet.await()
+                            out.write("200 welcome\r\n".toByteArray())
+                            out.flush()
+                            while (true) {
+                                val cmd = reader.readLine() ?: break
+                                val reply = when {
+                                    cmd.startsWith("STAT") -> "223 0 <test@msg> article exists"
+                                    cmd == "QUIT" -> "205 bye"
+                                    else -> "500 unknown command"
+                                }
+                                out.write("$reply\r\n".toByteArray())
+                                out.flush()
+                                if (cmd == "QUIT") break
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
+                    closed.countDown()
+                }.apply { isDaemon = true }.start()
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    /** The pool's private lock, so a test can hold it the way a concurrent pool operation does. */
+    private fun NntpClientPool.poolMutex(): Mutex =
+        NntpClientPool::class.java.getDeclaredField("poolMutex").apply { isAccessible = true }.get(this) as Mutex
 
 
     // --- New tests for keepalive, retry, sleep/wake ---
@@ -765,6 +821,103 @@ class NntpClientPoolTest {
         } finally {
             pool.close()
         }
+    }
+
+    /**
+     * An acquire cancelled while another coroutine holds the pool's lock skipped its cleanup
+     * (a contended Mutex.lock throws at once in a cancelled coroutine) and left its waiter
+     * queued with a live deferred. The connection opened for it was then completed into that
+     * dead waiter and lost: never idle, never closed, still counted against maxConnections.
+     * Every seek cancels the downloads waiting in acquire, so scrubbing could leak every slot.
+     */
+    @Test
+    @Timeout(30, unit = TimeUnit.SECONDS)
+    fun `acquires cancelled while the pool is locked do not lose the connections opened for them`() =
+        runBlocking<Unit> { assertCancelledAcquiresKeepTheirConnections(timeOutFirst = false) }
+
+    /** As above, for a caller cancelled while its timed-out acquire waits for the lock to clean up. */
+    @Test
+    @Timeout(30, unit = TimeUnit.SECONDS)
+    fun `acquires cancelled while cleaning up after a timeout do not lose the connections opened for them`() =
+        runBlocking<Unit> { assertCancelledAcquiresKeepTheirConnections(timeOutFirst = true) }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private suspend fun assertCancelledAcquiresKeepTheirConnections(timeOutFirst: Boolean) = coroutineScope {
+        val slots = 4
+        val greet = CountDownLatch(1)
+        val closed = CountDownLatch(slots)
+        launchGatedServer(greet, closed)
+
+        val registry = SimpleMeterRegistry()
+        Metrics.addRegistry(registry)
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = slots,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        val poolName = "localhost:${serverSocket.localPort}"
+        fun gauge(name: String) = registry.find(name).tag("pool.name", poolName).gauge()?.value()
+
+        // The waiting callers run on a test dispatcher, so the test decides when their
+        // cleanup runs (while the pool's lock is held) and when their acquire times out.
+        val scheduler = TestCoroutineScheduler()
+        val callers = CoroutineScope(StandardTestDispatcher(scheduler) + SupervisorJob())
+        try {
+            pool.wake()
+            val waiting = List(slots) {
+                callers.launch { pool.withClient { fail("a cancelled acquire was served") } }
+            }
+            scheduler.runCurrent()
+            assertEquals(slots.toDouble(), gauge("nntp.pool.waiters"), "every caller should be waiting")
+
+            val lock = pool.poolMutex()
+            lock.lock()
+            if (timeOutFirst) {
+                scheduler.advanceTimeBy(NntpClientPool.ACQUIRE_TIMEOUT_MS)
+                scheduler.runCurrent()
+            }
+            waiting.forEach { it.cancel() }
+            scheduler.runCurrent()
+            lock.unlock()
+            scheduler.runCurrent()
+            assertTrue(waiting.all { it.isCompleted }, "the cancelled callers should have finished")
+
+            // The connections opened for the cancelled callers arrive now. Every slot must
+            // still be usable, promptly: hold all of them at once.
+            greet.countDown()
+            val acquired = AtomicInteger()
+            val allAcquired = CompletableDeferred<Unit>()
+            val served = withTimeoutOrNull(5_000) {
+                List(slots) {
+                    async(Dispatchers.IO) {
+                        pool.withClient { client ->
+                            if (acquired.incrementAndGet() == slots) allAcquired.complete(Unit)
+                            allAcquired.await()
+                            client.stat("<test@msg>")
+                        }
+                    }
+                }.awaitAll()
+            }
+            assertNotNull(
+                served,
+                "only ${acquired.get()} of $slots slots could be acquired: the connections for the " +
+                    "rest went to cancelled waiters"
+            )
+            assertEquals(slots.toDouble(), gauge("nntp.pool.size"), "pool size")
+            assertEquals(slots.toDouble(), gauge("nntp.pool.idle"), "idle connections")
+            assertEquals(0.0, gauge("nntp.pool.connecting"), "connections neither idle nor in use")
+            assertEquals(0.0, gauge("nntp.pool.waiters"), "queued waiters")
+        } finally {
+            greet.countDown()
+            callers.cancel()
+            pool.close()
+            Metrics.removeRegistry(registry)
+        }
+        assertTrue(closed.await(5, TimeUnit.SECONDS), "${closed.count} connection(s) were never closed")
     }
 
     @Test
