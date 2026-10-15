@@ -1107,6 +1107,70 @@ class NntpClientPoolTest {
         }
 
     /**
+     * pool.bodyYenc's reader is outside withClient, so a body whose connection drops fails there
+     * and isn't fetched again. Read whole inside withClient, the failure is withClient's, and its
+     * command retry fetches the body again on another connection: what a consumer that wants
+     * whole articles relies on.
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a body read inside withClient whose connection closes mid-article is fetched again`() =
+        runBlocking<Unit> {
+            val data = ByteArray(64 * 1024) { (it % 256).toByte() }
+            val article = buildYencArticle(data, "again.bin")
+            val accepted = AtomicInteger()
+            Thread {
+                while (true) {
+                    val client = try {
+                        serverSocket.accept()
+                    } catch (_: Exception) {
+                        break
+                    }
+                    val number = accepted.incrementAndGet()
+                    Thread {
+                        client.use { socket ->
+                            runCatching {
+                                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                                val out = socket.getOutputStream()
+                                out.write("200 welcome\r\n".toByteArray())
+                                out.flush()
+                                reader.readLine() // BODY
+                                out.write("222 body follows\r\n".toByteArray())
+                                // The first connection closes halfway through the article.
+                                out.write(article, 0, if (number == 1) article.size / 2 else article.size)
+                                out.flush()
+                                if (number > 1) answerCommands(reader, out)
+                            }
+                        }
+                    }.apply { isDaemon = true }.start()
+                }
+            }.apply { isDaemon = true }.start()
+            val pool = NntpClientPool(
+                host = "localhost",
+                port = serverSocket.localPort,
+                selectorManager = selectorManager,
+                maxConnections = 1,
+                scope = poolScope,
+                keepaliveIntervalMs = 0,
+                idleGracePeriodMs = 0
+            )
+            pool.wake()
+            try {
+                val read = pool.withClient { client ->
+                    var body: ByteArray? = null
+                    client.bodyYenc("<again@test>").collect { event ->
+                        if (event is YencEvent.Body) body = event.data.toByteArray()
+                    }
+                    body
+                }
+                assertContentEquals(data, read)
+                assertEquals(2, accepted.get(), "the body should have been fetched again on a new connection")
+            } finally {
+                pool.close()
+            }
+        }
+
+    /**
      * EOF before =yend ended the pump normally, so a connection closed halfway through an
      * article (by the server, or by TLS, which reports a FIN, a reset and a missing
      * close_notify alike as EOF) delivered a short segment as a whole one.

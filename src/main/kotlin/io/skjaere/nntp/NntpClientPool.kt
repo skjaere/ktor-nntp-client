@@ -936,12 +936,21 @@ class NntpClientPool(
 
     // --- Delegated commands ---
 
+    /**
+     * The yEnc body of [messageId] on a pooled connection acquired at [priority], streamed: the
+     * Body event's channel gets the article as it's decoded. A connection that drops mid-article
+     * fails only that channel's reader, outside [withClient], so it isn't fetched again: the
+     * reader may already have part of it. To have such a body fetched again on another
+     * connection (the command retry), read it whole inside [withClient] instead, with
+     * [NntpClient.bodyYenc].
+     */
     fun bodyYenc(messageId: String, priority: Int = 0): Flow<YencEvent> = channelFlow {
         withClient(priority) { client ->
             client.bodyYenc(messageId).collect { event -> send(event) }
         }
     }
 
+    /** [bodyYenc] by article number. */
     fun bodyYenc(number: Long, priority: Int = 0): Flow<YencEvent> = channelFlow {
         withClient(priority) { client ->
             client.bodyYenc(number).collect { event -> send(event) }
