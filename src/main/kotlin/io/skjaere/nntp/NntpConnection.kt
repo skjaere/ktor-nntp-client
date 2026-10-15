@@ -129,6 +129,9 @@ class NntpConnection private constructor(
         if (pendingStatusLines > 0) pendingStatusLines--
     }
 
+    /** Pipelined status lines the server still owes ([pendingStatusLines]). */
+    internal val pipelinedAnswersOwed: Int get() = pendingStatusLines
+
     internal fun markBodyInProgress() {
         bodyInProgress = true
         bodyResponseRead = false

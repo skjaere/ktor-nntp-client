@@ -20,7 +20,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
+import kotlin.system.measureTimeMillis
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * Whether a connection goes back to the pool after a command on it was cut short (cancelled,
@@ -239,6 +241,66 @@ class NntpPoolWireStateTest {
             }
         }
 
+    // --- Cancelled pipelined STAT batches ---
+
+    /**
+     * Reading off the answers a cancelled batch still owes holds the caller until the server
+     * has sent them all, up to the drain budget (NntpClientPool.DRAIN_TIMEOUT_MS): seconds on a
+     * server slow to answer. With many owed, the connection is discarded at once instead.
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a pipelined STAT batch cancelled with many answers owed returns at once and does not pool its connection`() =
+        runBlocking<Unit> {
+            val accepted = launchServer { connection, cmd, _, out ->
+                val id = cmd.removePrefix("STAT ")
+                // The first connection answers its first STAT at once and each later one slowly.
+                if (connection == 1 && id != "<a0@test>") Thread.sleep(SLOW_PIPELINE_ANSWER_MS)
+                out.send("223 0 $id article exists")
+            }
+            val pool = pool()
+            pool.wake()
+            try {
+                val ids = (0 until 64).map { "<a$it@test>" }
+                val elapsed = measureTimeMillis {
+                    assertNull(withTimeoutOrNull(CANCEL_AFTER_MS) { pool.statPipelined(ids) })
+                }
+                assertTrue(
+                    elapsed < CANCEL_AFTER_MS + 1_000,
+                    "the cancelled batch held its caller for ${elapsed}ms with about 60 answers owed"
+                )
+
+                val next = pool.stat("<later@test>")
+                assertEquals("<later@test>", assertIs<StatResult.Found>(next).messageId, "the next STAT got $next")
+                assertEquals(2, accepted.get(), "the STAT should have needed a new connection")
+            } finally {
+                pool.close()
+            }
+        }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a pipelined STAT batch cancelled with a few answers owed is read off and its connection reused`() =
+        runBlocking<Unit> {
+            val accepted = launchServer { _, cmd, _, out ->
+                val id = cmd.removePrefix("STAT ")
+                if (id == "<a1@test>") Thread.sleep(SLOW_ANSWER_MS)
+                out.send("223 0 $id article exists")
+            }
+            val pool = pool()
+            pool.wake()
+            try {
+                val ids = (0 until 3).map { "<a$it@test>" }
+                assertNull(withTimeoutOrNull(CANCEL_AFTER_MS) { pool.statPipelined(ids) })
+
+                val next = pool.stat("<later@test>")
+                assertEquals("<later@test>", assertIs<StatResult.Found>(next).messageId, "the next STAT got $next")
+                assertEquals(1, accepted.get(), "the answers owed should have been read off and the connection reused")
+            } finally {
+                pool.close()
+            }
+        }
+
     // --- Blocks that catch a command's failure or cancellation and carry on ---
     // These pools don't retry, so a connection pooled out of step fails the next command
     // instead of being replaced behind the caller's back.
@@ -417,5 +479,9 @@ class NntpPoolWireStateTest {
         // drain budget (NntpClientPool.DRAIN_TIMEOUT_MS), so a drain gets the answer.
         const val SLOW_ANSWER_MS = 600L
         const val CANCEL_AFTER_MS = 200L
+
+        // A server that answers each pipelined STAT this long after the one before: the 60 or
+        // so a cancelled batch of 64 still owes would take it seconds, beyond the drain budget.
+        const val SLOW_PIPELINE_ANSWER_MS = 100L
     }
 }

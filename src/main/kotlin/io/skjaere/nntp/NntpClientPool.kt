@@ -110,6 +110,14 @@ class NntpClientPool(
         // any reasonable client patience for "we already cancelled this anyway".
         const val DRAIN_TIMEOUT_MS = 3_000L
 
+        // A cancelled pipelined STAT batch (statPipelined) that still owes more answers than this
+        // is discarded instead of drained. The drain would hold the cancelled caller until the
+        // server had sent every one, up to DRAIN_TIMEOUT_MS: seconds on a provider slow to answer
+        // 430s, after an availability check stopped at its first missing article. A new
+        // connection costs less. A few are still read off, so a batch nearly done keeps its
+        // connection.
+        const val MAX_DRAINED_STAT_ANSWERS = 4
+
         // Upper bound on a single TCP+TLS+welcome+AUTHINFO handshake. NntpConnection.connect
         // does `readChannel.readLine()` to consume the welcome banner, and NntpConnection's
         // performAuth does two more `readResponse()` -> readLine() calls for AUTHINFO USER
@@ -798,8 +806,16 @@ class NntpClientPool(
                     // simpler design: the caller waits for the drain, but we don't have
                     // to reason about a race between the drain and the next acquire of
                     // the same connection. The benign post-emit case (blockCompleted=true)
-                    // skips the drain entirely.
-                    if (!blockCompleted) {
+                    // skips the drain entirely. A pipelined STAT batch that still owes many
+                    // answers isn't waited for: it's discarded (MAX_DRAINED_STAT_ANSWERS).
+                    val owed = client?.connection?.pipelinedAnswersOwed ?: 0
+                    if (!blockCompleted && owed > MAX_DRAINED_STAT_ANSWERS) {
+                        logger.debug(
+                            "conn={} cancelled with {} pipelined answers owed; will discard in finally",
+                            client?.connection?.id, owed
+                        )
+                        dead = true
+                    } else if (!blockCompleted) {
                         client?.let { c ->
                             logger.debug(
                                 "conn={} cancellation mid-block, draining inline",
