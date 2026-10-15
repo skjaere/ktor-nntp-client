@@ -3,6 +3,7 @@ package io.skjaere.nntp
 import io.ktor.network.selector.SelectorManager
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -12,6 +13,8 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestCoroutineScheduler
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -22,15 +25,20 @@ import org.junit.jupiter.params.provider.ValueSource
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.ServerSocket
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.nio.channels.UnresolvedAddressException
 import kotlin.test.assertEquals
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
  * How the pool's connects fail. A failure a retry can't change (a rejected login, a host
  * name that doesn't resolve) is tried once; others are retried with a bounded back-off.
+ * When the pool is left with no connection, open or on its way, the acquires waiting for
+ * one fail at once with the connect's cause instead of timing out.
  */
 class NntpPoolConnectFailureTest {
 
@@ -123,6 +131,20 @@ class NntpPoolConnectFailureTest {
     private fun connects(outcome: String, host: String = "localhost", port: Int = serverSocket.localPort): Int =
         registry.find("nntp.pool.connect.attempts").tag("pool.name", "$host:$port").tag("outcome", outcome)
             .counter()?.count()?.toInt() ?: 0
+
+    private fun gauge(name: String, host: String = "localhost", port: Int = serverSocket.localPort): Double? =
+        registry.find(name).tag("pool.name", "$host:$port").gauge()?.value()
+
+    private fun acquireFailures(reason: String, host: String = "localhost", port: Int = serverSocket.localPort): Int =
+        registry.find("nntp.pool.acquire.failures").tag("pool.name", "$host:$port").tag("reason", reason)
+            .counter()?.count()?.toInt() ?: 0
+
+    /** Each caller's failure, or null if it succeeded; fails the test if any is still waiting after [timeoutMs]. */
+    private suspend fun failuresOf(calls: List<kotlinx.coroutines.Deferred<*>>, timeoutMs: Long): List<Throwable?> {
+        val done = withTimeoutOrNull(timeoutMs) { calls.forEach { it.join() } }
+        assertNotNull(done, "${calls.count { !it.isCompleted }} of ${calls.size} acquires still waiting after ${timeoutMs}ms")
+        return calls.map { it.getCompletionExceptionOrNull() }
+    }
 
     private suspend fun awaitUntil(timeoutMs: Long, message: () -> String, condition: () -> Boolean) {
         val met = withTimeoutOrNull(timeoutMs) {
@@ -252,4 +274,116 @@ class NntpPoolConnectFailureTest {
                 pool.close()
             }
         }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `acquires waiting for connects whose login is rejected fail at once with the rejection`() =
+        runBlocking<Unit> {
+            val logins = launchLoginServer { "481 Authentication failed" }
+            val pool = pool(maxConnections = 2)
+            try {
+                val calls = List(5) { callers.async { pool.stat("<test@msg>") } }
+                failuresOf(calls, 5_000).forEach { failure ->
+                    assertIs<NntpAuthenticationException>(failure, "an acquire's failure")
+                    assertEquals(481, failure.response?.code)
+                }
+                assertEquals(2, logins.get(), "logins")
+                assertEquals(5, acquireFailures("connect_failed"), "acquire failures counted")
+                assertEquals(0.0, gauge("nntp.pool.waiters"), "queued waiters")
+                assertEquals(0.0, gauge("nntp.pool.size"), "pool size")
+                assertEquals(0.0, gauge("nntp.pool.connecting"), "connections neither idle nor in use")
+            } finally {
+                pool.close()
+            }
+        }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `acquires waiting for a host that does not resolve fail at once with the cause`() = runBlocking<Unit> {
+        val host = "nntp-pool-test.invalid"
+        val pool = pool(host = host, port = 119, maxConnections = 2, username = null, password = null)
+        try {
+            val calls = List(3) { callers.async { pool.stat("<test@msg>") } }
+            failuresOf(calls, 5_000).forEach { failure ->
+                assertNotNull(failure, "an acquire succeeded")
+                assertTrue(
+                    generateSequence(failure) { it.cause }.any { it is UnresolvedAddressException },
+                    "the failure doesn't carry the unresolved address: $failure"
+                )
+            }
+            assertEquals(0.0, gauge("nntp.pool.waiters", host, 119), "queued waiters")
+            assertEquals(0.0, gauge("nntp.pool.size", host, 119), "pool size")
+        } finally {
+            pool.close()
+        }
+    }
+
+    /** A rejected connect doesn't fail an acquire that the pool's open connection can still serve. */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `an acquire whose connect is rejected is served by the connection the pool has open`() =
+        runBlocking<Unit> {
+            launchLoginServer { if (it == 1) "281 welcome" else "481 Too many connections" }
+            val pool = pool(maxConnections = 2)
+            try {
+                val held = CompletableDeferred<Unit>()
+                val release = CompletableDeferred<Unit>()
+                val holder = callers.async {
+                    pool.withClient {
+                        held.complete(Unit)
+                        release.await()
+                    }
+                }
+                held.await()
+                val waiting = callers.async { pool.stat("<test@msg>") }
+                awaitUntil(5_000, { "the second connect was not rejected" }) { connects("failure") == 1 }
+                delay(200)
+                assertTrue(waiting.isActive, "the acquire failed although a connection is open: ${
+                    if (waiting.isCompleted) waiting.getCompletionExceptionOrNull() else null
+                }")
+                release.complete(Unit)
+                holder.await()
+                val result = withTimeoutOrNull(5_000) { waiting.await() }
+                assertIs<StatResult.Found>(result, "the waiting acquire's STAT")
+            } finally {
+                pool.close()
+            }
+        }
+
+    /**
+     * An acquire cancelled just as its connect fails ends cancelled: its clean-up (withdraw)
+     * must not take the failed deferred for a delivered connection and throw the connect's
+     * failure in place of the cancellation.
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `an acquire cancelled as its connect fails ends cancelled`() = runBlocking<Unit> {
+        val answerLogin = CountDownLatch(1)
+        launchLoginServer {
+            answerLogin.await()
+            "481 Authentication failed"
+        }
+        val pool = pool()
+        // The caller runs on a test dispatcher, so its cancellation is handled only when the
+        // test says: after the connect has failed.
+        val scheduler = TestCoroutineScheduler()
+        val testCallers = CoroutineScope(StandardTestDispatcher(scheduler) + SupervisorJob())
+        try {
+            val call = testCallers.async { pool.stat("<test@msg>") }
+            scheduler.runCurrent()
+            assertEquals(1.0, gauge("nntp.pool.waiters"), "the caller should be waiting")
+            call.cancel()
+            answerLogin.countDown()
+            awaitUntil(5_000, { "the rejected connect never failed its waiter" }) {
+                gauge("nntp.pool.size") == 0.0 && gauge("nntp.pool.waiters") == 0.0
+            }
+            scheduler.runCurrent()
+            assertTrue(call.isCompleted, "the cancelled caller should have finished")
+            assertIs<CancellationException>(call.getCompletionExceptionOrNull(), "how the cancelled acquire ended")
+        } finally {
+            answerLogin.countDown()
+            testCallers.cancel()
+            pool.close()
+        }
+    }
 }

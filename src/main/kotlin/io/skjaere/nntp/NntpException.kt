@@ -18,8 +18,9 @@ class ArticleNotFoundException(
 
 class NntpAuthenticationException(
     message: String,
-    response: NntpResponse? = null
-) : NntpException(message, response)
+    response: NntpResponse? = null,
+    cause: Throwable? = null
+) : NntpException(message, response, cause)
 
 class NntpConnectionException(
     message: String,

@@ -289,13 +289,43 @@ class NntpClientPool(
         }
     }
 
-    /** Frees the slot of a connect that failed for good with [cause]. */
+    /**
+     * Frees the slot of a connect that failed for good with [cause]. If that leaves the pool
+     * with no connection, open or on its way, nothing can serve the acquires still waiting:
+     * they fail now with [cause] instead of timing out. While the pool has another connection
+     * they wait for it.
+     */
     private suspend fun connectFailed(cause: Exception) {
         poolMutex.withLock {
             currentSize--
             if (cause.isPermanentConnectFailure()) {
                 connectRejectedUntilMs = System.currentTimeMillis() + CONNECT_REJECTED_BACKOFF_MS
             }
+            if (currentSize > 0) return@withLock
+            // We own the dequeue, so we also own the per-priority decrement. A waiter being
+            // withdrawn has its deferred cancelled already: completing it fails, and withdraw
+            // finds it gone from the queue.
+            while (true) {
+                val waiter = waiters.poll() ?: break
+                decWaiter(waiter.priority)
+                if (waiter.deferred.completeExceptionally(failureFor(cause))) {
+                    recordAcquireFailure(waiter.priority, "connect_failed")
+                }
+            }
+        }
+    }
+
+    /**
+     * What an acquire whose connect failed with [cause] throws: a rejected login stays an
+     * [NntpAuthenticationException], anything else is an [NntpConnectionException]. One for
+     * each waiter, as they throw it from different coroutines.
+     */
+    private fun failureFor(cause: Exception): Exception {
+        val message = cause.message ?: cause.toString()
+        return when (cause) {
+            is NntpAuthenticationException -> NntpAuthenticationException(message, cause.response, cause)
+            is NntpConnectionException -> NntpConnectionException(message, cause)
+            else -> NntpConnectionException("Could not connect to $host:$port: $message", cause)
         }
     }
 
@@ -753,7 +783,8 @@ class NntpClientPool(
                     }
                 }
             }.retry(commandRetries.toLong()) { e ->
-                val retryable = e is NntpConnectionException || e is IOException
+                // A connect that failed for good (acquire passes its cause on) fails the same again.
+                val retryable = (e is NntpConnectionException || e is IOException) && !e.isPermanentConnectFailure()
                 if (retryable) {
                     logger.debug("Command failed ({}), retrying: {}", e::class.simpleName, e.message)
                 }
