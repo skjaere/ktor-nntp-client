@@ -120,7 +120,7 @@ internal object YencDecoder {
                 val n = connection.rawReadChannel.readAvailable(readBuf, 0, readLimit)
                 if (n == -1) {
                     eof = true
-                    if (srcBuf.position() == 0) break
+                    if (srcBuf.position() == 0) throw closedMidArticle()
                 } else if (n > 0) {
                     srcBuf.put(readBuf, 0, n)
                 } else {
@@ -175,15 +175,22 @@ internal object YencDecoder {
                     // because a single article had a bad CRC. (The pool's catch-all in
                     // withClient will still discard if drain itself fails — it only
                     // gives up the discard if everything below this line succeeds.)
-                    drainUntilArticleEnd(connection, remaining)
-                    // Wire is now line-protocol clean — flag the connection reusable.
-                    // Done HERE rather than in fetchBodyYenc because the decoder body
-                    // returns as soon as it has sent the Body event, while the writer
-                    // (this coroutine) is still pumping body bytes off the wire. Flipping
-                    // the flag in fetchBodyYenc therefore cleared it before the body
-                    // was actually drained, and a cancellation in that window left
-                    // yenc bytes pending for the next caller.
-                    connection.markBodyConsumed()
+                    if (drainUntilArticleEnd(connection, remaining)) {
+                        // Wire is now line-protocol clean — flag the connection reusable.
+                        // Done HERE rather than in fetchBodyYenc because the decoder body
+                        // returns as soon as it has sent the Body event, while the writer
+                        // (this coroutine) is still pumping body bytes off the wire. Flipping
+                        // the flag in fetchBodyYenc therefore cleared it before the body
+                        // was actually drained, and a cancellation in that window left
+                        // yenc bytes pending for the next caller.
+                        connection.markBodyConsumed()
+                    } else {
+                        // The connection closed after =yend but before the terminator: the
+                        // body is whole, so deliver it, but the pool must discard the connection.
+                        connection.markBodyFailed(
+                            NntpConnectionException("Connection closed before the article terminator")
+                        )
+                    }
 
                     crcMismatch?.let { (expected, actual) ->
                         throw YencCrcMismatchException(
@@ -202,32 +209,40 @@ internal object YencDecoder {
                 }
 
                 RapidYencDecoderEnd.NONE -> {
+                    // Neither =yend nor the terminator, and nothing more will come: ending
+                    // normally would hand the reader a short body as if it were whole.
+                    if (eof) throw closedMidArticle()
                     // Move any unconsumed bytes to the front so the next iteration
                     // can append a fresh socket read after them.
                     srcBuf.compact()
-                    if (eof && srcBuf.position() == 0) break
                 }
             }
         }
     }
 
+    // EOF mid-article: the server closed the connection, or under TLS anything that ended
+    // it (Ktor reports a FIN, a reset and a missing close_notify alike as EOF).
+    private fun closedMidArticle() =
+        NntpConnectionException("Connection closed mid-article, before =yend or the article terminator")
+
+    /** Reads up to the article terminator; false if the connection closed before it. */
     private suspend fun drainUntilArticleEnd(
         connection: NntpConnection,
         alreadyRead: ByteArray
-    ) {
+    ): Boolean {
         // Check if the article terminator is already in what we've read
         val str = String(alreadyRead, Charsets.ISO_8859_1)
         if (str.contains("\r\n.\r\n") || str.endsWith("\r\n.\r\n")) {
-            return
+            return true
         }
         // Continue reading until we find the article end marker
         val buffer = ByteArray(BUFFER_SIZE)
         val accumulator = StringBuilder(str)
         while (true) {
             val bytesRead = connection.rawReadChannel.readAvailable(buffer)
-            if (bytesRead == -1) break
+            if (bytesRead == -1) return false
             accumulator.append(String(buffer, 0, bytesRead, Charsets.ISO_8859_1))
-            if (accumulator.contains("\r\n.\r\n")) break
+            if (accumulator.contains("\r\n.\r\n")) return true
         }
     }
 }

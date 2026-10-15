@@ -39,6 +39,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -1067,6 +1068,108 @@ class NntpClientPoolTest {
                 assertEquals(2, accepted.get(), "the STAT should have needed a new connection")
             } finally {
                 pool.close()
+            }
+        }
+
+    /**
+     * EOF before =yend ended the pump normally, so a connection closed halfway through an
+     * article (by the server, or by TLS, which reports a FIN, a reset and a missing
+     * close_notify alike as EOF) delivered a short segment as a whole one.
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a body cut short by the connection closing fails instead of ending early`() = runBlocking<Unit> {
+        val data = ByteArray(64 * 1024) { (it % 256).toByte() }
+        launchFirstConnectionServer { _, reader, out ->
+            reader.readLine() // BODY
+            val article = buildYencArticle(data, "short.bin")
+            out.write("222 body follows\r\n".toByteArray())
+            out.write(article, 0, article.size / 2)
+            out.flush()
+            // Returning closes the connection (a FIN), mid-article.
+        }
+        val registry = SimpleMeterRegistry()
+        Metrics.addRegistry(registry)
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        val poolName = "localhost:${serverSocket.localPort}"
+        fun gauge(name: String) = registry.find(name).tag("pool.name", poolName).gauge()?.value()
+        pool.wake()
+        try {
+            var read: ByteArray? = null
+            var failure: IOException? = null
+            pool.bodyYenc("<short@test>").collect { event ->
+                if (event is YencEvent.Body) {
+                    try {
+                        read = event.data.toByteArray()
+                    } catch (e: IOException) {
+                        failure = e
+                    }
+                }
+            }
+            assertNotNull(failure, "the body ended without an error after ${read?.size} of ${data.size} bytes")
+            assertTrue(
+                generateSequence<Throwable>(failure) { it.cause }.any { it is NntpConnectionException },
+                "the reader should see the connection failure, got $failure"
+            )
+            assertEquals(0.0, gauge("nntp.pool.idle"), "the closed connection is idle in the pool")
+            assertEquals(0.0, gauge("nntp.pool.size"), "pool size")
+        } finally {
+            pool.close()
+            Metrics.removeRegistry(registry)
+        }
+    }
+
+    /**
+     * A connection closed after =yend but before the article terminator still delivers the
+     * whole body (its CRC checked), but must not go back to the pool: the trailer drain used
+     * to take EOF for the terminator and mark the wire clean.
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a body whose connection closes before the article terminator is delivered but not pooled`() =
+        runBlocking<Unit> {
+            val data = ByteArray(64 * 1024) { (it % 256).toByte() }
+            launchFirstConnectionServer { _, reader, out ->
+                reader.readLine() // BODY
+                val article = buildYencArticle(data, "trailer.bin")
+                out.write("222 body follows\r\n".toByteArray())
+                out.write(article, 0, article.size - ".\r\n".length)
+                out.flush()
+                // Returning closes the connection before the terminator.
+            }
+            val registry = SimpleMeterRegistry()
+            Metrics.addRegistry(registry)
+            val pool = NntpClientPool(
+                host = "localhost",
+                port = serverSocket.localPort,
+                selectorManager = selectorManager,
+                maxConnections = 1,
+                scope = poolScope,
+                keepaliveIntervalMs = 0,
+                idleGracePeriodMs = 0
+            )
+            val poolName = "localhost:${serverSocket.localPort}"
+            fun gauge(name: String) = registry.find(name).tag("pool.name", poolName).gauge()?.value()
+            pool.wake()
+            try {
+                var read: ByteArray? = null
+                pool.bodyYenc("<trailer@test>").collect { event ->
+                    if (event is YencEvent.Body) read = event.data.toByteArray()
+                }
+                assertContentEquals(data, read)
+                assertEquals(0.0, gauge("nntp.pool.idle"), "the closed connection is idle in the pool")
+                assertEquals(0.0, gauge("nntp.pool.size"), "pool size")
+            } finally {
+                pool.close()
+                Metrics.removeRegistry(registry)
             }
         }
 
