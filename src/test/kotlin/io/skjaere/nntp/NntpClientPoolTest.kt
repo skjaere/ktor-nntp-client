@@ -547,6 +547,35 @@ class NntpClientPoolTest {
         }
     }
 
+    /** Flow.retry rejects 0 retries, so a pool built with none failed every command. */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `zero command retries runs each command once`() = runBlocking<Unit> {
+        // The server drops the connection on the first STAT.
+        val accepted = launchCommandServer(failStatOnce = AtomicBoolean(true))
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 1,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0,
+            commandRetries = 0
+        )
+        pool.wake()
+
+        try {
+            assertFailsWith<NntpConnectionException> {
+                pool.stat("<test@msg>")
+            }
+            assertTrue(pool.stat("<test@msg>") is StatResult.Found)
+            assertEquals(2, accepted.size, "each STAT should have run once, on its own connection")
+        } finally {
+            pool.close()
+        }
+    }
+
     @Test
     @Timeout(10, unit = TimeUnit.SECONDS)
     fun `non-connection exceptions are not retried`() = runBlocking<Unit> {

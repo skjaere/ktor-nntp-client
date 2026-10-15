@@ -32,6 +32,7 @@ import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.retry
+import kotlinx.coroutines.flow.retryWhen
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -785,9 +786,11 @@ class NntpClientPool(
                         else returnToPool(it)
                     }
                 }
-            }.retry(commandRetries.toLong()) { e ->
-                // A connect that failed for good (acquire passes its cause on) fails the same again.
-                val retryable = (e is NntpConnectionException || e is IOException) && !e.isPermanentConnectFailure()
+            }.retryWhen { e, attempt ->
+                // retryWhen rather than retry, which rejects commandRetries = 0. A connect that
+                // failed for good (acquire passes its cause on) fails the same again.
+                val retryable = attempt < commandRetries &&
+                    (e is NntpConnectionException || e is IOException) && !e.isPermanentConnectFailure()
                 if (retryable) {
                     logger.debug("Command failed ({}), retrying: {}", e::class.simpleName, e.message)
                 }
