@@ -485,10 +485,11 @@ class NntpClientPoolTest {
 
     @Test
     @Timeout(15, unit = TimeUnit.SECONDS)
-    fun `exhausted retries propagates exception`() = runBlocking {
+    fun `exhausted retries propagates exception`() = runBlocking<Unit> {
         // Server that always kills the connection on STAT
         serverSocket.close()
         serverSocket = ServerSocket(0)
+        val statCommands = AtomicInteger(0)
         Thread {
             var accepted = 0
             while (accepted < 10) {
@@ -504,6 +505,7 @@ class NntpClientPoolTest {
                                 val cmd = reader.readLine() ?: break
                                 when {
                                     cmd.startsWith("STAT") -> {
+                                        statCommands.incrementAndGet()
                                         client.close()
                                         break
                                     }
@@ -539,6 +541,7 @@ class NntpClientPoolTest {
             assertFailsWith<NntpConnectionException> {
                 pool.stat("<test@msg>")
             }
+            assertEquals(3, statCommands.get())
         } finally {
             pool.close()
         }
@@ -546,8 +549,9 @@ class NntpClientPoolTest {
 
     @Test
     @Timeout(10, unit = TimeUnit.SECONDS)
-    fun `non-connection exceptions are not retried`() = runBlocking {
-        // Server that responds 430 to STAT (article not found)
+    fun `non-connection exceptions are not retried`() = runBlocking<Unit> {
+        // Server that responds 430 to ARTICLE (article not found)
+        val articleCommands = AtomicInteger(0)
         Thread {
             repeat(1) {
                 try {
@@ -560,7 +564,8 @@ class NntpClientPoolTest {
                             out.flush()
                             while (!client.isClosed) {
                                 val cmd = reader.readLine() ?: break
-                                if (cmd.startsWith("STAT")) {
+                                if (cmd.startsWith("ARTICLE")) {
+                                    articleCommands.incrementAndGet()
                                     out.write("430 no such article\r\n".toByteArray())
                                     out.flush()
                                 } else {
@@ -594,6 +599,7 @@ class NntpClientPoolTest {
             assertFailsWith<ArticleNotFoundException> {
                 pool.article("<nonexistent@msg>")
             }
+            assertEquals(1, articleCommands.get())
         } finally {
             pool.close()
         }
