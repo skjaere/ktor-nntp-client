@@ -44,6 +44,7 @@ import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.io.IOException
 import java.nio.channels.UnresolvedAddressException
+import java.security.cert.CertificateException
 import java.util.PriorityQueue
 
 class NntpClientPool(
@@ -60,7 +61,9 @@ class NntpClientPool(
     private val idleEvictionTimeoutMs: Long = DEFAULT_IDLE_EVICTION_TIMEOUT_MS,
     private val commandRetries: Int = DEFAULT_COMMAND_RETRIES,
     // How long a read waits for the server's next bytes; see NntpConnection.connect.
-    private val readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS
+    private val readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS,
+    // With useTls, check the certificate names host and send it as SNI; see NntpConnection.connect.
+    private val verifyHostname: Boolean = true
 ) : Closeable {
 
     companion object {
@@ -355,9 +358,9 @@ class NntpClientPool(
             // a timed-out attempt the same way.
             val client = withTimeoutOrNull(CONNECT_TIMEOUT_MS) {
                 if (username != null && password != null)
-                    NntpClient.connect(host, port, selectorManager, useTls, username, password, readTimeoutMs)
+                    NntpClient.connect(host, port, selectorManager, useTls, username, password, readTimeoutMs, verifyHostname)
                 else
-                    NntpClient.connect(host, port, selectorManager, useTls, readTimeoutMs)
+                    NntpClient.connect(host, port, selectorManager, useTls, readTimeoutMs, verifyHostname)
             } ?: throw NntpConnectionException(
                 "Connect to $host:$port timed out after ${CONNECT_TIMEOUT_MS}ms"
             )
@@ -941,9 +944,10 @@ class NntpClientPool(
 private val REJECTED_LOGIN_CODES = setOf(481, 482, 502)
 
 /**
- * A connect failure a retry can't change: the server rejected the login, or the host name
- * doesn't resolve. Anything else (refused, reset, timed out, a 400 greeting) may pass.
+ * A connect failure a retry can't change: the server rejected the login, the host name doesn't
+ * resolve, or TLS refused the server's certificate. Anything else (refused, reset, timed out, a
+ * 400 greeting) may pass.
  */
 private fun Throwable.isPermanentConnectFailure(): Boolean =
     (this is NntpAuthenticationException && response?.code in REJECTED_LOGIN_CODES) ||
-        generateSequence(this) { it.cause }.any { it is UnresolvedAddressException }
+        generateSequence(this) { it.cause }.any { it is UnresolvedAddressException || it is CertificateException }

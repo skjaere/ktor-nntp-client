@@ -18,19 +18,20 @@ class NntpClient(
         private val NOT_A_MESSAGE_ID = NntpResponse(430, "Not a message-id, not sent")
         private val NOT_A_MESSAGE_ID_STAT = StatResult.NotFound(NOT_A_MESSAGE_ID.code, NOT_A_MESSAGE_ID.message)
 
-        /** [readTimeoutMs]: see [NntpConnection.connect]. */
+        /** [readTimeoutMs], [verifyHostname]: see [NntpConnection.connect]. */
         suspend fun connect(
             host: String,
             port: Int,
             selectorManager: SelectorManager,
             useTls: Boolean = false,
-            readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS
+            readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS,
+            verifyHostname: Boolean = true
         ): NntpClient {
-            val connection = NntpConnection.connect(host, port, selectorManager, useTls, readTimeoutMs)
+            val connection = NntpConnection.connect(host, port, selectorManager, useTls, readTimeoutMs, verifyHostname)
             return NntpClient(connection)
         }
 
-        /** [readTimeoutMs]: see [NntpConnection.connect]. */
+        /** [readTimeoutMs], [verifyHostname]: see [NntpConnection.connect]. */
         suspend fun connect(
             host: String,
             port: Int,
@@ -38,9 +39,10 @@ class NntpClient(
             useTls: Boolean = false,
             username: String,
             password: String,
-            readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS
+            readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS,
+            verifyHostname: Boolean = true
         ): NntpClient {
-            val client = connect(host, port, selectorManager, useTls, readTimeoutMs)
+            val client = connect(host, port, selectorManager, useTls, readTimeoutMs, verifyHostname)
             // The TCP+TLS+welcome handshake just succeeded; if AUTH fails (e.g. server
             // returns 502 "Too many connections" on AUTHINFO PASS) we own a live socket
             // that nothing else holds a reference to. Without this catch the JVM hangs

@@ -23,6 +23,7 @@ import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.io.IOException
 import java.nio.channels.UnresolvedAddressException
+import java.security.GeneralSecurityException
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -208,6 +209,10 @@ class NntpConnection private constructor(
          *   TCP connection after a network change. An idle timeout, not a deadline: a long
          *   BODY or pipelined STAT batch that keeps receiving bytes never times out, and an
          *   idle connection with no read pending is never affected. 0 or less disables it.
+         * @param verifyHostname with [useTls], check that the server's certificate names [host]
+         *   (a host name, or an IP address) and send a host name as the server name (SNI). Off,
+         *   the certificate only has to be trusted, whatever host it names, and no server name
+         *   is sent: for a server reached by an address its certificate doesn't list.
          * @throws NntpConnectionException if the connection can't be opened: the host name
          *   doesn't resolve, the connect is refused or fails, or the TLS handshake fails.
          */
@@ -216,13 +221,17 @@ class NntpConnection private constructor(
             port: Int,
             selectorManager: SelectorManager,
             useTls: Boolean = false,
-            readTimeoutMs: Long = DEFAULT_READ_TIMEOUT_MS
+            readTimeoutMs: Long = DEFAULT_READ_TIMEOUT_MS,
+            verifyHostname: Boolean = true
         ): NntpConnection {
             val socket = try {
-                openSocket(host, port, selectorManager, useTls)
+                openSocket(host, port, selectorManager, useTls, verifyHostname)
             } catch (e: UnresolvedAddressException) {
                 throw NntpConnectionException("Unknown host $host", e)
             } catch (e: IOException) {
+                throw NntpConnectionException("Could not connect to $host:$port: ${e.message}", e)
+            } catch (e: GeneralSecurityException) {
+                // Ktor's TLS handshake lets the trust manager's CertificateException through.
                 throw NntpConnectionException("Could not connect to $host:$port: ${e.message}", e)
             }
             // Anything that throws between openSocket and a successful return must close
@@ -263,7 +272,8 @@ class NntpConnection private constructor(
             host: String,
             port: Int,
             selectorManager: SelectorManager,
-            useTls: Boolean
+            useTls: Boolean,
+            verifyHostname: Boolean
         ): Socket {
             log.debug("openSocket called with host='{}', port={}, useTls={}", host, port, useTls)
             val rawSocket = aSocket(selectorManager).tcp().connect(host, port)
@@ -271,7 +281,13 @@ class NntpConnection private constructor(
                 // TLS handshake can fail (cert mismatch, server abort, network); the raw
                 // TCP socket below is already open and would otherwise leak.
                 try {
-                    rawSocket.tls(coroutineContext = tlsContext)
+                    rawSocket.tls(coroutineContext = tlsContext) {
+                        if (verifyHostname) {
+                            // SNI names a host without a trailing dot; an IP address isn't one (RFC 6066 §3).
+                            if (ipAddress(host) == null) serverName = host.trimEnd('.')
+                            trustManager = HostnameVerifyingTrustManager(HostnameVerifyingTrustManager.platformDefault(), host)
+                        }
+                    }
                 } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
                     runCatching { rawSocket.close() }
                     throw e

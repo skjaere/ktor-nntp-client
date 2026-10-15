@@ -7,6 +7,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -40,6 +41,7 @@ import kotlin.test.assertTrue
  * When the pool is left with no connection, open or on its way, the acquires waiting for
  * one fail at once with the connect's cause instead of timing out.
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class NntpPoolConnectFailureTest {
 
     private lateinit var serverSocket: ServerSocket
