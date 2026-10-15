@@ -155,9 +155,27 @@ class NntpConnection private constructor(
         log.debug("conn={} markBodyConsumed", id)
     }
 
-    // Why the body pump stopped before the article's end, if it did (see [markBodyFailed]).
+    // Why the wire is at a point nobody knows, if it is: a read or write failed (the socket
+    // dead, a read timed out, a line that isn't a status line read as one), or the body pump
+    // stopped before the article's end (see [markBodyFailed]). Never cleared: the connection
+    // can't be reused or drained.
     @Volatile
-    private var bodyFailure: Throwable? = null
+    private var failure: Throwable? = null
+
+    /** Records [cause] as this connection's [failure], unless it has one, and returns it to throw. */
+    private fun failed(cause: Throwable): Throwable {
+        if (failure == null) failure = cause
+        return cause
+    }
+
+    /** Runs [block], recording anything it throws but a cancellation as the connection's [failure]. */
+    private inline fun <T> failing(block: () -> T): T = try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
+        throw failed(e)
+    }
 
     /**
      * Records that the body pump failed with [cause]. Before the article's end, that leaves
@@ -167,17 +185,19 @@ class NntpConnection private constructor(
      */
     internal fun markBodyFailed(cause: Throwable) {
         if (!bodyInProgress) return
-        bodyFailure = cause
+        failed(cause)
         log.debug("conn={} markBodyFailed: {}", id, cause.toString())
     }
 
     /**
-     * False while a body is unfinished: its pump failed ([markBodyFailed]) or was stopped,
-     * or never ran. Ktor 3's writer keeps a pump failure in the Body channel and completes
-     * normally, so a block can return with the connection in this state.
+     * False while the wire is out of step: a body unfinished (its pump failed or was stopped,
+     * or never ran), a read or write failed ([failure]), pipelined STAT answers still owed, or
+     * a command cut short ([inFlight]). A block can return with the connection in this state:
+     * Ktor 3's writer keeps a pump failure in the Body channel and completes normally, and a
+     * block may catch a command's failure or cancellation itself and carry on.
      */
     internal val isReusable: Boolean
-        get() = !bodyInProgress && bodyFailure == null
+        get() = !bodyInProgress && failure == null && pendingStatusLines == 0 && inFlight == InFlight.NONE
 
     companion object {
         private val log = LoggerFactory.getLogger(NntpConnection::class.java)
@@ -443,9 +463,9 @@ class NntpConnection private constructor(
         .tag("pool.name", "$host:$port")
         .register(registry)
 
-    /** [withReadTimeout] with this connection's read timeout. */
+    /** [withReadTimeout] with this connection's read timeout. A read that fails is its [failure]. */
     private suspend fun <T> timedRead(read: suspend () -> T): T =
-        withReadTimeout(readChannel, readTimeoutMs, host, port, read)
+        failing { withReadTimeout(readChannel, readTimeoutMs, host, port, read) }
 
     /** Reads what's available, up to [length] bytes, or -1 at EOF; bounded by the read timeout. */
     internal suspend fun readAvailable(dst: ByteArray, offset: Int = 0, length: Int = dst.size - offset): Int =
@@ -453,15 +473,16 @@ class NntpConnection private constructor(
 
     suspend fun readResponse(): NntpResponse {
         val line = timedRead { readChannel.readLine() }
-            ?: throw NntpConnectionException("Connection closed unexpectedly")
-        return parseResponseLine(line)
+            ?: throw failed(NntpConnectionException("Connection closed unexpectedly"))
+        // Not a status line: whatever it belongs to, the wire is out of step.
+        return failing { parseResponseLine(line) }
     }
 
     suspend fun readMultiLineData(): List<String> {
         val lines = mutableListOf<String>()
         while (true) {
             val line = timedRead { readChannel.readLine() }
-                ?: throw NntpConnectionException("Connection closed during multi-line read")
+                ?: throw failed(NntpConnectionException("Connection closed during multi-line read"))
             if (line == ".") break
             // Dot-unstuffing: lines starting with ".." have leading dot removed
             if (line.startsWith("..")) {
@@ -475,7 +496,7 @@ class NntpConnection private constructor(
 
     suspend fun readLine(): String {
         return timedRead { readChannel.readLine() }
-            ?: throw NntpConnectionException("Connection closed unexpectedly")
+            ?: throw failed(NntpConnectionException("Connection closed unexpectedly"))
     }
 
     /**
@@ -501,12 +522,12 @@ class NntpConnection private constructor(
     val rawReadChannel: ByteReadChannel get() = readChannel
 
     suspend fun writeLine(line: String) {
-        writeChannel.writeStringUtf8("$line\r\n")
+        failing { writeChannel.writeStringUtf8("$line\r\n") }
     }
 
     /** Writes several command lines in one write (one flush), for pipelining. */
     suspend fun writeLines(lines: List<String>) {
-        writeChannel.writeStringUtf8(lines.joinToString("") { "$it\r\n" })
+        failing { writeChannel.writeStringUtf8(lines.joinToString("") { "$it\r\n" }) }
     }
 
     /**
@@ -528,12 +549,13 @@ class NntpConnection private constructor(
      * POST cut short can't be drained: see [InFlight.UNRECOVERABLE].
      *
      * @return true if the wire is now clean and the connection is reusable, false if
-     *   the server closed mid-stream (EOF) without giving us a clean state, the body
-     *   pump had already failed ([markBodyFailed]), or what's owed can't be drained.
+     *   the server closed mid-stream (EOF) without giving us a clean state, a read or
+     *   write or the body pump had already failed ([failure]), or what's owed can't be
+     *   drained.
      */
     suspend fun drainUntilArticleEnd(): Boolean {
-        bodyFailure?.let {
-            log.debug("conn={} drain: body pump failed ({}), wire position unknown", id, it.toString())
+        failure?.let {
+            log.debug("conn={} drain: a read or write failed ({}), wire position unknown", id, it.toString())
             return false
         }
         // Pipelined STATs never overlap a BODY: read off the status lines still owed.

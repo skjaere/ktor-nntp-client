@@ -18,14 +18,15 @@ import java.net.ServerSocket
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNull
 
 /**
- * Whether a connection goes back to the pool after a command on it was cut short. It may
- * only when the wire is in step: what the server still owes has been read off, or else the
- * connection is discarded. Otherwise the next command reads an earlier command's answer as
- * its own.
+ * Whether a connection goes back to the pool after a command on it was cut short (cancelled,
+ * or failed in a block that caught the failure and carried on). It may only when the wire is
+ * in step: what the server still owes has been read off, or else the connection is
+ * discarded. Otherwise the next command reads an earlier command's answer as its own.
  */
 class NntpPoolWireStateTest {
 
@@ -91,14 +92,19 @@ class NntpPoolWireStateTest {
         flush()
     }
 
-    private fun pool() = NntpClientPool(
+    private fun pool(
+        commandRetries: Int = NntpClientPool.DEFAULT_COMMAND_RETRIES,
+        readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS
+    ) = NntpClientPool(
         host = "localhost",
         port = serverSocket.localPort,
         selectorManager = selectorManager,
         maxConnections = 1,
         scope = poolScope,
         keepaliveIntervalMs = 0,
-        idleGracePeriodMs = 0
+        idleGracePeriodMs = 0,
+        commandRetries = commandRetries,
+        readTimeoutMs = readTimeoutMs
     )
 
     // --- Cancelled commands ---
@@ -232,6 +238,178 @@ class NntpPoolWireStateTest {
                 pool.close()
             }
         }
+
+    // --- Blocks that catch a command's failure or cancellation and carry on ---
+    // These pools don't retry, so a connection pooled out of step fails the next command
+    // instead of being replaced behind the caller's back.
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a pipelined STAT that fails mid-batch in a block that carries on does not pool its connection`() =
+        runBlocking<Unit> {
+            val accepted = launchServer { _, cmd, _, out ->
+                when (cmd) {
+                    "STAT <a@test>" -> out.send("223 0 <a@test> article exists")
+                    "STAT <b@test>" -> out.send("garbage")
+                    "STAT <later@test>" -> out.send("223 0 <later@test> article exists")
+                    else -> out.send("430 no such article")
+                }
+            }
+            val pool = pool(commandRetries = 0)
+            pool.wake()
+            try {
+                val failure = pool.withClient { client ->
+                    runCatching { client.statPipelined(listOf("<a@test>", "<b@test>", "<c@test>")) }.exceptionOrNull()
+                }
+                assertIs<NntpProtocolException>(failure)
+
+                val next = pool.stat("<later@test>")
+                assertIs<StatResult.Found>(next, "the next STAT read an answer the batch still owed: $next")
+                assertEquals(2, accepted.get(), "the STAT should have needed a new connection")
+            } finally {
+                pool.close()
+            }
+        }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a read that timed out in a block that carries on does not pool its connection`() = runBlocking<Unit> {
+        val accepted = launchServer { _, cmd, _, out ->
+            when (cmd) {
+                "STAT <stalled@test>" -> Thread.sleep(2_000)
+                else -> out.send("223 0 <test@msg> article exists")
+            }
+        }
+        val pool = pool(commandRetries = 0, readTimeoutMs = 300)
+        pool.wake()
+        try {
+            val failure = pool.withClient { client ->
+                runCatching { client.stat("<stalled@test>") }.exceptionOrNull()
+            }
+            assertIs<NntpConnectionException>(failure)
+
+            val next = runCatching { pool.stat("<test@msg>") }
+            assertIs<StatResult.Found>(next.getOrNull(), "the next STAT got $next")
+            assertEquals(2, accepted.get(), "the STAT should have needed a new connection")
+        } finally {
+            pool.close()
+        }
+    }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a pipelined STAT cut short in a block that carries on does not pool its connection`() =
+        runBlocking<Unit> {
+            val accepted = launchServer { _, cmd, _, out ->
+                when (cmd) {
+                    "STAT <a@test>" -> out.send("223 0 <a@test> article exists")
+                    "STAT <slow@test>" -> {
+                        Thread.sleep(SLOW_ANSWER_MS)
+                        out.send("223 0 <slow@test> article exists")
+                    }
+                    else -> out.send("430 no such article")
+                }
+            }
+            val pool = pool(commandRetries = 0)
+            pool.wake()
+            try {
+                val results = pool.withClient { client ->
+                    withTimeoutOrNull(CANCEL_AFTER_MS) { client.statPipelined(listOf("<a@test>", "<slow@test>")) }
+                }
+                assertNull(results)
+
+                val next = pool.stat("<missing@test>")
+                assertIs<StatResult.NotFound>(next, "the next STAT read an answer the batch still owed: $next")
+                assertEquals(2, accepted.get(), "the STAT should have needed a new connection")
+            } finally {
+                pool.close()
+            }
+        }
+
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a STAT cut short in a block that carries on does not pool its connection`() = runBlocking<Unit> {
+        val accepted = launchServer { _, cmd, _, out ->
+            when (cmd) {
+                "STAT <slow@test>" -> {
+                    Thread.sleep(SLOW_ANSWER_MS)
+                    out.send("223 0 <slow@test> article exists")
+                }
+                else -> out.send("430 no such article")
+            }
+        }
+        val pool = pool(commandRetries = 0)
+        pool.wake()
+        try {
+            val result = pool.withClient { client ->
+                withTimeoutOrNull(CANCEL_AFTER_MS) { client.stat("<slow@test>") }
+            }
+            assertNull(result)
+
+            val next = pool.stat("<missing@test>")
+            assertIs<StatResult.NotFound>(next, "the next STAT read the cut-short STAT's answer: $next")
+            assertEquals(2, accepted.get(), "the STAT should have needed a new connection")
+        } finally {
+            pool.close()
+        }
+    }
+
+    /**
+     * A 430 ends a block without its connection being discarded, as the wire is in step after
+     * one; not so when the block had swallowed a failure before (here the 430 is the batch's).
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a block that swallowed a failure and then ends with a 430 does not pool its connection`() =
+        runBlocking<Unit> {
+            val accepted = launchServer { _, cmd, _, out ->
+                when (cmd) {
+                    "STAT <a@test>" -> out.send("223 0 <a@test> article exists")
+                    "STAT <b@test>" -> out.send("garbage")
+                    "STAT <later@test>" -> out.send("223 0 <later@test> article exists")
+                    else -> out.send("430 no such article")
+                }
+            }
+            val pool = pool(commandRetries = 0)
+            pool.wake()
+            try {
+                assertFailsWith<ArticleNotFoundException> {
+                    pool.withClient { client ->
+                        runCatching { client.statPipelined(listOf("<a@test>", "<b@test>", "<c@test>")) }
+                        client.article("<x@test>")
+                    }
+                }
+
+                val next = pool.stat("<later@test>")
+                assertIs<StatResult.Found>(next, "the next STAT read an answer still owed: $next")
+                assertEquals(2, accepted.get(), "the STAT should have needed a new connection")
+            } finally {
+                pool.close()
+            }
+        }
+
+    /** A command the server refused cleanly leaves the wire in step: its connection stays pooled. */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a command refused cleanly in a block that carries on keeps its connection`() = runBlocking<Unit> {
+        val accepted = launchServer { _, cmd, _, out ->
+            when {
+                cmd.startsWith("GROUP") -> out.send("411 no such group")
+                else -> out.send("223 0 <test@msg> article exists")
+            }
+        }
+        val pool = pool(commandRetries = 0)
+        pool.wake()
+        try {
+            val failure = pool.withClient { client -> runCatching { client.group("alt.missing") }.exceptionOrNull() }
+            assertIs<NntpProtocolException>(failure)
+
+            assertIs<StatResult.Found>(pool.stat("<test@msg>"))
+            assertEquals(1, accepted.get(), "the connection should have been reused")
+        } finally {
+            pool.close()
+        }
+    }
 
     private companion object {
         // The server answers the slow command this long after reading it, and the caller gives

@@ -699,10 +699,12 @@ class NntpClientPool(
                     val result = block(client)
                     // A yEnc body's pump runs in Ktor's writer, which keeps its failure in the
                     // Body channel and completes normally, so block can return with the body
-                    // unfinished: the socket dead or the rest of the article on the wire.
+                    // unfinished: the socket dead or the rest of the article on the wire. So can
+                    // a block that caught a command's failure or cancellation itself and carried
+                    // on, with that command's answer still owed or the socket dead.
                     if (!client.connection.isReusable) {
                         logger.debug(
-                            "conn={} body left unfinished; will discard in finally",
+                            "conn={} wire left out of step; will discard in finally",
                             client.connection.id
                         )
                         dead = true
@@ -713,7 +715,9 @@ class NntpClientPool(
                     // Server cleanly responded 430 to STAT/BODY — wire is line-protocol
                     // clean, connection stays reusable. The only "benign" exception
                     // type that block can produce; everything else gets the catch-all
-                    // below and is treated as protocol-corrupting.
+                    // below and is treated as protocol-corrupting. Unless block left the wire
+                    // out of step before, as checked above for a normal return.
+                    if (client?.connection?.isReusable == false) dead = true
                     throw e
                 } catch (e: CancellationException) {
                     // Mid-block cancellation (e.g. an outer withTimeout firing while a
