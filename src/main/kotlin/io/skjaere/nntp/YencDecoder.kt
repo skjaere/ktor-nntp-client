@@ -144,6 +144,11 @@ internal object YencDecoder {
                 crc = RapidYenc.crc32(destBuf, length = outLen, initCrc = crc)
                 destBuf.get(writeBuf, 0, outLen)
                 channel.writeFully(writeBuf, 0, outLen)
+                // Hand the reader each chunk as it's decoded. Ktor 3's writer ignores autoFlush,
+                // and its channel flushes by itself only every 1 MiB, more than a whole article:
+                // without this the reader gets nothing until the pump ends. Still suspends while
+                // the reader is 1 MiB behind.
+                channel.flush()
             }
 
             decoderState = result.state

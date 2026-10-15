@@ -13,6 +13,8 @@ import java.io.InputStreamReader
 import java.net.ConnectException
 import java.net.ServerSocket
 import java.nio.channels.UnresolvedAddressException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -306,6 +308,57 @@ class NntpClientTest {
         assertEquals(originalData.size.toLong(), headers!!.size)
         assertContentEquals(originalData, decoded)
         client.close()
+    }
+
+    /**
+     * The Body channel hands its reader each part of the article as it is decoded, not the
+     * whole article at the end: Ktor's writer ignores autoFlush, and its channel flushes by
+     * itself only every 1 MiB, more than a whole article.
+     */
+    @Test
+    fun `bodyYenc hands a reader the start of an article before the server sends the rest`() = runBlocking<Unit> {
+        val originalData = ByteArray(512 * 1024) { (it * 31 % 251).toByte() }
+        val encoded = RapidYenc.encode(originalData)
+        val crc = RapidYenc.crc32(originalData)
+        val article = buildString {
+            append("=ybegin line=128 size=${originalData.size} name=large.bin\r\n")
+            append(String(encoded, Charsets.ISO_8859_1))
+            if (!endsWith("\r\n")) append("\r\n")
+            append("=yend size=${originalData.size} crc32=${crc.toString(16).padStart(8, '0')}\r\n")
+            append(".\r\n")
+        }.toByteArray(Charsets.ISO_8859_1)
+        val start = 64 * 1024
+        val sendRest = CountDownLatch(1)
+
+        launchServer { reader, out ->
+            reader.readLine()
+            out.write("222 body follows\r\n".toByteArray())
+            out.write(article, 0, start)
+            out.flush()
+            sendRest.await(10, TimeUnit.SECONDS)
+            out.write(article, start, article.size - start)
+            out.flush()
+        }
+
+        val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
+        try {
+            var firstRead = 0
+            val decoded = java.io.ByteArrayOutputStream()
+            client.bodyYenc("<large@msg>").collect { event ->
+                if (event is YencEvent.Body) {
+                    val buffer = ByteArray(8192)
+                    firstRead = withTimeoutOrNull(2_000) { event.data.readAvailable(buffer) } ?: 0
+                    sendRest.countDown()
+                    decoded.write(buffer, 0, firstRead.coerceAtLeast(0))
+                    decoded.write(event.data.toByteArray())
+                }
+            }
+            assertTrue(firstRead > 0, "the reader got no byte while the server held back the rest of the article")
+            assertContentEquals(originalData, decoded.toByteArray())
+        } finally {
+            sendRest.countDown()
+            client.close()
+        }
     }
 
 
