@@ -339,8 +339,7 @@ class NntpClientPoolTest {
         // Server accepts 2 initial connections; the rest will fail (server closed below).
         // After both pooled clients are discarded, the next acquire spawns a fresh
         // connection via connectWithRetry — which retries with exponential backoff for
-        // CONNECT_RETRY_BUDGET_MS before giving up, failing the acquire with the refusal;
-        // withClient's retry does the same once more.
+        // CONNECT_RETRY_BUDGET_MS before giving up and failing the acquire with the refusal.
         val sockets = launchCommandServer(maxAccepts = 10)
 
         val pool = NntpClientPool(

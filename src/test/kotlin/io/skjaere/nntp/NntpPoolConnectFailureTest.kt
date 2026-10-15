@@ -24,6 +24,7 @@ import org.junit.jupiter.api.Timeout
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
 import java.net.ConnectException
 import java.net.InetSocketAddress
@@ -33,6 +34,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.nio.channels.UnresolvedAddressException
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -356,6 +358,209 @@ class NntpPoolConnectFailureTest {
                 pool.close()
             }
         }
+
+    /**
+     * While the back-off after a rejected login runs, an acquire on a pool with no connection
+     * fails at once with that rejection instead of logging in again: the login would be rejected
+     * the same, and a caller that retries would send rejected logins as fast as it asks, which
+     * can get the account locked.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = [481, 482])
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `while a rejected login's back-off runs an acquire on a pool with no connection fails at once with the rejection`(
+        code: Int
+    ) {
+        runBlocking {
+            val logins = launchLoginServer { "$code Authentication rejected" }
+            val pool = pool(maxConnections = 2)
+            try {
+                assertFailsWith<NntpAuthenticationException>("the first acquire") { pool.stat("<test@msg>") }
+                val calls = List(3) { callers.async { pool.stat("<test@msg>") } }
+                failuresOf(calls, 5_000).forEach { failure ->
+                    assertIs<NntpAuthenticationException>(failure, "an acquire's failure")
+                    assertEquals(code, failure.response?.code)
+                }
+                delay(200)
+                assertEquals(1, logins.get(), "logins: an acquire logged in again while the back-off ran")
+                assertEquals(4, acquireFailures("connect_failed"), "acquire failures counted")
+                assertEquals(0.0, gauge("nntp.pool.waiters"), "queued waiters")
+                assertEquals(0.0, gauge("nntp.pool.size"), "pool size")
+                assertEquals(0.0, gauge("nntp.pool.connecting"), "connections neither idle nor in use")
+            } finally {
+                pool.close()
+            }
+        }
+    }
+
+    /**
+     * A 502 is most often "too many connections", as is a 481 or 482 whose words say so, which
+     * says nothing against the account: a pool with no connection logs in again for the next
+     * acquire.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["502 Too many connections", "481 Too many connections", "482 Too many sessions"])
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `after a login turned away for too many connections an acquire on a pool with no connection logs in again`(
+        reply: String
+    ) {
+        runBlocking {
+            val logins = launchLoginServer { if (it == 1) reply else "281 welcome" }
+            val pool = pool()
+            try {
+                assertFailsWith<NntpAuthenticationException>("the first acquire") { pool.stat("<test@msg>") }
+                assertIs<StatResult.Found>(pool.stat("<test@msg>"), "the STAT after the \"$reply\"")
+                assertEquals(2, logins.get(), "logins")
+            } finally {
+                pool.close()
+            }
+        }
+    }
+
+    /**
+     * Only a connect launched after a rejected login ends its back-off by succeeding: one already
+     * under way when the login was rejected says nothing about the account now.
+     */
+    @Test
+    @Timeout(20, unit = TimeUnit.SECONDS)
+    fun `a connect launched before a rejected login does not end its back-off when it succeeds`() {
+        runBlocking {
+            val answerFirstLogin = CountDownLatch(1)
+            val logins = launchLoginServer {
+                if (it == 1) {
+                    answerFirstLogin.await()
+                    "281 welcome"
+                } else {
+                    "481 Authentication failed"
+                }
+            }
+            val pool = pool(maxConnections = 2)
+            try {
+                // Two connects: the first one's login waits, the second one's is rejected meanwhile.
+                val first = callers.async { pool.stat("<test@msg>") }
+                awaitUntil(5_000, { "the first login was not sent" }) { logins.get() == 1 }
+                val second = callers.async { pool.stat("<test@msg>") }
+                awaitUntil(5_000, { "the second login was not rejected" }) { connects("failure") == 1 }
+                answerFirstLogin.countDown()
+                // The first connect's connection serves both.
+                assertIs<StatResult.Found>(withTimeoutOrNull(5_000) { first.await() }, "the first STAT")
+                assertIs<StatResult.Found>(withTimeoutOrNull(5_000) { second.await() }, "the second STAT")
+
+                // The back-off still runs: an acquire queued behind the one connection waits for
+                // it instead of logging in again.
+                val held = CompletableDeferred<Unit>()
+                val release = CompletableDeferred<Unit>()
+                val holder = callers.async {
+                    pool.withClient {
+                        held.complete(Unit)
+                        release.await()
+                    }
+                }
+                held.await()
+                val waiting = callers.async { pool.stat("<test@msg>") }
+                delay(500)
+                assertEquals(2, logins.get(), "logins: the connect launched before the rejection ended its back-off")
+                release.complete(Unit)
+                holder.await()
+                assertIs<StatResult.Found>(withTimeoutOrNull(5_000) { waiting.await() }, "the waiting STAT")
+            } finally {
+                answerFirstLogin.countDown()
+                pool.close()
+            }
+        }
+    }
+
+    /**
+     * When the pool's last connection is discarded while the back-off after a rejected login
+     * runs, the acquires queued behind it fail at once with the rejection: no new login, and no
+     * wait for the acquire timeout.
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `acquires queued behind a connection discarded during a rejected login's back-off fail at once with the rejection`() {
+        runBlocking {
+            val logins = launchLoginServer { if (it == 1) "281 welcome" else "481 Authentication failed" }
+            val pool = pool(maxConnections = 2, commandRetries = 0)
+            val drop = CompletableDeferred<Unit>()
+            try {
+                val held = CompletableDeferred<Unit>()
+                val holder = callers.async {
+                    pool.withClient {
+                        held.complete(Unit)
+                        drop.await()
+                        throw IOException("dropped")
+                    }
+                }
+                held.await()
+                val waiting = List(2) { callers.async { pool.stat("<test@msg>") } }
+                awaitUntil(5_000, { "the second login was not rejected, or the acquires are not waiting" }) {
+                    connects("failure") == 1 && gauge("nntp.pool.waiters") == 2.0
+                }
+                drop.complete(Unit) // the connection is discarded
+                failuresOf(waiting, 5_000).forEach { failure ->
+                    assertIs<NntpAuthenticationException>(failure, "a queued acquire's failure")
+                    assertEquals(481, failure.response?.code)
+                }
+                assertIs<IOException>(failuresOf(listOf(holder), 5_000).single(), "the holder's failure")
+                assertEquals(2, logins.get(), "logins: the discarded connection was replaced by a new login")
+                assertEquals(0.0, gauge("nntp.pool.waiters"), "queued waiters")
+                assertEquals(0.0, gauge("nntp.pool.size"), "pool size")
+                assertEquals(0.0, gauge("nntp.pool.connecting"), "connections neither idle nor in use")
+            } finally {
+                drop.complete(Unit)
+                pool.close()
+            }
+        }
+    }
+
+    /**
+     * Some providers turn a login over the account's connection limit away with 481 or 482 and
+     * words that say so. That says nothing against the account: when the pool's last connection
+     * is discarded (a drop) during the back-off, the pool logs in again, as the dropped session
+     * freed a slot, and serves the acquire queued behind it and the command's own retry.
+     */
+    @ParameterizedTest
+    @ValueSource(strings = ["481 Too many connections", "482 Connection limit reached for this account"])
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a rejected login that names a connection limit does not stop the pool replacing a discarded connection`(
+        reply: String
+    ) {
+        runBlocking {
+            val logins = launchLoginServer { if (it == 2) reply else "281 welcome" }
+            val pool = pool(maxConnections = 2)
+            val drop = CompletableDeferred<Unit>()
+            try {
+                val held = CompletableDeferred<Unit>()
+                val attempts = AtomicInteger()
+                val holder = callers.async {
+                    pool.withClient {
+                        if (attempts.incrementAndGet() == 1) {
+                            held.complete(Unit)
+                            drop.await()
+                            throw IOException("dropped")
+                        }
+                        it.stat("<test@msg>")
+                    }
+                }
+                held.await()
+                val waiting = callers.async { pool.stat("<test@msg>") }
+                awaitUntil(5_000, { "the second login was not rejected, or the acquire is not waiting" }) {
+                    connects("failure") == 1 && gauge("nntp.pool.waiters") == 1.0
+                }
+                drop.complete(Unit) // the connection is discarded, and the command retried
+                val failures = failuresOf(listOf(waiting, holder), 5_000)
+                assertEquals(listOf(null, null), failures, "the queued acquire's and the retried command's failures")
+                assertIs<StatResult.Found>(waiting.await(), "the queued STAT")
+                assertIs<StatResult.Found>(holder.await(), "the retried command's STAT")
+                assertEquals(2, attempts.get(), "the command's attempts")
+                assertEquals(3, logins.get(), "logins: the discarded connection was not replaced by a new login")
+                assertEquals(0, acquireFailures("connect_failed"), "acquire failures counted")
+            } finally {
+                drop.complete(Unit)
+                pool.close()
+            }
+        }
+    }
 
     /**
      * A server that refuses connections (down, or the wrong port) is tried again for a few

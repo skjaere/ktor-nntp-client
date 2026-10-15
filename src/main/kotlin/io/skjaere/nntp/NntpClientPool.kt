@@ -97,7 +97,11 @@ class NntpClientPool(
         // pool opens no new connection for this long while it has another one, open or on its
         // way: the acquires queued behind it are served as connections come back. Otherwise each
         // queued acquire would start a login the server rejects, e.g. "502 Too many connections"
-        // when the account allows fewer connections than maxConnections.
+        // when the account allows fewer connections than maxConnections. After a login rejected
+        // for the account (rejectsAccount) a pool with no connection opens none either: its
+        // acquires fail at once with the rejection, as logging in again risks the account being
+        // locked. A connect launched after the failure ends the back-off early by succeeding; one
+        // already under way doesn't.
         const val CONNECT_REJECTED_BACKOFF_MS = 30_000L
 
         const val ACQUIRE_TIMEOUT_MS = 30_000L
@@ -196,6 +200,16 @@ class NntpClientPool(
     // Until when new connections wait after a rejected connect; see CONNECT_REJECTED_BACKOFF_MS.
     @Volatile
     private var connectRejectedUntilMs = 0L
+
+    // The last login rejected for the account (rejectsAccount) and the end of its back-off; see
+    // loginRejectedNow. Under poolMutex, as are the two counts below.
+    private var loginRejection: NntpAuthenticationException? = null
+    private var loginRejectedUntilMs = 0L
+
+    // Connects launched so far, and how many had been when the last back-off began: only a
+    // connect launched after that ends it by succeeding.
+    private var connectsLaunched = 0L
+    private var connectsLaunchedAtRejection = 0L
 
     // The last connect attempt that failed, and how many have: an acquire that times out names
     // the last one made while it waited as its cause. Set before counted, so a count that has
@@ -304,6 +318,7 @@ class NntpClientPool(
      * Must only be called after incrementing [currentSize] under [poolMutex], on an open pool.
      */
     private fun launchConnection() {
+        val launched = ++connectsLaunched
         val job = scope.launch {
             val client = try {
                 connectWithRetry()
@@ -317,38 +332,78 @@ class NntpClientPool(
             }
             opened.incrementAndGet()
             recordConnectAttempt("success")
-            connectRejectedUntilMs = 0L
-            withContext(NonCancellable) { addClientToPool(client) }
+            withContext(NonCancellable) {
+                connectSucceeded(launched)
+                addClientToPool(client)
+            }
         }
         connects.add(job)
         job.invokeOnCompletion { connects.remove(job) }
     }
 
     /**
+     * The [launched]-th connect succeeded. If it was launched after the last rejected connect,
+     * the account logs in again, and the back-off ends. One already under way at the rejection
+     * says nothing about that, so the back-off runs on.
+     */
+    private suspend fun connectSucceeded(launched: Long) {
+        poolMutex.withLock {
+            if (launched > connectsLaunchedAtRejection) {
+                connectRejectedUntilMs = 0L
+                loginRejection = null
+            }
+        }
+    }
+
+    /**
      * Frees the slot of a connect that failed for good with [cause]. If that leaves the pool
      * with no connection, open or on its way, nothing can serve the acquires still waiting:
      * they fail now with [cause] instead of timing out. While the pool has another connection
-     * they wait for it.
+     * they wait for it. A failure a retry can't change starts the back-off
+     * ([CONNECT_REJECTED_BACKOFF_MS]), and a login rejected for the account is kept for
+     * [loginRejectedNow].
      */
     private suspend fun connectFailed(cause: Exception) {
         poolMutex.withLock {
             currentSize--
             if (cause.isPermanentConnectFailure()) {
-                connectRejectedUntilMs = System.currentTimeMillis() + CONNECT_REJECTED_BACKOFF_MS
+                val now = System.currentTimeMillis()
+                connectRejectedUntilMs = now + CONNECT_REJECTED_BACKOFF_MS
+                connectsLaunchedAtRejection = connectsLaunched
+                if (cause is NntpAuthenticationException && cause.rejectsAccount) {
+                    loginRejection = cause
+                    loginRejectedUntilMs = now + CONNECT_REJECTED_BACKOFF_MS
+                }
             }
             if (currentSize > 0) return@withLock
-            // We own the dequeue, so we also own the per-priority decrement. A waiter being
-            // withdrawn has its deferred cancelled already: completing it fails, and withdraw
-            // finds it gone from the queue.
-            while (true) {
-                val waiter = waiters.poll() ?: break
-                decWaiter(waiter.priority)
-                if (waiter.deferred.completeExceptionally(failureFor(cause))) {
-                    recordAcquireFailure(waiter.priority, "connect_failed")
-                }
+            failWaiters(cause)
+        }
+    }
+
+    /**
+     * Under [poolMutex]: fails every queued acquire with [cause] ([failureFor]). We own the
+     * dequeue, so we also own the per-priority decrement. A waiter being withdrawn has its
+     * deferred cancelled already: completing it fails, and withdraw finds it gone from the queue.
+     */
+    private fun failWaiters(cause: Exception) {
+        while (true) {
+            val waiter = waiters.poll() ?: break
+            decWaiter(waiter.priority)
+            if (waiter.deferred.completeExceptionally(failureFor(cause))) {
+                recordAcquireFailure(waiter.priority, "connect_failed")
             }
         }
     }
+
+    /**
+     * Under [poolMutex]: the login rejected for the account whose back-off still runs, if the pool
+     * has no connection, open or on its way. An acquire then fails with it instead of logging in
+     * again: the login would be rejected the same, and a caller that retries (a player reloading,
+     * one provider and nothing to fall back to) would send rejected logins as fast as it asks,
+     * which can get the account locked.
+     */
+    private fun loginRejectedNow(): NntpAuthenticationException? =
+        loginRejection?.takeIf { currentSize == 0 && System.currentTimeMillis() < loginRejectedUntilMs }
 
     /**
      * What an acquire whose connect failed with [cause] throws: a rejected login stays an
@@ -367,7 +422,8 @@ class NntpClientPool(
     /**
      * Under [poolMutex]: whether a waiter may have a new connection opened for it. Not at the
      * maximum, nor while a rejected connect's back-off runs and another connection can serve
-     * the waiter (see [CONNECT_REJECTED_BACKOFF_MS]).
+     * the waiter (see [CONNECT_REJECTED_BACKOFF_MS]). Ask [loginRejectedNow] first: with no
+     * connection, a rejected login fails the waiter instead.
      */
     private fun canOpenConnection(): Boolean =
         currentSize < maxConnections &&
@@ -663,6 +719,11 @@ class NntpClientPool(
             if (entry != null) {
                 deferred.complete(entry.client)
                 return@withLock null
+            }
+            // Nothing to wait for, and logging in again would be rejected: fail now.
+            loginRejectedNow()?.let { rejection ->
+                recordAcquireFailure(priority, "connect_failed")
+                throw failureFor(rejection)
             }
             val w = PriorityWaiter(priority, deferred, waiterSequence++)
             waiters.add(w)
@@ -977,8 +1038,12 @@ class NntpClientPool(
                 // If callers are queued waiting for a connection, spawn a replacement
                 // so they're not left hanging until acquire-timeout. Without this kick,
                 // a discarded slot stays vacant unless a new acquire happens to walk the
-                // currentSize<max branch.
-                if (waiters.isNotEmpty() && canOpenConnection() && !closed && !sleeping) {
+                // currentSize<max branch. When that was the last connection and a rejected
+                // login's back-off runs, they fail with the rejection instead, as an acquire would.
+                val rejection = loginRejectedNow()
+                if (rejection != null) {
+                    failWaiters(rejection)
+                } else if (waiters.isNotEmpty() && canOpenConnection() && !closed && !sleeping) {
                     currentSize++
                     launchConnection()
                 }
@@ -1145,6 +1210,25 @@ class NntpClientPool(
 // AUTHINFO answers that reject the login itself: 481 (rejected), 482 (out of sequence) and 502
 // (not allowed, e.g. too many connections for the account). Asking again gets the same answer.
 private val REJECTED_LOGIN_CODES = setOf(481, 482, 502)
+
+// Of those, the answers that can reject the account itself (credentials refused, the account
+// disabled or expired), after which logging in again risks the account being locked. Not every
+// 481 or 482 does: some providers send one, as most send 502, for a login over the account's
+// connection limit (see rejectsAccount).
+private val REJECTED_ACCOUNT_CODES = setOf(481, 482)
+
+// Words with which a provider turns away a login over the account's connection limit.
+private val CONNECTION_LIMIT =
+    Regex("""too many (connections|sessions|logins|users)|connection limit""", RegexOption.IGNORE_CASE)
+
+/**
+ * Whether this rejected login rejects the account itself rather than one more connection: a 481
+ * or 482 whose words don't name a connection limit ("481 Too many connections" doesn't). A
+ * login over the limit is treated as a 502 is: the account may log in again once a connection
+ * of it closes.
+ */
+private val NntpAuthenticationException.rejectsAccount: Boolean
+    get() = response?.let { it.code in REJECTED_ACCOUNT_CODES && !CONNECTION_LIMIT.containsMatchIn(it.message) } == true
 
 /**
  * A connect failure a retry can't change: the server rejected the login, the host name doesn't
