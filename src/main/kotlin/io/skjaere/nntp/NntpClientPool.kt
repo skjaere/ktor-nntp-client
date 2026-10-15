@@ -19,6 +19,7 @@ import kotlin.collections.mutableSetOf
 import kotlin.collections.plus
 import kotlin.collections.toList
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.TimeSource
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -83,6 +84,15 @@ class NntpClientPool(
         const val CONNECT_RETRY_MAX_DELAY_MS = 30_000L
         const val CONNECT_MAX_RETRIES = 5L
 
+        // How long a connect that fails in a way that may pass (refused, timed out) is tried for:
+        // its attempts and the back-off between them, so a refused one is tried at 0, 1, 3 and 7 s.
+        // Long enough to ride out a short outage, and well inside ACQUIRE_TIMEOUT_MS, so the
+        // acquires waiting for the connection fail with its cause instead of timing out.
+        const val CONNECT_RETRY_BUDGET_MS = 10_000L
+
+        // A connect is retried only if the budget leaves the attempt this long.
+        private const val MIN_CONNECT_ATTEMPT_MS = 1_000L
+
         // After a connect fails in a way a retry can't change (isPermanentConnectFailure), the
         // pool opens no new connection for this long while it has another one, open or on its
         // way: the acquires queued behind it are served as connections come back. Otherwise each
@@ -128,7 +138,8 @@ class NntpClientPool(
         //
         // 20 s is loose enough to cover worst-case healthy handshakes (TCP ~3 s + TLS ~1 s +
         // welcome <0.1 s + AUTHINFO round-trips <1 s = ~5 s healthy, ~10 s degraded) and
-        // strict enough to keep one stalled peer from indefinitely consuming a slot.
+        // strict enough to keep one stalled peer from indefinitely consuming a slot. In the pool an
+        // attempt also ends with what is left of CONNECT_RETRY_BUDGET_MS, which is shorter.
         const val CONNECT_TIMEOUT_MS = 20_000L
     }
 
@@ -185,6 +196,13 @@ class NntpClientPool(
     // Until when new connections wait after a rejected connect; see CONNECT_REJECTED_BACKOFF_MS.
     @Volatile
     private var connectRejectedUntilMs = 0L
+
+    // The last connect attempt that failed, and how many have: an acquire that times out names
+    // the last one made while it waited as its cause. Set before counted, so a count that has
+    // moved finds that failure or a later one.
+    @Volatile
+    private var lastConnectFailure: Exception? = null
+    private val connectFailures = AtomicLong()
 
     /**
      * Connections this pool has opened (connected, greeted and logged in) since it was created.
@@ -356,9 +374,12 @@ class NntpClientPool(
             (currentSize == 0 || System.currentTimeMillis() >= connectRejectedUntilMs)
 
     /**
-     * Connects, retrying with exponential back-off (1 s doubling, at most [CONNECT_MAX_RETRIES]
-     * retries) a failure that may pass: refused, reset, timed out, a greeting other than 200/201.
-     * A failure a retry can't change ([isPermanentConnectFailure]) is thrown at once.
+     * Connects, retrying with exponential back-off (1 s doubling) a failure that may pass: refused,
+     * reset, timed out, a greeting other than 200/201. The attempts and the back-off share
+     * [CONNECT_RETRY_BUDGET_MS]: what is left of it bounds an attempt, and a retry is made only
+     * while it leaves the attempt [MIN_CONNECT_ATTEMPT_MS] (and at most [CONNECT_MAX_RETRIES]).
+     * A failure a retry can't change ([isPermanentConnectFailure]) is thrown at once. Each failed
+     * attempt is noted for [acquire]'s timeout.
      *
      * A loop rather than a retrying flow: a flow's emit checks for cancellation, and a connect
      * cancelled there (close() cancels connects) would drop the client it had just opened.
@@ -366,9 +387,12 @@ class NntpClientPool(
      * checks for cancellation.
      */
     private suspend fun connectWithRetry(): NntpClient {
+        val started = TimeSource.Monotonic.markNow()
+        fun budgetLeftMs() = CONNECT_RETRY_BUDGET_MS - started.elapsedNow().inWholeMilliseconds
         var delayMs = CONNECT_RETRY_BASE_DELAY_MS
         var retries = 0L
         while (true) {
+            val timeoutMs = budgetLeftMs().coerceIn(MIN_CONNECT_ATTEMPT_MS, CONNECT_TIMEOUT_MS)
             try {
                 // Bound each individual connect attempt. The inner NntpClient.connect path has
                 // three unbounded readLine() suspends (welcome + AUTHINFO USER ack + AUTHINFO
@@ -377,21 +401,23 @@ class NntpClientPool(
                 // surface as NntpConnectionException so the same retry path that handles real
                 // connect failures (IO errors, EOF mid-handshake, etc.) treats a timed-out
                 // attempt the same way.
-                return connectWithin(CONNECT_TIMEOUT_MS) {
+                return connectWithin(timeoutMs) {
                     NntpClient.connect(
                         host, port, selectorManager, useTls, username, password, readTimeoutMs, verifyHostname, poolName
                     )
                 } ?: throw NntpConnectionException(
-                    "Connect to $host:$port timed out after ${CONNECT_TIMEOUT_MS}ms"
+                    "Connect to $host:$port timed out after ${timeoutMs}ms"
                 )
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
+                lastConnectFailure = e
+                connectFailures.incrementAndGet()
                 if (e.isPermanentConnectFailure()) {
                     logger.error("Failed to connect to {}:{}, not retrying: {}", host, port, e.message ?: e.toString())
                     throw e
                 }
-                if (retries++ == CONNECT_MAX_RETRIES) throw e
+                if (retries++ == CONNECT_MAX_RETRIES || budgetLeftMs() - delayMs < MIN_CONNECT_ATTEMPT_MS) throw e
                 logger.warn("Failed to connect to {}:{}: {}", host, port, e.message)
                 delay(delayMs)
                 delayMs = (delayMs * 2).coerceAtMost(CONNECT_RETRY_MAX_DELAY_MS)
@@ -623,6 +649,8 @@ class NntpClientPool(
     @OptIn(ExperimentalCoroutinesApi::class)
     private suspend fun acquire(priority: Int = 0): NntpClient {
         val sample = Timer.start(registry)
+        // A timeout names a connect failure after these as its cause.
+        val failuresBefore = connectFailures.get()
         val deferred = CompletableDeferred<NntpClient>()
         val waiter = poolMutex.withLock {
             // As close() fails the acquires already waiting. Not retried by withClient, so work
@@ -663,8 +691,12 @@ class NntpClientPool(
         }
         withdraw(waiter)
         recordAcquireFailure(priority, "timeout")
+        // No connection came in time: the pool's stayed in use, and a connect made meanwhile
+        // failed while the pool had others, or is still trying. The last connect failure since
+        // this acquire began says why, if there was one.
         throw NntpConnectionException(
-            "Timed out waiting for connection to $host:$port (${ACQUIRE_TIMEOUT_MS}ms)"
+            "Timed out waiting for connection to $host:$port (${ACQUIRE_TIMEOUT_MS}ms)",
+            if (connectFailures.get() > failuresBefore) lastConnectFailure else null
         )
     }
 

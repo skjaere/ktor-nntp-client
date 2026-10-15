@@ -338,9 +338,9 @@ class NntpClientPoolTest {
     fun `both connections dead propagates exception`() = runBlocking {
         // Server accepts 2 initial connections; the rest will fail (server closed below).
         // After both pooled clients are discarded, the next acquire spawns a fresh
-        // connection via connectWithRetry — which retries 5x with exponential backoff
-        // before giving up. Worst case ~30s of backoff + acquire timeout before the
-        // final NntpConnectionException surfaces.
+        // connection via connectWithRetry — which retries with exponential backoff for
+        // CONNECT_RETRY_BUDGET_MS before giving up, failing the acquire with the refusal;
+        // withClient's retry does the same once more.
         val sockets = launchCommandServer(maxAccepts = 10)
 
         val pool = NntpClientPool(
@@ -1305,9 +1305,9 @@ class NntpClientPoolTest {
             delay(200) // let acquire trigger launchConnection
             job.cancel()
 
-            // connectWithRetry does up to 5 retries with exponential backoff (1+2+4+8+16=31s).
-            // After all retries fail, launchConnection should decrement currentSize.
-            delay(35_000)
+            // connectWithRetry retries a refused connect for CONNECT_RETRY_BUDGET_MS (at 0, 1, 3
+            // and 7 s). After all retries fail, launchConnection should decrement currentSize.
+            delay(NntpClientPool.CONNECT_RETRY_BUDGET_MS + 2_000)
 
             val sizeGauge = registry.find("nntp.pool.size").tag("pool.name", poolName).gauge()
             assertEquals(0.0, sizeGauge?.value() ?: -1.0, "currentSize should be 0 after failed connections")

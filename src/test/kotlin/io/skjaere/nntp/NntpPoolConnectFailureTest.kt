@@ -25,6 +25,8 @@ import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.net.ConnectException
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -37,7 +39,8 @@ import kotlin.test.assertTrue
 
 /**
  * How the pool's connects fail. A failure a retry can't change (a rejected login, a host
- * name that doesn't resolve) is tried once; others are retried with a bounded back-off.
+ * name that doesn't resolve) is tried once; others are retried with back-off for a few seconds,
+ * well inside the acquire timeout.
  * When the pool is left with no connection, open or on its way, the acquires waiting for
  * one fail at once with the connect's cause instead of timing out.
  */
@@ -116,7 +119,8 @@ class NntpPoolConnectFailureTest {
         port: Int = serverSocket.localPort,
         maxConnections: Int = 1,
         username: String? = "user",
-        password: String? = "secret"
+        password: String? = "secret",
+        commandRetries: Int = NntpClientPool.DEFAULT_COMMAND_RETRIES
     ) = NntpClientPool(
         host = host,
         port = port,
@@ -126,7 +130,8 @@ class NntpPoolConnectFailureTest {
         maxConnections = maxConnections,
         scope = poolScope,
         keepaliveIntervalMs = 0,
-        idleGracePeriodMs = 0
+        idleGracePeriodMs = 0,
+        commandRetries = commandRetries
     )
 
     /** Connects of the pool at [host]:[port] that ended with [outcome], retries included once. */
@@ -351,6 +356,140 @@ class NntpPoolConnectFailureTest {
                 pool.close()
             }
         }
+
+    /**
+     * A server that refuses connections (down, or the wrong port) is tried again for a few
+     * seconds, not past the acquire timeout: the acquires waiting fail with the refusal instead
+     * of "Timed out waiting" after 30 s.
+     */
+    @Test
+    @Timeout(30, unit = TimeUnit.SECONDS)
+    fun `acquires waiting for a server that refuses connections fail with the refusal before the acquire timeout`() {
+        runBlocking {
+            serverSocket.close()
+            val pool = pool(maxConnections = 2, commandRetries = 0)
+            try {
+                val calls = List(3) { callers.async { pool.stat("<test@msg>") } }
+                failuresOf(calls, 15_000).forEach { failure ->
+                    assertIs<NntpConnectionException>(failure, "an acquire's failure")
+                    assertTrue(
+                        generateSequence<Throwable>(failure) { it.cause }.any { it is ConnectException },
+                        "the failure doesn't carry the refusal: $failure"
+                    )
+                }
+                assertEquals(3, acquireFailures("connect_failed"), "acquire failures counted")
+                assertEquals(0, acquireFailures("timeout"), "acquires timed out")
+                assertEquals(0.0, gauge("nntp.pool.waiters"), "queued waiters")
+                assertEquals(0.0, gauge("nntp.pool.size"), "pool size")
+            } finally {
+                pool.close()
+            }
+        }
+    }
+
+    /** A refused connect is still tried again for a few seconds: a server back within them is ridden out. */
+    @Test
+    @Timeout(20, unit = TimeUnit.SECONDS)
+    fun `a server that comes back within a few seconds is ridden out`() {
+        runBlocking {
+            val port = serverSocket.localPort
+            serverSocket.close()
+            val pool = pool(commandRetries = 0)
+            try {
+                val call = callers.async { pool.stat("<test@msg>") }
+                delay(2_000)
+                serverSocket = ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(port))
+                }
+                launchLoginServer { "281 welcome" }
+                val result = withTimeoutOrNull(10_000) { call.await() }
+                assertIs<StatResult.Found>(result, "the STAT once the server is back")
+            } finally {
+                pool.close()
+            }
+        }
+    }
+
+    /**
+     * A connect that hangs (dropped SYNs, a server that never greets) ends within the same few
+     * seconds, so the acquires waiting hear that it timed out instead of "Timed out waiting".
+     */
+    @Test
+    @Timeout(30, unit = TimeUnit.SECONDS)
+    fun `acquires waiting for a server that never greets fail with the connect's timeout before the acquire timeout`() {
+        runBlocking {
+            // Nobody accepts: the kernel completes the TCP handshake, and no greeting comes.
+            val pool = pool(commandRetries = 0)
+            try {
+                val calls = List(2) { callers.async { pool.stat("<test@msg>") } }
+                failuresOf(calls, 15_000).forEach { failure ->
+                    assertIs<NntpConnectionException>(failure, "an acquire's failure")
+                    assertTrue(
+                        failure.message.orEmpty().startsWith("Connect to localhost:${serverSocket.localPort} timed out"),
+                        "an acquire's failure: $failure"
+                    )
+                }
+                assertEquals(2, acquireFailures("connect_failed"), "acquire failures counted")
+                assertEquals(0.0, gauge("nntp.pool.waiters"), "queued waiters")
+                assertEquals(0.0, gauge("nntp.pool.size"), "pool size")
+            } finally {
+                pool.close()
+            }
+        }
+    }
+
+    /**
+     * An acquire that does time out, here behind a connection held all along while the server
+     * refuses the pool's next connect, names the last connect failure as its cause.
+     */
+    @Test
+    @Timeout(30, unit = TimeUnit.SECONDS)
+    fun `an acquire that times out carries the last connect failure as its cause`() {
+        runBlocking {
+            launchLoginServer { "281 welcome" }
+            val pool = pool(maxConnections = 2, commandRetries = 0)
+            // The waiting caller runs on a test dispatcher, so the test says when its acquire times out.
+            val scheduler = TestCoroutineScheduler()
+            val testCallers = CoroutineScope(StandardTestDispatcher(scheduler) + SupervisorJob())
+            val release = CompletableDeferred<Unit>()
+            try {
+                val held = CompletableDeferred<Unit>()
+                val holder = callers.async {
+                    pool.withClient {
+                        held.complete(Unit)
+                        release.await()
+                    }
+                }
+                held.await()
+                serverSocket.close() // the next connect is refused
+                val call = testCallers.async { pool.stat("<test@msg>") }
+                scheduler.runCurrent()
+                assertEquals(1.0, gauge("nntp.pool.waiters"), "the caller should be waiting")
+                delay(1_500) // the connect for it is refused, and tried again
+                scheduler.advanceTimeBy(NntpClientPool.ACQUIRE_TIMEOUT_MS)
+                awaitUntil(5_000, { "the acquire did not end at its timeout" }) {
+                    scheduler.runCurrent()
+                    call.isCompleted
+                }
+                val failure = call.getCompletionExceptionOrNull()
+                assertIs<NntpConnectionException>(failure, "the acquire's failure")
+                assertTrue(failure.message.orEmpty().startsWith("Timed out waiting"), "the acquire's failure: $failure")
+                assertTrue(
+                    generateSequence<Throwable>(failure) { it.cause }.any { it is ConnectException },
+                    "the timeout doesn't name the refused connect as its cause: $failure, caused by ${failure.cause}"
+                )
+                assertEquals(1, acquireFailures("timeout"), "acquires timed out")
+                assertEquals(0.0, gauge("nntp.pool.waiters"), "queued waiters")
+                release.complete(Unit)
+                holder.await()
+            } finally {
+                release.complete(Unit)
+                testCallers.cancel()
+                pool.close()
+            }
+        }
+    }
 
     /**
      * An acquire cancelled just as its connect fails ends cancelled: its clean-up (withdraw)
