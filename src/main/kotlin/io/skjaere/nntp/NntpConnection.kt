@@ -671,9 +671,17 @@ class NntpConnection private constructor(
      * `socketContext.cancel()` can land while the read/write actor still holds the
      * channel — close() then returns without releasing the underlying FD, producing
      * orphan socket FDs (visible in /proc/<pid>/fd but not in /proc/net/tcp).
+     *
+     * A coroutine still reading or writing (the pool's close() closes connections callers
+     * have checked out) fails with an I/O error whose cause says the connection was closed.
+     * The socket's cancellation alone would reach it as a CancellationException, which it
+     * would take for its own cancellation.
      */
     override fun close() {
         try {
+            val closedCause = NntpConnectionException("Connection to $host:$port closed")
+            readChannel.cancel(closedCause)
+            writeChannel.cancel(closedCause)
             socket.socketContext.cancel()
             runBlocking { runCatching { socket.socketContext.join() } }
         } finally {

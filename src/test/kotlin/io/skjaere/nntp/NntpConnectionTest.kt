@@ -1,22 +1,37 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.*
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
 import java.io.PrintWriter
 import java.net.ConnectException
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.channels.UnresolvedAddressException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 class NntpConnectionTest {
 
@@ -191,6 +206,46 @@ class NntpConnectionTest {
         assertEquals(430, response.code)
         assertEquals(emptyList(), lines)
         connection.close()
+    }
+
+    /**
+     * Closing a connection while another coroutine waits on it for an answer (the pool's close()
+     * does this to a checked-out connection) fails that command with an I/O error. Cancelling the
+     * socket alone ended the read with the socket's own CancellationException, which the caller,
+     * not cancelled itself, takes for its own cancellation.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `closing a connection fails a command waiting on it instead of cancelling it`() = runBlocking<Unit> {
+        val commandReceived = CountDownLatch(1)
+        launch(Dispatchers.IO) {
+            runCatching {
+                acceptAndHandle { reader, writer ->
+                    writer.print("200 welcome\r\n")
+                    writer.flush()
+                    reader.readLine() // DATE, never answered
+                    commandReceived.countDown()
+                    reader.readLine() // until the client goes away
+                }
+            }
+        }
+        val callers = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        try {
+            val connection = NntpConnection.connect("localhost", serverSocket.localPort, selectorManager)
+            val pending = callers.async { connection.command("DATE") }
+            assertTrue(commandReceived.await(5, TimeUnit.SECONDS), "DATE never reached the server")
+
+            connection.close()
+
+            withTimeout(5_000) { pending.join() }
+            val failure = pending.getCompletionExceptionOrNull()
+            assertNotNull(failure, "the command succeeded on a closed connection")
+            assertFalse(failure is CancellationException, "the command ended as cancelled: $failure")
+            assertTrue(failure is IOException || failure is NntpException, "expected an I/O failure, got $failure")
+        } finally {
+            callers.cancel()
+        }
     }
 
     /**
