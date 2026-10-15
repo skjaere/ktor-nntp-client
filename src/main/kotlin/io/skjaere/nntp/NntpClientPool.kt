@@ -738,13 +738,23 @@ class NntpClientPool(
 
     suspend fun <T> withClient(block: suspend (NntpClient) -> T): T = withClient(0, block)
 
-    /** [NntpClient.statPipelined] on one pooled connection, acquired at [priority]. */
+    /**
+     * [NntpClient.statPipelined] on one pooled connection, acquired at [priority]. With nothing
+     * to send (no id that can be a message-id), every result is NotFound and no connection is
+     * taken.
+     */
     suspend fun statPipelined(
         messageIds: List<String>,
         priority: Int = 0,
         window: Int = 64,
         onResult: ((index: Int, result: StatResult) -> Unit)? = null,
-    ): List<StatResult> = withClient(priority) { it.statPipelined(messageIds, window, onResult) }
+    ): List<StatResult> {
+        if (messageIds.none(NntpCommand::isMessageId)) {
+            require(window > 0) { "window must be > 0, got $window" }
+            return messageIds.indices.map { i -> NntpClient.NOT_A_MESSAGE_ID_STAT.also { onResult?.invoke(i, it) } }
+        }
+        return withClient(priority) { it.statPipelined(messageIds, window, onResult) }
+    }
 
     suspend fun <T> withClient(priority: Int = 0, block: suspend (NntpClient) -> T): T {
         if (sleeping) doWake()
@@ -942,13 +952,19 @@ class NntpClientPool(
      * fails only that channel's reader, outside [withClient], so it isn't fetched again: the
      * reader may already have part of it. To have such a body fetched again on another
      * connection (the command retry), read it whole inside [withClient] instead, with
-     * [NntpClient.bodyYenc].
+     * [NntpClient.bodyYenc]. An id that can't be a message-id fails with its not-found at once,
+     * taking no connection.
      */
-    fun bodyYenc(messageId: String, priority: Int = 0): Flow<YencEvent> = channelFlow {
-        withClient(priority) { client ->
-            client.bodyYenc(messageId).collect { event -> send(event) }
+    fun bodyYenc(messageId: String, priority: Int = 0): Flow<YencEvent> =
+        if (!NntpCommand.isMessageId(messageId)) {
+            flow { NntpClient.checkMessageId(messageId) }
+        } else {
+            channelFlow {
+                withClient(priority) { client ->
+                    client.bodyYenc(messageId).collect { event -> send(event) }
+                }
+            }
         }
-    }
 
     /** [bodyYenc] by article number. */
     fun bodyYenc(number: Long, priority: Int = 0): Flow<YencEvent> = channelFlow {
@@ -961,28 +977,39 @@ class NntpClientPool(
         withClient(priority) { it.group(name) }
 
     suspend fun article(messageId: String, priority: Int = 0): ArticleResponse =
-        withClient(priority) { it.article(messageId) }
+        lookup(messageId, priority) { it.article(messageId) }
 
     suspend fun article(number: Long, priority: Int = 0): ArticleResponse =
         withClient(priority) { it.article(number) }
 
     suspend fun head(messageId: String, priority: Int = 0): ArticleResponse =
-        withClient(priority) { it.head(messageId) }
+        lookup(messageId, priority) { it.head(messageId) }
 
     suspend fun head(number: Long, priority: Int = 0): ArticleResponse =
         withClient(priority) { it.head(number) }
 
     suspend fun body(messageId: String, priority: Int = 0): ArticleResponse =
-        withClient(priority) { it.body(messageId) }
+        lookup(messageId, priority) { it.body(messageId) }
 
     suspend fun body(number: Long, priority: Int = 0): ArticleResponse =
         withClient(priority) { it.body(number) }
 
     suspend fun stat(messageId: String, priority: Int = 0): StatResult =
-        withClient(priority) { it.stat(messageId) }
+        if (NntpCommand.isMessageId(messageId)) withClient(priority) { it.stat(messageId) }
+        else NntpClient.NOT_A_MESSAGE_ID_STAT
 
     suspend fun stat(number: Long, priority: Int = 0): StatResult =
         withClient(priority) { it.stat(number) }
+
+    /**
+     * [withClient] for a lookup by [messageId]. One that can't be a message-id fails at once with
+     * its not-found ([NntpClient.checkMessageId]): it would never be sent, so it takes no
+     * connection, nor opens one, on this pool or any a caller falls back to.
+     */
+    private suspend fun <T> lookup(messageId: String, priority: Int, block: suspend (NntpClient) -> T): T {
+        NntpClient.checkMessageId(messageId)
+        return withClient(priority, block)
+    }
 
     /**
      * Closes the pool for good. Acquires waiting now, and any made later, fail with

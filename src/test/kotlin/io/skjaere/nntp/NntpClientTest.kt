@@ -519,6 +519,35 @@ class NntpClientTest {
         client.close()
     }
 
+    /** As for an id that can't be a message-id, which is never sent (NntpMessageIdTest). */
+    @Test
+    fun `over by message-id throws ArticleNotFoundException on 430`() = runBlocking<Unit> {
+        launchServer { reader, out ->
+            reader.readLine()
+            out.write("430 No article with that message-id\r\n".toByteArray())
+            out.flush()
+        }
+
+        NntpClient.connect("localhost", serverSocket.localPort, selectorManager).use { client ->
+            val ex = assertFailsWith<ArticleNotFoundException> { client.over("<missing@host>") }
+            assertEquals(430, ex.response?.code)
+        }
+    }
+
+    @Test
+    fun `hdr by message-id throws ArticleNotFoundException on 430`() = runBlocking<Unit> {
+        launchServer { reader, out ->
+            reader.readLine()
+            out.write("430 No article with that message-id\r\n".toByteArray())
+            out.flush()
+        }
+
+        NntpClient.connect("localhost", serverSocket.localPort, selectorManager).use { client ->
+            val ex = assertFailsWith<ArticleNotFoundException> { client.hdr("Subject", "<missing@host>") }
+            assertEquals(430, ex.response?.code)
+        }
+    }
+
     @Test
     fun `article throws NntpProtocolException on non-430 error`() = runTest {
         launchServer { reader, out ->

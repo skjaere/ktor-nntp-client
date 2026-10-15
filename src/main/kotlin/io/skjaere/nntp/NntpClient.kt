@@ -16,7 +16,16 @@ class NntpClient(
         // A lookup by an id that can't be one ([NntpCommand.isMessageId]) isn't sent: no article
         // has that id, so it gets the command's not-found outcome, as if the server said 430.
         private val NOT_A_MESSAGE_ID = NntpResponse(430, "Not a message-id, not sent")
-        private val NOT_A_MESSAGE_ID_STAT = StatResult.NotFound(NOT_A_MESSAGE_ID.code, NOT_A_MESSAGE_ID.message)
+        internal val NOT_A_MESSAGE_ID_STAT = StatResult.NotFound(NOT_A_MESSAGE_ID.code, NOT_A_MESSAGE_ID.message)
+
+        /** Throws the not-found of a lookup by [messageId], without sending it, when it can't be one. */
+        internal fun checkMessageId(messageId: String) {
+            if (!NntpCommand.isMessageId(messageId)) throw articleNotFound(NOT_A_MESSAGE_ID)
+        }
+
+        /** What a lookup by message-id throws for a 430, or for an id that can't be one. */
+        private fun articleNotFound(response: NntpResponse) =
+            ArticleNotFoundException("Article not found: ${response.code} ${response.message}", response)
 
         /** [readTimeoutMs], [verifyHostname]: see [NntpConnection.connect]. */
         suspend fun connect(
@@ -266,6 +275,7 @@ class NntpClient(
     suspend fun over(messageId: String): List<String> {
         checkMessageId(messageId)
         val (response, lines) = connection.commandMultiLine(NntpCommand.over(messageId))
+        if (response.code == 430) throw articleNotFound(response)
         if (response.code != 224) {
             throw NntpProtocolException("OVER failed: ${response.code} ${response.message}", response)
         }
@@ -291,6 +301,7 @@ class NntpClient(
     suspend fun hdr(field: String, messageId: String): List<String> {
         checkMessageId(messageId)
         val (response, lines) = connection.commandMultiLine(NntpCommand.hdr(field, messageId))
+        if (response.code == 430) throw articleNotFound(response)
         if (response.code != 225) {
             throw NntpProtocolException("HDR failed: ${response.code} ${response.message}", response)
         }
@@ -359,16 +370,6 @@ class NntpClient(
     }
 
     // --- Private helpers ---
-
-    /** Throws the not-found of a lookup by [messageId], without sending it, when it can't be one. */
-    private fun checkMessageId(messageId: String) {
-        if (!NntpCommand.isMessageId(messageId)) {
-            throw ArticleNotFoundException(
-                "Article not found: ${NOT_A_MESSAGE_ID.code} ${NOT_A_MESSAGE_ID.message}",
-                NOT_A_MESSAGE_ID
-            )
-        }
-    }
 
     private suspend fun fetchArticle(cmd: String, expectedCode: Int): ArticleResponse {
         val (response, lines) = connection.commandMultiLine(cmd)

@@ -14,19 +14,19 @@ A Kotlin NNTP (Network News Transfer Protocol) client library built on Ktor's as
 - Automatic pool shrinking -- excess idle connections are closed when demand drops
 - Idle connection keepalive with configurable interval
 - Automatic sleep after configurable idle grace period, with transparent wake-on-demand
-- Dead connection detection -- closed channels are detected at acquire time before leasing
+- Dead connection detection -- the keepalive checks idle connections with `DATE`, and a read that gets no data for `readTimeoutMs` fails, so dead connections are discarded
 - I/O error recovery -- TLS/socket exceptions trigger automatic reconnect and retry
 - Flow-based streaming yEnc body decoding
-- Lightweight yEnc header retrieval without downloading the full body
+- Pipelined `STAT` for checking many articles in few round trips
 - SIMD-accelerated yEnc decoding via rapidyenc native library
 - CRC32 validation for yEnc articles
 - Coroutine-based async I/O with backpressure
-- TLS support
+- TLS support, with SNI and certificate hostname verification
 - Credential storage for automatic re-authentication on reconnect
 
 ## Requirements
 
-- Java 25+
+- Java 17+ (the tests run on JDK 25)
 - Kotlin 2.3+
 
 ## Installation
@@ -73,7 +73,7 @@ println("Articles: ${group.count}, range: ${group.low}-${group.high}")
 pool.close()
 ```
 
-Connections are created on demand as requests come in, up to `maxConnections`. When demand drops, excess idle connections are automatically closed over time. If a connection fails (server close, TLS error), the pool transparently reconnects and retries with a different connection.
+Connections are created on demand as requests come in, up to `maxConnections`. When demand drops, excess idle connections are automatically closed over time. If a connection fails (server close, TLS error), the pool transparently reconnects and retries with a different connection (once by default; `commandRetries`, where `0` means no retry).
 
 ### Direct Connection
 
@@ -92,6 +92,8 @@ val client = NntpClient.connect(
 // With TLS
 val client = NntpClient.connect("news.example.com", 563, selectorManager, useTls = true)
 ```
+
+With TLS the server's certificate must be trusted and name the host you connect to (a host name, or an IP address), and the host name is sent as SNI. Pass `verifyHostname = false` (to `NntpClient.connect` or `NntpClientPool`) for a server reached by an address its certificate doesn't list: the certificate then only has to be trusted.
 
 ### Group Selection
 
@@ -114,13 +116,20 @@ val head = pool.head("<message-id@host>")
 val body = pool.body(12345L)
 
 // Check if article exists
-val stat = pool.stat("<message-id@host>")
-println("Article ${stat.articleNumber}: ${stat.messageId}")
+when (val stat = pool.stat("<message-id@host>")) {
+    is StatResult.Found -> println("Article ${stat.articleNumber}: ${stat.messageId}")
+    is StatResult.NotFound -> println("Missing: ${stat.code}")
+}
+
+// Check many articles, pipelined on one connection; onResult sees each answer as it arrives
+val results = pool.statPipelined(listOf("<a@host>", "<b@host>")) { index, result -> println("$index: $result") }
 ```
+
+A lookup by an id that can't be a message-id (`<...>` with no whitespace or control characters) is never sent: it gets the command's not-found outcome (`StatResult.NotFound`, or `ArticleNotFoundException`), and the pool doesn't take a connection for it.
 
 ### yEnc Body Decoding (Streaming)
 
-`bodyYenc()` returns a `Flow<YencEvent>` that emits a `Headers` event followed by a `Body` event containing a `ByteReadChannel` for streaming the decoded data:
+`bodyYenc()` returns a `Flow<YencEvent>` that emits a `Headers` event followed by a `Body` event containing a `ByteReadChannel` for streaming the decoded data. The channel gets the article as it is decoded:
 
 ```kotlin
 pool.bodyYenc("<yenc-message-id@host>").collect { event ->
@@ -146,25 +155,16 @@ pool.bodyYenc("<yenc-message-id@host>").collect { event ->
 }
 ```
 
-### yEnc Headers Only
-
-Retrieve just the yEnc headers (filename, size, part info) from an article body without downloading or decoding the full content. The connection automatically reconnects in the background after the headers are read.
+A connection that drops mid-article fails the read of the `Body` channel, which happens outside the pool's `withClient`, so the pool doesn't fetch the article again: the reader may already have part of it. To have it fetched again on another connection, read the body whole inside `withClient`:
 
 ```kotlin
-val headers = pool.bodyYencHeaders("<yenc-message-id@host>")
-
-println("Filename: ${headers.name}")
-println("Size: ${headers.size}")
-println("Line length: ${headers.line}")
-
-// Multipart articles also include part info
-if (headers.part != null) {
-    println("Part ${headers.part} of ${headers.total}")
-    println("Byte range: ${headers.partBegin}-${headers.partEnd}")
+val decoded: ByteArray? = pool.withClient { client ->
+    var data: ByteArray? = null
+    client.bodyYenc("<yenc-message-id@host>").collect { event ->
+        if (event is YencEvent.Body) data = event.data.toByteArray()
+    }
+    data
 }
-
-// Subsequent commands work immediately -- the pool handles reconnection transparently
-val nextHeaders = pool.bodyYencHeaders("<another-message-id@host>")
 ```
 
 ### Concurrent Downloads
@@ -183,13 +183,15 @@ val pool = NntpClientPool(
 coroutineScope {
     messageIds.map { msgId ->
         async {
-            var decoded: ByteArray? = null
-            pool.bodyYenc(msgId).collect { event ->
-                if (event is YencEvent.Body) {
-                    decoded = event.data.toByteArray()
+            pool.withClient { client ->
+                var decoded: ByteArray? = null
+                client.bodyYenc(msgId).collect { event ->
+                    if (event is YencEvent.Body) {
+                        decoded = event.data.toByteArray()
+                    }
                 }
+                decoded!!
             }
-            decoded!!
         }
     }.awaitAll()
 }
@@ -199,7 +201,7 @@ coroutineScope {
 
 The pool periodically sends `DATE` commands to keep connections alive. If no activity occurs within the idle grace period, the pool automatically closes all connections (sleeps). The next `withClient` call transparently wakes the pool.
 
-When demand drops, the pool gradually shrinks by closing excess idle connections. After 2 consecutive keepalive cycles where all connections are idle, the pool closes half the excess (keeping at least 1). This continues until the pool reaches minimum size. New connections are created again on demand when traffic increases.
+When demand drops, the pool shrinks: on each keepalive tick it closes the connections that have been idle for longer than `idleEvictionTimeoutMs` (3 minutes by default), keeping at least 1. New connections are created again on demand when traffic increases.
 
 You can also control sleep/wake explicitly:
 
@@ -211,7 +213,7 @@ pool.sleep()
 pool.wake()
 ```
 
-Set `keepaliveIntervalMs = 0` to disable keepalive, and `idleGracePeriodMs = 0` to disable automatic sleep.
+Set `keepaliveIntervalMs = 0` to disable keepalive, and `idleGracePeriodMs = 0` to disable automatic sleep. Automatic sleep and idle eviction run on the keepalive's ticks, so without keepalive the pool neither sleeps nor shrinks by itself.
 
 ### Read Timeout
 
@@ -260,12 +262,13 @@ client.close()
 | `sleep()` | Close all idle connections and stop keepalive |
 | `wake()` | Re-enable the pool (connections created on demand) |
 | `bodyYenc(messageId/number, priority = 0)` | Stream yEnc decoded body as `Flow<YencEvent>` |
-| `bodyYencHeaders(messageId/number, priority = 0)` | Retrieve yEnc headers only |
 | `group(name, priority = 0)` | Select newsgroup |
 | `article(messageId/number, priority = 0)` | Retrieve full article |
 | `head(messageId/number, priority = 0)` | Retrieve headers |
 | `body(messageId/number, priority = 0)` | Retrieve body (text) |
 | `stat(messageId/number, priority = 0)` | Check article exists |
+| `statPipelined(messageIds, priority = 0, window = 64, onResult)` | Check many articles, pipelined on one connection |
+| `connectionsOpened` | Connections opened since the pool was created |
 | `close()` | Close all connections and cancel waiters |
 
 ### NntpClient
@@ -282,8 +285,8 @@ client.close()
 | `head(messageId/number)` | Retrieve headers |
 | `body(messageId/number)` | Retrieve body (text) |
 | `bodyYenc(messageId/number)` | Stream yEnc decoded body as `Flow<YencEvent>` |
-| `bodyYencHeaders(messageId/number)` | Retrieve yEnc headers only |
 | `stat(messageId/number)` | Check article exists |
+| `statPipelined(messageIds, window = 64, onResult)` | Check many articles, pipelined |
 | `next()` / `last()` | Navigate articles |
 | `over(range/messageId)` | Overview data |
 | `xover(range)` | Extended overview |
@@ -300,23 +303,29 @@ client.close()
 
 ### Metrics
 
-The pool exposes the following Micrometer gauges (tagged with `pool.name`):
+The pool exposes the following Micrometer meters (tagged with `pool.name`):
 
 | Metric | Description |
 |--------|-------------|
 | `nntp.pool.idle` | Number of idle connections |
-| `nntp.pool.active` | Number of connections currently in use |
+| `nntp.pool.active` | Number of connections currently in use (tagged by priority) |
 | `nntp.pool.size` | Total connections (idle + active + connecting) |
-| `nntp.pool.waiters` | Number of callers waiting for a connection |
+| `nntp.pool.connecting` | Connections being opened (connect, TLS, login or retry back-off) |
+| `nntp.pool.waiters` | Number of callers waiting for a connection (tagged by priority) |
 | `nntp.pool.sleeping` | 1 if pool is sleeping, 0 otherwise |
 | `nntp.pool.acquire` | Timer for connection acquire latency (tagged by priority) |
+| `nntp.pool.acquire.failures` | Acquires that failed (tagged by priority and `reason`: `timeout`, `connect_failed`) |
+| `nntp.pool.connect.attempts` | Connects that succeeded or failed for good (tagged by `outcome`) |
+| `nntp.body.duration` | Timer for a whole yEnc `BODY`, command to article terminator |
+
+Connections also record `nntp.command.ack_latency`, the time from sending a command to its status line, tagged by `command` (not by pool).
 
 ### Thread Safety
 
 - `NntpClientPool` is safe for concurrent use from multiple coroutines
 - The pool uses `supervisorScope` to isolate failures and `NonCancellable` to ensure connections are always returned
 - When all connections are busy, waiting coroutines are dispatched by priority (higher first, FIFO within same priority). Cancelled waiters are cleaned up without leaking connections.
-- After `bodyYencHeaders()` or a cancelled `bodyYenc()`, the connection automatically reconnects in the background and re-authenticates if credentials were provided
+- A command cancelled before its answer was read (e.g. a cancelled `bodyYenc()` or `stat()`) has the rest of the answer read off before its connection is reused, for up to 3 s; a connection that can't be brought back in step that way (a multi-line answer cut short, a pipelined `STAT` batch owing many answers) is closed, and a new one is opened on demand
 - I/O errors (e.g., `ClosedWriteChannelException` from TLS) trigger automatic reconnect and retry with a different connection
 - Each `NntpClient` instance is safe for sequential use from any coroutine
 - A single `SelectorManager` can be shared across all connections
@@ -332,5 +341,6 @@ The pool exposes the following Micrometer gauges (tagged with `pool.name`):
 ## Dependencies
 
 - Ktor Network 3.4.1
-- rapidyenc-kotlin-wrapper 0.1.3
+- rapidyenc-kotlin-wrapper 0.3.0
 - Kotlin Coroutines 1.10.1
+- Micrometer 1.14.4
