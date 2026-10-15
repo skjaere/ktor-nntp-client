@@ -326,9 +326,7 @@ class NntpClient(
                 initialResponse
             )
         }
-        connection.writeLine(dotStuff(article))
-        connection.writeLine(".")
-        return connection.readResponse()
+        return connection.sendArticle(dotStuff(article))
     }
 
     // RFC 3977 §3.1.1: any line in a multi-line data block that begins with "." must

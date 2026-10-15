@@ -96,6 +96,31 @@ class NntpConnection private constructor(
      */
     private var pendingStatusLines: Int = 0
 
+    /**
+     * What the server still owes for the command in flight ([command], [commandMultiLine],
+     * [commandRaw]'s status line, POST/IHAVE, AUTHINFO), from just before it's written until
+     * its response has been read. A cancellation in between leaves it on the wire;
+     * [drainUntilArticleEnd] reads off a single-line command's status line and gives up on
+     * anything else. The yEnc BODY path and pipelined STATs keep their own books
+     * ([bodyInProgress], [pendingStatusLines]).
+     */
+    private var inFlight = InFlight.NONE
+
+    private enum class InFlight {
+        NONE,
+
+        /** One status line and nothing after it. */
+        STATUS_LINE,
+
+        /**
+         * A response with a data block, a POST's article, a login, or [commandRaw]'s status
+         * line, which the caller follows up. No drain brings these back in step for sure: a
+         * cancelled readLine drops the part of a line it had read, which may be the start of
+         * the status line or of the terminator.
+         */
+        UNRECOVERABLE
+    }
+
     internal fun markPipelined(lines: Int) {
         pendingStatusLines += lines
     }
@@ -300,11 +325,15 @@ class NntpConnection private constructor(
 
     /** AUTHINFO USER/PASS handshake. Caller has exclusive access via the pool. */
     private suspend fun performAuth(user: String, pass: String): NntpResponse {
+        // A login cut short or refused leaves the session half-authenticated or not at all,
+        // which no drain puts right.
+        inFlight = InFlight.UNRECOVERABLE
         writeLine(NntpCommand.authinfoUser(user))
         val userResponse = readResponse()
         if (userResponse.code == 281) {
             username = user
             password = pass
+            inFlight = InFlight.NONE
             return userResponse
         }
         if (userResponse.code != 381) {
@@ -323,6 +352,7 @@ class NntpConnection private constructor(
         }
         username = user
         password = pass
+        inFlight = InFlight.NONE
         return passResponse
     }
 
@@ -336,39 +366,59 @@ class NntpConnection private constructor(
      */
     suspend fun command(cmd: String): NntpResponse {
         val sample = Timer.start(registry)
-        writeLine(cmd)
-        val response = readResponse()
+        val response = exchange(cmd)
         sample.stop(ackLatencyTimer(cmd))
         return response
     }
 
     suspend fun commandMultiLine(cmd: String): Pair<NntpResponse, List<String>> {
         val sample = Timer.start(registry)
+        inFlight = InFlight.UNRECOVERABLE
         writeLine(cmd)
         val response = readResponse()
         // Stop the timer at the status line — that's "first byte of response".
         // The data lines that follow on a 1xx/2xx response are the body, not TTFB.
         sample.stop(ackLatencyTimer(cmd))
-        return if (response.code in 100..299) {
-            Pair(response, readMultiLineData())
-        } else {
-            Pair(response, emptyList())
-        }
+        val lines = if (response.code in 100..299) readMultiLineData() else emptyList()
+        inFlight = InFlight.NONE
+        return Pair(response, lines)
     }
 
     /**
      * Send a command and read the initial status line. The caller is responsible for
      * consuming any remaining data via [rawReadChannel] (used by the BODY/yenc streaming
-     * path, where the body bytes follow the status line). With single-owner connections
+     * path, where the body bytes follow the status line), and for keeping track of it: this
+     * connection only knows whether the status line was read. With single-owner connections
      * there's no mutex to manage — the connection is held by the caller for the whole
      * operation.
      */
     suspend fun commandRaw(cmd: String): NntpResponse {
         val sample = Timer.start(registry)
-        writeLine(cmd)
-        val response = readResponse()
+        // What follows the status line depends on the command (a BODY's data, POST waiting for
+        // its article), so a cancellation before it's read leaves nothing a drain can rely on.
+        val response = exchange(cmd, InFlight.UNRECOVERABLE)
         sample.stop(ackLatencyTimer(cmd))
         return response
+    }
+
+    /** Writes [cmd] and reads its status line, owing [owed] in between ([inFlight]). */
+    private suspend fun exchange(cmd: String, owed: InFlight = InFlight.STATUS_LINE): NntpResponse {
+        inFlight = owed
+        writeLine(cmd)
+        val response = readResponse()
+        inFlight = InFlight.NONE
+        return response
+    }
+
+    /**
+     * After POST's or IHAVE's go-ahead: sends [article] (dot-stuffed) and the terminator, and
+     * reads the server's answer.
+     */
+    internal suspend fun sendArticle(article: String): NntpResponse {
+        // Until the terminator is on its way, the server takes whatever follows as the article.
+        inFlight = InFlight.UNRECOVERABLE
+        writeLine(article)
+        return exchange(".")
     }
 
     private val registry = Metrics.globalRegistry
@@ -473,9 +523,13 @@ class NntpConnection private constructor(
      * starts with three digits and isn't `222`, the server is done. Otherwise we keep
      * reading until we see `\r\n.\r\n`.
      *
+     * Outside a BODY, the status line a cancelled single-line command (STAT, GROUP, DATE...)
+     * still owes is read off. A command with a data block (ARTICLE, HEAD, OVER, HDR...) or a
+     * POST cut short can't be drained: see [InFlight.UNRECOVERABLE].
+     *
      * @return true if the wire is now clean and the connection is reusable, false if
-     *   the server closed mid-stream (EOF) without giving us a clean state, or the body
-     *   pump had already failed ([markBodyFailed]).
+     *   the server closed mid-stream (EOF) without giving us a clean state, the body
+     *   pump had already failed ([markBodyFailed]), or what's owed can't be drained.
      */
     suspend fun drainUntilArticleEnd(): Boolean {
         bodyFailure?.let {
@@ -491,15 +545,12 @@ class NntpConnection private constructor(
             pendingStatusLines--
         }
         // Fast-path: protocol-state check. If no body operation is in flight, the
-        // wire is line-protocol clean and there's nothing to drain. Set by
+        // wire is line-protocol clean once any other command's answer is read off. Set by
         // fetchBodyYenc BEFORE issuing the BODY command (so the flag is true even
         // for cancellations that land between the write and the response read) and
         // cleared either by the YencDecoder writer on natural body termination or by
         // this function on successful drain.
-        if (!bodyInProgress) {
-            log.debug("conn={} drain: bodyInProgress=false fast-path, wire is clean", id)
-            return true
-        }
+        if (!bodyInProgress) return drainInFlight()
         log.debug("conn={} drain: starting (bodyInProgress=true)", id)
 
         val buffer = ByteArray(8192)
@@ -542,6 +593,7 @@ class NntpConnection private constructor(
                         // NNTP server there shouldn't be any (no pipelining).
                         bodyInProgress = false
                         bodyResponseRead = false
+                        inFlight = InFlight.NONE
                         log.debug(
                             "conn={} drain: single-line {} response; wire clean after {} bytes",
                             id, code, totalRead
@@ -557,9 +609,35 @@ class NntpConnection private constructor(
             if (window.contains("\r\n.\r\n")) {
                 bodyInProgress = false
                 bodyResponseRead = false
+                // The BODY's status line, if a cancellation cut commandRaw short, was read above.
+                inFlight = InFlight.NONE
                 log.debug("conn={} drain: success after {} bytes", id, totalRead)
                 return true
             }
+        }
+    }
+
+    /** [drainUntilArticleEnd] outside a BODY: reads off the status line a command still owes. */
+    private suspend fun drainInFlight(): Boolean = when (inFlight) {
+        InFlight.NONE -> {
+            log.debug("conn={} drain: nothing in flight, wire is clean", id)
+            true
+        }
+        InFlight.STATUS_LINE -> {
+            // Whole, or what's left of it after a cancelled read: either way it ends the answer.
+            val line = timedRead { readChannel.readLine() }
+            if (line == null) {
+                log.debug("conn={} drain: EOF with a status line outstanding", id)
+                false
+            } else {
+                inFlight = InFlight.NONE
+                log.debug("conn={} drain: read off the status line owed: {}", id, line)
+                true
+            }
+        }
+        InFlight.UNRECOVERABLE -> {
+            log.debug("conn={} drain: a multi-line response or article was cut short, wire position unknown", id)
+            false
         }
     }
 
