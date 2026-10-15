@@ -7,6 +7,7 @@ import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import io.skjaere.nntp.NntpClientPool.Companion.MIN_POOL_SIZE
 import kotlin.collections.ArrayDeque
 import kotlin.collections.List
@@ -157,6 +158,14 @@ class NntpClientPool(
     @Volatile
     private var lastActivityMs = System.currentTimeMillis()
 
+    private val opened = AtomicLong()
+
+    /**
+     * Connections this pool has opened (connected, greeted and logged in) since it was created.
+     * Read it before and after an operation to see how many connects the operation waited for.
+     */
+    val connectionsOpened: Long get() = opened.get()
+
     private val poolName = "$host:$port"
 
     private val registry = Metrics.globalRegistry
@@ -261,6 +270,7 @@ class NntpClientPool(
                 null
             }
             if (client != null) {
+                opened.incrementAndGet()
                 recordConnectAttempt("success")
                 withContext(NonCancellable) { addClientToPool(client) }
             } else {

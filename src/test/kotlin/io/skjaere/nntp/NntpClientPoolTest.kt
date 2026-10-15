@@ -1515,4 +1515,42 @@ class NntpClientPoolTest {
             pool.close()
         }
     }
+
+    @Test
+    @Timeout(10, unit = TimeUnit.SECONDS)
+    fun `connectionsOpened counts the connections the pool opened, not reuses`() = runBlocking<Unit> {
+        launchCommandServer(maxAccepts = 10)
+
+        val pool = NntpClientPool(
+            host = "localhost",
+            port = serverSocket.localPort,
+            selectorManager = selectorManager,
+            maxConnections = 2,
+            scope = poolScope,
+            keepaliveIntervalMs = 0,
+            idleGracePeriodMs = 0
+        )
+        try {
+            assertEquals(0, pool.connectionsOpened)
+            // Two at once need two connections.
+            val bothHeld = CompletableDeferred<Unit>()
+            val holding = AtomicInteger()
+            coroutineScope {
+                repeat(2) {
+                    launch {
+                        pool.withClient {
+                            if (holding.incrementAndGet() == 2) bothHeld.complete(Unit)
+                            bothHeld.await()
+                        }
+                    }
+                }
+            }
+            assertEquals(2, pool.connectionsOpened)
+            // A later command reuses one of them.
+            assertTrue(pool.stat("<test@msg>") is StatResult.Found)
+            assertEquals(2, pool.connectionsOpened)
+        } finally {
+            pool.close()
+        }
+    }
 }
