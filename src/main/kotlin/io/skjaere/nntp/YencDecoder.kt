@@ -16,6 +16,9 @@ internal object YencDecoder {
     // socket read, and (b) the worst-case decoded output (yEnc encoded ≈ source size).
     private const val DECODE_BUFFER_SIZE = BUFFER_SIZE * 2
 
+    // The most decodeWhole allocates up front, for headers that claim a huge body: it grows past it.
+    private const val MAX_PRESIZE = 16 * 1024 * 1024
+
     /**
      * Stream a yenc-encoded BODY response into the producer scope. Caller has exclusive
      * ownership of [connection] for the whole BODY operation (one [NntpClientPool.withClient]
@@ -28,6 +31,30 @@ internal object YencDecoder {
     suspend fun ProducerScope<YencEvent>.decode(
         connection: NntpConnection
     ) {
+        val (headers, firstDataBytes) = readHeaders(connection)
+        send(YencEvent.Headers(headers))
+
+        val writerJob = launchWriterJob(connection, firstDataBytes)
+        send(YencEvent.Body(writerJob.channel))
+    }
+
+    /**
+     * Reads the article on [connection] whole, decoding its body straight into one array sized from
+     * its headers (grown or trimmed if they misstate it). No channel stands between the decoder and
+     * the bytes, so nothing is copied twice. The body's failures are the call's, as the Body channel's
+     * reader sees them in [decode].
+     */
+    suspend fun decodeWhole(connection: NntpConnection): YencArticle {
+        val (headers, firstDataBytes) = readHeaders(connection)
+        val body = DecodedBytes(presize(headers))
+        failingTheBody(connection) {
+            pump(connection, firstDataBytes) { decoded, length -> body.append(decoded, length) }
+        }
+        return YencArticle(headers, body.toByteArray())
+    }
+
+    /** The =ybegin (and =ypart) lines; and the first line of data when there's no =ypart, which was read in its place. */
+    private suspend fun readHeaders(connection: NntpConnection): Pair<YencHeaders, ByteArray?> {
         // Skip blank lines before =ybegin (real NNTP servers send header/body separator)
         var ybeginLine: String
         while (true) {
@@ -54,22 +81,38 @@ internal object YencDecoder {
             firstDataBytes = nextLineBytes + byteArrayOf('\r'.code.toByte(), '\n'.code.toByte())
         }
 
-        val headers = YencHeaders.parse(ybeginLine, ypartLine)
-        send(YencEvent.Headers(headers))
+        return YencHeaders.parse(ybeginLine, ypartLine) to firstDataBytes
+    }
 
-        val writerJob = launchWriterJob(connection, firstDataBytes)
-        send(YencEvent.Body(writerJob.channel))
+    /** The body's decoded size as [headers] give it: the part's, else the file's; at most [MAX_PRESIZE]. */
+    private fun presize(headers: YencHeaders): Int {
+        val part = headers.partBegin?.let { begin -> headers.partEnd?.let { end -> end - begin + 1 } }
+        return (part ?: headers.size).coerceIn(0L, MAX_PRESIZE.toLong()).toInt()
+    }
+
+    /** A body decoded into one array: sized up front, grown if the body is longer, trimmed if shorter. */
+    private class DecodedBytes(size: Int) {
+        private var bytes = ByteArray(size)
+        private var length = 0
+
+        fun append(decoded: ByteBuffer, count: Int) {
+            if (length + count > bytes.size) bytes = bytes.copyOf(maxOf(length + count, bytes.size * 2))
+            decoded.get(bytes, length, count)
+            length += count
+        }
+
+        fun toByteArray(): ByteArray = if (length == bytes.size) bytes else bytes.copyOf(length)
     }
 
     /**
-     * Read pump for one BODY response. Reuses three buffers across the article instead
-     * of allocating per-chunk:
+     * Read pump for one BODY response, handing [emit] each decoded chunk (a direct buffer and its
+     * length, valid until emit returns). Reuses three buffers across the article instead of
+     * allocating per-chunk:
      *
      *   - [readBuf]  — heap ByteArray sized to one socket read; reused indefinitely
      *   - [srcBuf]   — direct ByteBuffer fed to the yEnc decoder; carries any unconsumed
      *                  tail across iterations via [java.nio.ByteBuffer.compact]
      *   - [destBuf]  — direct ByteBuffer where rapidyenc writes decoded output
-     *   - [writeBuf] — heap ByteArray for the ktor channel write, sized to destBuf
      *
      * The previous implementation called [RapidYenc.decodeIncremental] with a [ByteArray]
      * source, which the wrapper then copied into a fresh JNA `Memory` (raw `malloc`)
@@ -86,22 +129,42 @@ internal object YencDecoder {
         connection: NntpConnection,
         firstDataBytes: ByteArray?
     ): WriterJob = writer(autoFlush = true) {
-        try {
-            pump(connection, firstDataBytes)
-        } catch (e: CancellationException) {
-            // The pool's withClient drains the rest of the article after a cancellation.
-            throw e
-        } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
-            // The writer only stores this in the Body channel, so mark the connection for
-            // the pool to see.
-            connection.markBodyFailed(e)
-            throw e
+        // A heap ByteArray for the ktor channel write, sized to the decoder's output: ktor 3.x's
+        // stable cross-version write surface is ByteArray-based.
+        val writeBuf = ByteArray(DECODE_BUFFER_SIZE)
+        // The writer only keeps a failure in the Body channel: marked, the pool sees it too.
+        failingTheBody(connection) {
+            pump(connection, firstDataBytes) { decoded, length ->
+                decoded.get(writeBuf, 0, length)
+                channel.writeFully(writeBuf, 0, length)
+                // Hand the reader each chunk as it's decoded. Ktor 3's writer ignores autoFlush,
+                // and its channel flushes by itself only every 1 MiB, more than a whole article:
+                // without this the reader gets nothing until the pump ends. Still suspends while
+                // the reader is 1 MiB behind.
+                channel.flush()
+            }
         }
     }
 
-    private suspend fun WriterScope.pump(connection: NntpConnection, firstDataBytes: ByteArray?) {
+    /**
+     * Runs [block], a body's pump, marking [connection]'s body failed if it fails other than by
+     * cancellation (after which the pool's withClient drains the rest of the article).
+     */
+    private inline fun <T> failingTheBody(connection: NntpConnection, block: () -> T): T = try {
+        block()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
+        connection.markBodyFailed(e)
+        throw e
+    }
+
+    private suspend fun pump(
+        connection: NntpConnection,
+        firstDataBytes: ByteArray?,
+        emit: suspend (decoded: ByteBuffer, length: Int) -> Unit,
+    ) {
         val readBuf = ByteArray(BUFFER_SIZE)
-        val writeBuf = ByteArray(DECODE_BUFFER_SIZE)
         val srcBuf = ByteBuffer.allocateDirect(DECODE_BUFFER_SIZE)
         val destBuf = ByteBuffer.allocateDirect(DECODE_BUFFER_SIZE)
         var decoderState = RapidYencDecoderState.CRLF
@@ -137,18 +200,9 @@ internal object YencDecoder {
             if (result.bytesWritten > 0) {
                 destBuf.flip()
                 val outLen = destBuf.remaining()
-                // CRC over the still-direct buffer (no copy), then drain into a heap
-                // ByteArray for the ktor channel write — ktor 3.x's stable cross-version
-                // write surface is ByteArray-based, and the per-iteration heap copy here
-                // is reusable + bounded so it's cheap relative to what we removed.
+                // CRC over the still-direct buffer (no copy), then out to the caller.
                 crc = RapidYenc.crc32(destBuf, length = outLen, initCrc = crc)
-                destBuf.get(writeBuf, 0, outLen)
-                channel.writeFully(writeBuf, 0, outLen)
-                // Hand the reader each chunk as it's decoded. Ktor 3's writer ignores autoFlush,
-                // and its channel flushes by itself only every 1 MiB, more than a whole article:
-                // without this the reader gets nothing until the pump ends. Still suspends while
-                // the reader is 1 MiB behind.
-                channel.flush()
+                emit(destBuf, outLen)
             }
 
             decoderState = result.state

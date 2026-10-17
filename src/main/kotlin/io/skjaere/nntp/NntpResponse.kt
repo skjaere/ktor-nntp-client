@@ -53,6 +53,9 @@ sealed interface YencEvent {
     data class Body(val data: ByteReadChannel) : YencEvent
 }
 
+/** A yEnc article read whole ([NntpClient.bodyYencBytes]): its headers and its decoded body. */
+class YencArticle(val headers: YencHeaders, val data: ByteArray)
+
 internal fun parseResponseLine(line: String): NntpResponse {
     if (line.length < 3) {
         throw NntpProtocolException("Invalid response line: $line")

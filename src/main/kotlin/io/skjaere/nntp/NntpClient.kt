@@ -224,6 +224,18 @@ class NntpClient(
     fun bodyYenc(number: Long): Flow<YencEvent> =
         fetchBodyYenc(NntpCommand.body(number))
 
+    /**
+     * The article [messageId] whole: its yEnc headers and decoded body, for a caller that wants it
+     * all before using any. Fails as [bodyYenc]'s Body channel would: [ArticleNotFoundException] on
+     * 430, [NntpConnectionException] when the connection closes mid-article, [YencCrcMismatchException]
+     * once the article has been read to its end.
+     */
+    suspend fun bodyYencBytes(messageId: String): YencArticle {
+        checkMessageId(messageId)
+        startBody(NntpCommand.body(messageId))
+        return YencDecoder.decodeWhole(connection)
+    }
+
     // --- Group selection ---
 
     suspend fun group(name: String): GroupResponse {
@@ -421,6 +433,16 @@ class NntpClient(
     }
 
     private fun fetchBodyYenc(cmd: String): Flow<YencEvent> = channelFlow {
+        startBody(cmd)
+        // 222 received — body bytes about to flow. The matching markBodyConsumed runs
+        // inside the YencDecoder writer once the article terminator is read off the
+        // wire (NOT here, because decode returns as soon as it has sent the Body event
+        // while the writer is still streaming body bytes asynchronously).
+        with(YencDecoder) { decode(connection) }
+    }
+
+    /** Sends [cmd], a BODY, and reads its status line: on 222 the article follows, else it throws (430: not found). */
+    private suspend fun startBody(cmd: String) {
         // Set the flag BEFORE issuing the command. Once BODY is on the wire the server
         // WILL send a response (222+body, or 430/5xx single line); if a cancellation
         // lands between this writeLine and the readResponse below, we still have to
@@ -451,10 +473,5 @@ class NntpClient(
                 response
             )
         }
-        // 222 received — body bytes about to flow. The matching markBodyConsumed runs
-        // inside the YencDecoder writer once the article terminator is read off the
-        // wire (NOT here, because decode returns as soon as it has sent the Body event
-        // while the writer is still streaming body bytes asynchronously).
-        with(YencDecoder) { decode(connection) }
     }
 }
