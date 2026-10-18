@@ -1,6 +1,7 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.SelectorManager
+import io.ktor.utils.io.toByteArray
 import io.skjaere.yenc.RapidYenc
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
@@ -212,6 +213,47 @@ class NntpWholeBodyTest {
         client().use { client ->
             assertContentEquals(data, client.bodyYencBytes("<no-crc@test>").data)
             assertTrue(client.connection.isReusable)
+        }
+    }
+
+    /**
+     * The decoder's buffers are the connection's, which reads one body at a time. Allocated for each
+     * article, a 128 KB read buffer and two 256 KB direct buffers (Java heap on ART), and a 256 KB
+     * array to write the Body channel from, they were 0.17 MB for every MB a stream read, more for
+     * small articles (library issue K42). Counted on the calling thread, where the decoder runs.
+     */
+    @Test
+    fun `small articles on one connection allocate about their own size each`() = runBlocking<Unit> {
+        val bodies = List(40) { Random(20 + it).nextBytes(16_000) }
+        serve(*bodies.map { body -> { out: OutputStream -> out.write(article(body)) } }.toTypedArray())
+        val threads = ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+        client().use { client ->
+            // The first bodies load and compile what decoding needs: only the rest are counted.
+            repeat(10) { assertContentEquals(bodies[it], client.bodyYencBytes("<warm-up-$it@test>").data) }
+            val before = threads.getThreadAllocatedBytes(Thread.currentThread().id)
+            for (i in 10 until 40) assertContentEquals(bodies[i], client.bodyYencBytes("<small-$i@test>").data)
+            val perBody = (threads.getThreadAllocatedBytes(Thread.currentThread().id) - before) / 30
+            assertTrue(perBody < 4 * 16_000, "$perBody bytes allocated for each 16,000-byte body")
+        }
+    }
+
+    /** As above, through the Body channel ([NntpClient.bodyYenc]), its writer on the calling thread too. */
+    @Test
+    fun `small articles streamed on one connection allocate about their own size each`() = runBlocking<Unit> {
+        val bodies = List(40) { Random(60 + it).nextBytes(16_000) }
+        serve(*bodies.map { body -> { out: OutputStream -> out.write(article(body)) } }.toTypedArray())
+        val threads = ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+        client().use { client ->
+            suspend fun streamed(id: String): ByteArray {
+                var data: ByteArray? = null
+                client.bodyYenc(id).collect { event -> if (event is YencEvent.Body) data = event.data.toByteArray() }
+                return assertNotNull(data, "no Body event for $id")
+            }
+            repeat(10) { assertContentEquals(bodies[it], streamed("<warm-up-$it@test>")) }
+            val before = threads.getThreadAllocatedBytes(Thread.currentThread().id)
+            for (i in 10 until 40) assertContentEquals(bodies[i], streamed("<small-$i@test>"))
+            val perBody = (threads.getThreadAllocatedBytes(Thread.currentThread().id) - before) / 30
+            assertTrue(perBody < 4 * 16_000, "$perBody bytes allocated for each 16,000-byte body")
         }
     }
 

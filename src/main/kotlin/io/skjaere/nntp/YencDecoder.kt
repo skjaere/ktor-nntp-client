@@ -101,6 +101,27 @@ internal object YencDecoder {
         return (part ?: headers.size).coerceIn(0L, MAX_PRESIZE.toLong()).toInt()
     }
 
+    /**
+     * A connection's decode buffers, kept from one BODY to the next as it reads one at a time
+     * ([NntpConnection.decodeBuffers]). Allocated for each article they were 0.17 MB for every MB
+     * streamed, more for small articles, on ART all of it Java heap (library issue K42).
+     *
+     *   - [readBuf]  — heap ByteArray sized to one socket read
+     *   - [srcBuf]   — direct ByteBuffer fed to the yEnc decoder; carries any unconsumed
+     *                  tail across iterations via [java.nio.ByteBuffer.compact]
+     *   - [destBuf]  — direct ByteBuffer where rapidyenc writes decoded output
+     *   - [writeBuf] — heap ByteArray the Body channel is written from, sized to the decoder's
+     *                  output; made by the first BODY streamed through one
+     */
+    internal class Buffers {
+        val readBuf = ByteArray(BUFFER_SIZE)
+        val srcBuf: ByteBuffer = ByteBuffer.allocateDirect(DECODE_BUFFER_SIZE)
+        val destBuf: ByteBuffer = ByteBuffer.allocateDirect(DECODE_BUFFER_SIZE)
+
+        // One BODY at a time, each handed over through the pool: no lock needed.
+        val writeBuf: ByteArray by lazy(LazyThreadSafetyMode.NONE) { ByteArray(DECODE_BUFFER_SIZE) }
+    }
+
     /** A body decoded into one array: sized up front, grown if the body is longer, trimmed if shorter. */
     private class DecodedBytes(size: Int) {
         private var bytes = ByteArray(size)
@@ -117,13 +138,8 @@ internal object YencDecoder {
 
     /**
      * Read pump for one BODY response, handing [emit] each decoded chunk (a direct buffer and its
-     * length, valid until emit returns). Reuses three buffers across the article instead of
-     * allocating per-chunk:
-     *
-     *   - [readBuf]  — heap ByteArray sized to one socket read; reused indefinitely
-     *   - [srcBuf]   — direct ByteBuffer fed to the yEnc decoder; carries any unconsumed
-     *                  tail across iterations via [java.nio.ByteBuffer.compact]
-     *   - [destBuf]  — direct ByteBuffer where rapidyenc writes decoded output
+     * length, valid until emit returns). Reads and decodes through its connection's [Buffers]
+     * instead of allocating per chunk or per article.
      *
      * The previous implementation called [RapidYenc.decodeIncremental] with a [ByteArray]
      * source, which the wrapper then copied into a fresh JNA `Memory` (raw `malloc`)
@@ -143,7 +159,7 @@ internal object YencDecoder {
     ): WriterJob = writer(autoFlush = true) {
         // A heap ByteArray for the ktor channel write, sized to the decoder's output: ktor 3.x's
         // stable cross-version write surface is ByteArray-based.
-        val writeBuf = ByteArray(DECODE_BUFFER_SIZE)
+        val writeBuf = connection.decodeBuffers().writeBuf
         // The writer only keeps a failure in the Body channel: marked, the pool sees it too.
         failingTheBody(connection) {
             val mismatch = pump(connection, firstDataBytes, part) { decoded, length ->
@@ -183,9 +199,12 @@ internal object YencDecoder {
         part: Boolean,
         emit: suspend (decoded: ByteBuffer, length: Int) -> Unit,
     ): CrcMismatch? {
-        val readBuf = ByteArray(BUFFER_SIZE)
-        val srcBuf = ByteBuffer.allocateDirect(DECODE_BUFFER_SIZE)
-        val destBuf = ByteBuffer.allocateDirect(DECODE_BUFFER_SIZE)
+        val buffers = connection.decodeBuffers()
+        val readBuf = buffers.readBuf
+        val srcBuf = buffers.srcBuf
+        val destBuf = buffers.destBuf
+        // Emptied of what the last body's pump left in it: its end, and what came after it.
+        srcBuf.clear()
         var decoderState = RapidYencDecoderState.CRLF
         var crc = 0u
         var eof = false
@@ -241,7 +260,7 @@ internal object YencDecoder {
                     // connection stays reusable and we don't need the pool to discard a perfectly
                     // healthy socket just because a single article had a bad CRC. (The pool's
                     // withClient still discards it if this read fails.)
-                    val tail = readToArticleEnd(connection, remaining)
+                    val tail = readToArticleEnd(connection, remaining, readBuf)
                     if (tail.ended) {
                         // Wire is now line-protocol clean — flag the connection reusable.
                         // Done HERE rather than in fetchBodyYenc because the decoder body
@@ -287,16 +306,19 @@ internal object YencDecoder {
     /** What followed the "=y" rapidyenc stopped at: its [yendLine] (null if cut short), and whether the article terminator [ended] it. */
     private class Tail(val yendLine: String?, val ended: Boolean)
 
-    /** Reads up to the article terminator, from [alreadyRead], the bytes after the "=y" rapidyenc stopped at. */
+    /**
+     * Reads up to the article terminator, from [alreadyRead], the bytes after the "=y" rapidyenc
+     * stopped at, into [buffer] (the pump's read buffer, which it no longer needs).
+     */
     private suspend fun readToArticleEnd(
         connection: NntpConnection,
-        alreadyRead: ByteArray
+        alreadyRead: ByteArray,
+        buffer: ByteArray,
     ): Tail {
         val accumulator = StringBuilder(String(alreadyRead, Charsets.ISO_8859_1))
         // Continue reading until we find the article end marker
         var ended = accumulator.contains("\r\n.\r\n")
-        val buffer = if (ended) null else ByteArray(BUFFER_SIZE)
-        while (buffer != null && !ended) {
+        while (!ended) {
             val bytesRead = connection.readAvailable(buffer)
             if (bytesRead == -1) break
             accumulator.append(String(buffer, 0, bytesRead, Charsets.ISO_8859_1))

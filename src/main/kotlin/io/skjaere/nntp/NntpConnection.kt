@@ -91,6 +91,14 @@ class NntpConnection private constructor(
     @Volatile
     private var bodyStartSample: Timer.Sample? = null
 
+    // The yEnc decoder's buffers, kept for the next BODY as a connection reads one at a time;
+    // dropped on close, so a connection let go of doesn't keep them while something holds it.
+    @Volatile
+    private var decodeBuffers: YencDecoder.Buffers? = null
+
+    /** The yEnc decoder's buffers ([YencDecoder.Buffers]): made by the first BODY, used again by the next. */
+    internal fun decodeBuffers(): YencDecoder.Buffers = decodeBuffers ?: YencDecoder.Buffers().also { decodeBuffers = it }
+
     /**
      * Status lines still owed by the server for pipelined single-line commands (see
      * [NntpClient.statPipelined]). A cancellation mid-pipeline leaves these on the wire;
@@ -704,6 +712,7 @@ class NntpConnection private constructor(
             runCatching { socket.close() }.onFailure {
                 log.warn("Socket close failed for {}:{}: {}", host, port, it.message, it)
             }
+            decodeBuffers = null
         }
     }
 
