@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStream
+import java.lang.management.BufferPoolMXBean
 import java.lang.management.ManagementFactory
 import java.net.ServerSocket
 import kotlin.random.Random
@@ -220,7 +221,8 @@ class NntpWholeBodyTest {
      * The decoder's buffers are the connection's, which reads one body at a time. Allocated for each
      * article, a 128 KB read buffer and two 256 KB direct buffers (Java heap on ART), and a 256 KB
      * array to write the Body channel from, they were 0.17 MB for every MB a stream read, more for
-     * small articles (library issue K42). Counted on the calling thread, where the decoder runs.
+     * small articles (library issue K42). Counted on the calling thread, where the decoder runs; the
+     * direct buffers are counted apart, as the JVM keeps them off its heap ([directGrowth]).
      */
     @Test
     fun `small articles on one connection allocate about their own size each`() = runBlocking<Unit> {
@@ -231,9 +233,10 @@ class NntpWholeBodyTest {
             // The first bodies load and compile what decoding needs: only the rest are counted.
             repeat(10) { assertContentEquals(bodies[it], client.bodyYencBytes("<warm-up-$it@test>").data) }
             val before = threads.getThreadAllocatedBytes(Thread.currentThread().id)
-            for (i in 10 until 40) assertContentEquals(bodies[i], client.bodyYencBytes("<small-$i@test>").data)
+            val direct = directGrowth { for (i in 10 until 40) assertContentEquals(bodies[i], client.bodyYencBytes("<small-$i@test>").data) }
             val perBody = (threads.getThreadAllocatedBytes(Thread.currentThread().id) - before) / 30
             assertTrue(perBody < 4 * 16_000, "$perBody bytes allocated for each 16,000-byte body")
+            assertTrue(direct < DECODE_BUFFER, "$direct bytes of direct buffers allocated for 30 bodies")
         }
     }
 
@@ -251,11 +254,25 @@ class NntpWholeBodyTest {
             }
             repeat(10) { assertContentEquals(bodies[it], streamed("<warm-up-$it@test>")) }
             val before = threads.getThreadAllocatedBytes(Thread.currentThread().id)
-            for (i in 10 until 40) assertContentEquals(bodies[i], streamed("<small-$i@test>"))
+            val direct = directGrowth { for (i in 10 until 40) assertContentEquals(bodies[i], streamed("<small-$i@test>")) }
             val perBody = (threads.getThreadAllocatedBytes(Thread.currentThread().id) - before) / 30
             assertTrue(perBody < 4 * 16_000, "$perBody bytes allocated for each 16,000-byte body")
+            assertTrue(direct < DECODE_BUFFER, "$direct bytes of direct buffers allocated for 30 bodies")
         }
     }
+
+    /**
+     * How much the JVM's direct buffers grew by while [block] ran. ThreadMXBean doesn't count them:
+     * on HotSpot they are native memory, but for a small object each. The decoder's are the larger
+     * part of what an article allocated, and on ART they are Java heap.
+     */
+    private suspend fun directGrowth(block: suspend () -> Unit): Long {
+        val before = directBuffers.totalCapacity
+        block()
+        return directBuffers.totalCapacity - before
+    }
+
+    private val directBuffers = ManagementFactory.getPlatformMXBeans(BufferPoolMXBean::class.java).first { it.name == "direct" }
 
     /**
      * Decoded straight into the array its headers size: about one body's worth allocated on the
@@ -276,5 +293,10 @@ class NntpWholeBodyTest {
             assertContentEquals(data, article.data)
             assertTrue(allocated < data.size * 3 / 2, "$allocated bytes allocated for a ${data.size}-byte body")
         }
+    }
+
+    private companion object {
+        /** One of the decoder's direct buffers (256 KB). */
+        const val DECODE_BUFFER = 256L * 1024
     }
 }
