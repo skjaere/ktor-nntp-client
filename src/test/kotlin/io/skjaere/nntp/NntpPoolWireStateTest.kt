@@ -1,6 +1,7 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.SelectorManager
+import io.skjaere.yenc.RapidYenc
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -19,6 +20,7 @@ import java.io.OutputStream
 import java.net.ServerSocket
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
@@ -512,6 +514,33 @@ class NntpPoolWireStateTest {
             assertIs<NntpProtocolException>(failure)
 
             assertIs<StatResult.Found>(pool.stat("<test@msg>"))
+            assertEquals(1, accepted.get(), "the connection should have been reused")
+        } finally {
+            pool.close()
+        }
+    }
+
+    /**
+     * A body whose CRC doesn't match fails only once it has been read to the article terminator:
+     * the wire is in step, and the connection stays pooled, not reconnected for every damaged copy.
+     */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a body whose CRC doesn't match keeps its connection`() = runBlocking<Unit> {
+        val data = "a damaged copy of an article".toByteArray()
+        val accepted = launchServer { _, cmd, _, out ->
+            val crc = if (cmd == "BODY <damaged@test>") RapidYenc.crc32(data) xor 1u else RapidYenc.crc32(data)
+            val encoded = String(RapidYenc.encode(data), Charsets.ISO_8859_1).removeSuffix("\r\n")
+            out.write("222 0 body follows\r\n=ybegin line=128 size=${data.size} name=data.bin\r\n".toByteArray())
+            out.write(encoded.toByteArray(Charsets.ISO_8859_1))
+            out.send("", "=yend size=${data.size} crc32=${crc.toString(16).padStart(8, '0')}", ".")
+        }
+        val pool = pool(commandRetries = 0)
+        pool.wake()
+        try {
+            assertFailsWith<YencCrcMismatchException> { pool.withClient { it.bodyYencBytes("<damaged@test>") } }
+
+            assertContentEquals(data, pool.withClient { it.bodyYencBytes("<good@test>") }.data)
             assertEquals(1, accepted.get(), "the connection should have been reused")
         } finally {
             pool.close()

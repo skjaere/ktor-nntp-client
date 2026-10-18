@@ -893,6 +893,12 @@ class NntpClientPool(
                     // out of step before, as checked above for a normal return.
                     if (client?.connection?.isReusable == false) dead = true
                     throw e
+                } catch (e: YencCrcMismatchException) {
+                    // A damaged copy of the article: the decoder throws it only once it has read
+                    // the article to its terminator, so the wire is clean and the connection stays,
+                    // unless the connection closed before the terminator, which isReusable says.
+                    if (client?.connection?.isReusable == false) dead = true
+                    throw e
                 } catch (e: CancellationException) {
                     // Mid-block cancellation (e.g. an outer withTimeout firing while a
                     // bodyYenc stream is still reading article bytes off the wire) leaves
@@ -953,7 +959,7 @@ class NntpClientPool(
                     throw e
                 } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
                     // Anything else — NntpConnectionException, IOException, NntpProtocolException,
-                    // YencDecodingException, YencCrcMismatchException, decode/parse errors,
+                    // YencDecodingException, decode/parse errors,
                     // unexpected runtime exceptions — leaves the wire state unknown. Discard
                     // so a polluted connection can't cascade through the pool. (NntpProtocol-
                     // Exception in particular surfaces when we read a response and get yenc

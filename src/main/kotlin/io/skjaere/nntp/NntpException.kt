@@ -32,8 +32,15 @@ open class YencDecodingException(
     cause: Throwable? = null
 ) : NntpException(message, cause = cause)
 
-class YencCrcMismatchException(
+/**
+ * A body whose CRC, [actual], isn't the one its =yend line gives, [expected]: a damaged copy of the
+ * article. Thrown once the article has been read to its end. [article] is the article, decoded whole,
+ * when it was read whole ([NntpClient.bodyYencBytes]); null from the Body channel, whose reader had
+ * its bytes as they came.
+ */
+class YencCrcMismatchException @JvmOverloads constructor(
     message: String,
     val expected: UInt,
-    val actual: UInt
+    val actual: UInt,
+    val article: YencArticle? = null,
 ) : YencDecodingException(message)

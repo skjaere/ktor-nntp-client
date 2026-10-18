@@ -17,6 +17,7 @@ import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
@@ -59,17 +60,31 @@ class NntpWholeBodyTest {
         }.start()
     }
 
-    /** A yEnc article as a server sends it after "222": [ypart] for one part of a larger file; [crc] what =yend claims. */
-    private fun article(data: ByteArray, size: Long = data.size.toLong(), ypart: LongRange? = null, crc: UInt = RapidYenc.crc32(data)): ByteArray {
+    /**
+     * A yEnc article as a server sends it after "222": [ypart] for one part of a larger file; [crc] what
+     * =yend claims the body's CRC is (a part's pcrc32, else its crc32; none if null), and [fileCrc] the
+     * whole file's, which a part's =yend may give as its crc32.
+     */
+    private fun article(
+        data: ByteArray,
+        size: Long = data.size.toLong(),
+        ypart: LongRange? = null,
+        crc: UInt? = RapidYenc.crc32(data),
+        fileCrc: UInt? = null,
+    ): ByteArray {
         val encoded = RapidYenc.encode(data)
+        fun hex(crc: UInt) = crc.toString(16).padStart(8, '0')
         val text = buildString {
             append("222 body follows\r\n")
             if (ypart == null) append("=ybegin line=128 size=$size name=data.bin\r\n")
             else append("=ybegin part=2 total=9 line=128 size=${size * 9} name=data.bin\r\n=ypart begin=${ypart.first} end=${ypart.last}\r\n")
             append(String(encoded, Charsets.ISO_8859_1))
             if (!endsWith("\r\n")) append("\r\n")
-            val crcName = if (ypart == null) "crc32" else "pcrc32"
-            append("=yend size=${data.size} $crcName=${crc.toString(16).padStart(8, '0')}\r\n")
+            append("=yend size=${data.size}")
+            if (ypart != null) append(" part=2")
+            crc?.let { append(if (ypart == null) " crc32=${hex(it)}" else " pcrc32=${hex(it)}") }
+            fileCrc?.let { append(" crc32=${hex(it)}") }
+            append("\r\n")
             append(".\r\n")
         }
         return text.toByteArray(Charsets.ISO_8859_1)
@@ -133,6 +148,70 @@ class NntpWholeBodyTest {
         client().use { client ->
             assertFailsWith<NntpConnectionException> { client.bodyYencBytes("<cut@test>") }
             assertFalse(client.connection.isReusable)
+        }
+    }
+
+    /** The article is read to its end first, so the connection can go on. */
+    @Test
+    fun `a CRC mismatch fails once the article is read to its end`() = runBlocking<Unit> {
+        val data = Random(5).nextBytes(10_000)
+        val next = "the next article".toByteArray()
+        serve({ it.write(article(data, crc = RapidYenc.crc32(data) xor 1u)) }, { it.write(article(next)) })
+        client().use { client ->
+            assertFailsWith<YencCrcMismatchException> { client.bodyYencBytes("<bad@test>") }
+            assertContentEquals(next, client.bodyYencBytes("<next@test>").data)
+        }
+    }
+
+    /** Read whole, the damaged copy comes with the failure: a caller that has no better one may use it. */
+    @Test
+    fun `a CRC mismatch carries the article it was read whole`() = runBlocking<Unit> {
+        val data = Random(12).nextBytes(300_000)
+        serve({ it.write(article(data, crc = RapidYenc.crc32(data) xor 1u)) })
+        client().use { client ->
+            val e = assertFailsWith<YencCrcMismatchException> { client.bodyYencBytes("<bad@test>") }
+            assertEquals(RapidYenc.crc32(data) xor 1u, e.expected)
+            assertEquals(RapidYenc.crc32(data), e.actual)
+            val article = assertNotNull(e.article, "the mismatch should carry the article")
+            assertEquals("data.bin", article.headers.name)
+            assertContentEquals(data, article.data)
+        }
+    }
+
+    @Test
+    fun `a part whose pcrc32 doesn't match fails once it is read to its end`() = runBlocking<Unit> {
+        val data = Random(8).nextBytes(10_000)
+        val next = "the next article".toByteArray()
+        serve(
+            { it.write(article(data, ypart = 10_001L..20_000L, crc = RapidYenc.crc32(data) xor 1u, fileCrc = RapidYenc.crc32(data))) },
+            { it.write(article(next)) },
+        )
+        client().use { client ->
+            val e = assertFailsWith<YencCrcMismatchException> { client.bodyYencBytes("<bad-part@test>") }
+            assertEquals(RapidYenc.crc32(data), e.actual)
+            assertContentEquals(next, client.bodyYencBytes("<next@test>").data)
+        }
+    }
+
+    /** A part's =yend may give the whole file's CRC as its crc32: only its pcrc32 is the part's. */
+    @Test
+    fun `a part is checked against its pcrc32, not the file's crc32`() = runBlocking<Unit> {
+        val data = Random(9).nextBytes(10_000)
+        val fileCrc = RapidYenc.crc32(data) xor 0x5a5a5a5au
+        serve({ it.write(article(data, ypart = 10_001L..20_000L, fileCrc = fileCrc)) }, { it.write(article(data, ypart = 10_001L..20_000L, crc = null, fileCrc = fileCrc)) })
+        client().use { client ->
+            assertContentEquals(data, client.bodyYencBytes("<part@test>").data)
+            assertContentEquals(data, client.bodyYencBytes("<part-without-pcrc32@test>").data)
+        }
+    }
+
+    @Test
+    fun `an article whose =yend gives no CRC is taken as it is`() = runBlocking<Unit> {
+        val data = Random(10).nextBytes(10_000)
+        serve({ it.write(article(data, crc = null)) })
+        client().use { client ->
+            assertContentEquals(data, client.bodyYencBytes("<no-crc@test>").data)
+            assertTrue(client.connection.isReusable)
         }
     }
 

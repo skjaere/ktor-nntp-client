@@ -228,7 +228,8 @@ class NntpClient(
      * The article [messageId] whole: its yEnc headers and decoded body, for a caller that wants it
      * all before using any. Fails as [bodyYenc]'s Body channel would: [ArticleNotFoundException] on
      * 430, [NntpConnectionException] when the connection closes mid-article, [YencCrcMismatchException]
-     * once the article has been read to its end.
+     * once the article has been read to its end, the article on it ([YencCrcMismatchException.article]),
+     * for a caller with no better copy.
      */
     suspend fun bodyYencBytes(messageId: String): YencArticle {
         checkMessageId(messageId)

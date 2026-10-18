@@ -26,15 +26,18 @@ internal object YencDecoder {
      * up and the pool discards the connection. A failure of the body pump (socket error,
      * the reader cancelling the Body channel) doesn't propagate: Ktor 3's writer keeps it
      * in the Body channel, where the reader sees it, and completes normally. The pump marks
-     * the connection instead ([NntpConnection.markBodyFailed]), and the pool discards it.
+     * the connection instead ([NntpConnection.markBodyFailed]), and the pool discards it. A body
+     * whose CRC doesn't match its =yend line's closes the channel with a [YencCrcMismatchException]
+     * as its cause once the article has been read to its end, every byte written to the channel
+     * first; the connection goes on. Ktor drops what its reader hasn't taken of them by then.
      */
     suspend fun ProducerScope<YencEvent>.decode(
         connection: NntpConnection
     ) {
-        val (headers, firstDataBytes) = readHeaders(connection)
+        val (headers, firstDataBytes, part) = readHeaders(connection)
         send(YencEvent.Headers(headers))
 
-        val writerJob = launchWriterJob(connection, firstDataBytes)
+        val writerJob = launchWriterJob(connection, firstDataBytes, part)
         send(YencEvent.Body(writerJob.channel))
     }
 
@@ -42,19 +45,27 @@ internal object YencDecoder {
      * Reads the article on [connection] whole, decoding its body straight into one array sized from
      * its headers (grown or trimmed if they misstate it). No channel stands between the decoder and
      * the bytes, so nothing is copied twice. The body's failures are the call's, as the Body channel's
-     * reader sees them in [decode].
+     * reader sees them in [decode]; a [YencCrcMismatchException] carries the article.
      */
     suspend fun decodeWhole(connection: NntpConnection): YencArticle {
-        val (headers, firstDataBytes) = readHeaders(connection)
+        val (headers, firstDataBytes, part) = readHeaders(connection)
         val body = DecodedBytes(presize(headers))
-        failingTheBody(connection) {
-            pump(connection, firstDataBytes) { decoded, length -> body.append(decoded, length) }
+        val mismatch = failingTheBody(connection) {
+            pump(connection, firstDataBytes, part) { decoded, length -> body.append(decoded, length) }
         }
-        return YencArticle(headers, body.toByteArray())
+        val article = YencArticle(headers, body.toByteArray())
+        mismatch?.let { throw it.toException(article) }
+        return article
     }
 
-    /** The =ybegin (and =ypart) lines; and the first line of data when there's no =ypart, which was read in its place. */
-    private suspend fun readHeaders(connection: NntpConnection): Pair<YencHeaders, ByteArray?> {
+    /**
+     * An article's =ybegin (and =ypart) lines, as [headers]; [firstDataBytes], the first line of data
+     * when there's no =ypart, which was read in its place; and whether it is a [part] of a larger
+     * file (there is a =ypart line), whose =yend gives the part's CRC as its pcrc32.
+     */
+    private data class Start(val headers: YencHeaders, val firstDataBytes: ByteArray?, val part: Boolean)
+
+    private suspend fun readHeaders(connection: NntpConnection): Start {
         // Skip blank lines before =ybegin (real NNTP servers send header/body separator)
         var ybeginLine: String
         while (true) {
@@ -81,7 +92,7 @@ internal object YencDecoder {
             firstDataBytes = nextLineBytes + byteArrayOf('\r'.code.toByte(), '\n'.code.toByte())
         }
 
-        return YencHeaders.parse(ybeginLine, ypartLine) to firstDataBytes
+        return Start(YencHeaders.parse(ybeginLine, ypartLine), firstDataBytes, part = ypartLine != null)
     }
 
     /** The body's decoded size as [headers] give it: the part's, else the file's; at most [MAX_PRESIZE]. */
@@ -127,14 +138,15 @@ internal object YencDecoder {
      */
     private fun ProducerScope<YencEvent>.launchWriterJob(
         connection: NntpConnection,
-        firstDataBytes: ByteArray?
+        firstDataBytes: ByteArray?,
+        part: Boolean,
     ): WriterJob = writer(autoFlush = true) {
         // A heap ByteArray for the ktor channel write, sized to the decoder's output: ktor 3.x's
         // stable cross-version write surface is ByteArray-based.
         val writeBuf = ByteArray(DECODE_BUFFER_SIZE)
         // The writer only keeps a failure in the Body channel: marked, the pool sees it too.
         failingTheBody(connection) {
-            pump(connection, firstDataBytes) { decoded, length ->
+            val mismatch = pump(connection, firstDataBytes, part) { decoded, length ->
                 decoded.get(writeBuf, 0, length)
                 channel.writeFully(writeBuf, 0, length)
                 // Hand the reader each chunk as it's decoded. Ktor 3's writer ignores autoFlush,
@@ -143,6 +155,8 @@ internal object YencDecoder {
                 // the reader is 1 MiB behind.
                 channel.flush()
             }
+            // Every byte is in the channel by now: the writer closes it with this as its cause.
+            mismatch?.let { throw it.toException(article = null) }
         }
     }
 
@@ -159,11 +173,16 @@ internal object YencDecoder {
         throw e
     }
 
+    /**
+     * Returns the body's CRC mismatch with its =yend line, if any, for the caller to throw once it
+     * has the body: [part] says which of the line's CRCs is the body's ([crcMismatch]).
+     */
     private suspend fun pump(
         connection: NntpConnection,
         firstDataBytes: ByteArray?,
+        part: Boolean,
         emit: suspend (decoded: ByteBuffer, length: Int) -> Unit,
-    ) {
+    ): CrcMismatch? {
         val readBuf = ByteArray(BUFFER_SIZE)
         val srcBuf = ByteBuffer.allocateDirect(DECODE_BUFFER_SIZE)
         val destBuf = ByteBuffer.allocateDirect(DECODE_BUFFER_SIZE)
@@ -209,32 +228,21 @@ internal object YencDecoder {
 
             when (result.end) {
                 RapidYencDecoderEnd.CONTROL -> {
-                    // Found =yend line — parse trailer for CRC validation. The unconsumed
-                    // tail of srcBuf (from its current position to limit) is the bytes
-                    // after =yend, including potentially the trailer line and the article
-                    // terminator. Pull them out as a ByteArray so the rest of this branch
-                    // can stay character-oriented.
+                    // Found the =yend line: rapidyenc stops just past its "=y", so the unconsumed
+                    // tail of srcBuf (from its current position to limit) is the rest of that line
+                    // ("end size=... crc32=...") and what follows it, the article terminator, or
+                    // only some of them so far. Pull them out as a ByteArray so the rest of this
+                    // branch can stay character-oriented.
                     val remaining = ByteArray(srcBuf.remaining())
                     srcBuf.get(remaining)
-                    val remainingStr = String(remaining, Charsets.ISO_8859_1)
-                    val yendLine = remainingStr.lines()
-                        .firstOrNull { it.startsWith("=yend") }
-                    val crcMismatch = if (yendLine != null) {
-                        val trailer = YencTrailer.parse(yendLine)
-                        val expectedCrc = trailer.pcrc32 ?: trailer.crc32
-                        if (expectedCrc != null && expectedCrc != crc) expectedCrc to crc
-                        else null
-                    } else null
 
-                    // Drain remaining bytes until the NNTP article terminator BEFORE
-                    // throwing. By the time we get here we already have everything we
-                    // need to detect the CRC mismatch; deferring the throw until after
-                    // the wire is clean means the connection stays reusable and we
-                    // don't need the pool to discard a perfectly healthy socket just
-                    // because a single article had a bad CRC. (The pool's catch-all in
-                    // withClient will still discard if drain itself fails — it only
-                    // gives up the discard if everything below this line succeeds.)
-                    if (drainUntilArticleEnd(connection, remaining)) {
+                    // Read on to the NNTP article terminator BEFORE the CRC is compared, the =yend
+                    // line whole with it. A mismatch is then thrown with the wire clean, so the
+                    // connection stays reusable and we don't need the pool to discard a perfectly
+                    // healthy socket just because a single article had a bad CRC. (The pool's
+                    // withClient still discards it if this read fails.)
+                    val tail = readToArticleEnd(connection, remaining)
+                    if (tail.ended) {
                         // Wire is now line-protocol clean — flag the connection reusable.
                         // Done HERE rather than in fetchBodyYenc because the decoder body
                         // returns as soon as it has sent the Body event, while the writer
@@ -250,21 +258,13 @@ internal object YencDecoder {
                             NntpConnectionException("Connection closed before the article terminator")
                         )
                     }
-
-                    crcMismatch?.let { (expected, actual) ->
-                        throw YencCrcMismatchException(
-                            "CRC mismatch: expected ${expected.toString(16)}, got ${actual.toString(16)}",
-                            expected = expected,
-                            actual = actual
-                        )
-                    }
-                    break
+                    return crcMismatch(tail.yendLine, part, crc)
                 }
 
                 RapidYencDecoderEnd.ARTICLE -> {
-                    // Found \r\n.\r\n — article end. Wire is clean.
+                    // Found \r\n.\r\n — article end, with no =yend line to check it by. Wire is clean.
                     connection.markBodyConsumed()
-                    break
+                    return null
                 }
 
                 RapidYencDecoderEnd.NONE -> {
@@ -284,24 +284,55 @@ internal object YencDecoder {
     private fun closedMidArticle() =
         NntpConnectionException("Connection closed mid-article, before =yend or the article terminator")
 
-    /** Reads up to the article terminator; false if the connection closed before it. */
-    private suspend fun drainUntilArticleEnd(
+    /** What followed the "=y" rapidyenc stopped at: its [yendLine] (null if cut short), and whether the article terminator [ended] it. */
+    private class Tail(val yendLine: String?, val ended: Boolean)
+
+    /** Reads up to the article terminator, from [alreadyRead], the bytes after the "=y" rapidyenc stopped at. */
+    private suspend fun readToArticleEnd(
         connection: NntpConnection,
         alreadyRead: ByteArray
-    ): Boolean {
-        // Check if the article terminator is already in what we've read
-        val str = String(alreadyRead, Charsets.ISO_8859_1)
-        if (str.contains("\r\n.\r\n") || str.endsWith("\r\n.\r\n")) {
-            return true
-        }
+    ): Tail {
+        val accumulator = StringBuilder(String(alreadyRead, Charsets.ISO_8859_1))
         // Continue reading until we find the article end marker
-        val buffer = ByteArray(BUFFER_SIZE)
-        val accumulator = StringBuilder(str)
-        while (true) {
+        var ended = accumulator.contains("\r\n.\r\n")
+        val buffer = if (ended) null else ByteArray(BUFFER_SIZE)
+        while (buffer != null && !ended) {
             val bytesRead = connection.readAvailable(buffer)
-            if (bytesRead == -1) return false
+            if (bytesRead == -1) break
             accumulator.append(String(buffer, 0, bytesRead, Charsets.ISO_8859_1))
-            if (accumulator.contains("\r\n.\r\n")) return true
+            ended = accumulator.contains("\r\n.\r\n")
         }
+        // A line the connection closed in the middle of says nothing for sure.
+        val lineEnd = accumulator.indexOf("\r\n")
+        return Tail(if (lineEnd < 0) null else "=y" + accumulator.substring(0, lineEnd), ended)
+    }
+
+    /** A body's CRC, [actual], that isn't the one its =yend line gives, [expected]. */
+    private class CrcMismatch(val expected: UInt, val actual: UInt) {
+        fun toException(article: YencArticle?) = YencCrcMismatchException(
+            "CRC mismatch: expected ${expected.toString(16)}, got ${actual.toString(16)}",
+            expected = expected,
+            actual = actual,
+            article = article,
+        )
+    }
+
+    /**
+     * [crc], the body's, against the one [yendLine] gives: a part's against its pcrc32 only, as its
+     * crc32 is then the whole file's; a single part's against its crc32. Null when they match, or
+     * when there is nothing to compare it with: no =yend line, no CRC on it, or a line that can't
+     * be read (the body is then taken as it is, as when there's no =yend line at all).
+     */
+    private fun crcMismatch(yendLine: String?, part: Boolean, crc: UInt): CrcMismatch? {
+        if (yendLine == null || !yendLine.startsWith("=yend")) return null
+        val trailer = try {
+            YencTrailer.parse(yendLine)
+        } catch (_: YencDecodingException) {
+            return null
+        } catch (_: NumberFormatException) {
+            return null
+        }
+        val expected = (if (part) trailer.pcrc32 else trailer.crc32) ?: return null
+        return if (expected == crc) null else CrcMismatch(expected, crc)
     }
 }

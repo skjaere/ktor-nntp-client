@@ -362,6 +362,71 @@ class NntpClientTest {
     }
 
 
+    /**
+     * A body whose CRC doesn't match comes through the Body channel as it's decoded, all of it, and
+     * the channel then closes with the mismatch as its cause, once the article has been read to its
+     * end: the connection goes on. The server holds back the =yend line until the reader has every byte.
+     */
+    @Test
+    fun `bodyYenc's Body channel closes with a CRC mismatch after all the bytes`() = runBlocking<Unit> {
+        val originalData = kotlin.random.Random(11).nextBytes(100_000)
+        val next = "the next article".toByteArray()
+        fun body(data: ByteArray) = buildString {
+            append("222 body follows\r\n")
+            append("=ybegin line=128 size=${data.size} name=damaged.bin\r\n")
+            append(String(RapidYenc.encode(data), Charsets.ISO_8859_1))
+            if (!endsWith("\r\n")) append("\r\n")
+        }.toByteArray(Charsets.ISO_8859_1)
+        fun trailer(data: ByteArray, crc: UInt) =
+            "=yend size=${data.size} crc32=${crc.toString(16).padStart(8, '0')}\r\n.\r\n".toByteArray()
+        val sendTrailer = CountDownLatch(1)
+
+        launchServer { reader, out ->
+            reader.readLine()
+            out.write(body(originalData))
+            out.flush()
+            sendTrailer.await(10, TimeUnit.SECONDS)
+            out.write(trailer(originalData, RapidYenc.crc32(originalData) xor 1u))
+            out.flush()
+            reader.readLine()
+            out.write(body(next) + trailer(next, RapidYenc.crc32(next)))
+            out.flush()
+            reader.readLine()
+        }
+
+        val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
+        try {
+            val decoded = java.io.ByteArrayOutputStream()
+            var failure: Throwable? = null
+            client.bodyYenc("<damaged@msg>").collect { event ->
+                if (event is YencEvent.Body) {
+                    val buffer = ByteArray(8192)
+                    try {
+                        while (true) {
+                            val n = event.data.readAvailable(buffer)
+                            if (n == -1) break
+                            decoded.write(buffer, 0, n)
+                            if (decoded.size() == originalData.size) sendTrailer.countDown()
+                        }
+                    } catch (e: java.io.IOException) {
+                        failure = e
+                    }
+                    // A channel closed with a cause reads as ended (-1) when it closed between reads.
+                    failure = failure ?: event.data.closedCause
+                }
+            }
+            assertContentEquals(originalData, decoded.toByteArray())
+            assertTrue(
+                generateSequence(failure) { it.cause }.any { it is YencCrcMismatchException },
+                "the Body channel should close with the CRC mismatch, got $failure"
+            )
+            assertContentEquals(next, client.bodyYencBytes("<next@msg>").data)
+        } finally {
+            sendTrailer.countDown()
+            client.close()
+        }
+    }
+
     @Test
     fun `concurrent bodyYenc on multiple connections`() = runTest {
         val originalData = "Concurrent test data".toByteArray()
