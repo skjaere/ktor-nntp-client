@@ -120,9 +120,8 @@ internal class TlsNntpServer(keyStore: Path) : Closeable {
         val keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
             .apply { init(keys, PASSWORD.toCharArray()) }.keyManagers
         val context = SSLContext.getInstance("TLS").apply { init(keyManagers, null, null) }
-        // Ktor's TLS client speaks TLS 1.2 only.
-        serverSocket = (context.serverSocketFactory.createServerSocket(0) as SSLServerSocket)
-            .apply { enabledProtocols = arrayOf("TLSv1.2") }
+        // The JDK's protocols, TLS 1.3 among them, which the client then chooses.
+        serverSocket = context.serverSocketFactory.createServerSocket(0) as SSLServerSocket
         Thread {
             while (true) {
                 val socket = try {

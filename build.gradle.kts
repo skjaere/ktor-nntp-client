@@ -14,6 +14,7 @@ repositories {
 
 dependencies {
     api(libs.ktor.network)
+    // No longer used here (TLS is the platform's): kept so consumers' classpaths stay as they were until a release drops it.
     api(libs.ktor.network.tls)
     api(libs.ktor.io)
     api(libs.micrometer.core)

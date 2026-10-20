@@ -528,7 +528,10 @@ class NntpConnection private constructor(
         result.copyOf(result.size - 1)
     }
 
-    /** The socket's read channel. Reads through it aren't bounded by the read timeout. */
+    /**
+     * The connection's read channel, TLS's with TLS. A read through it that waits for the server is bounded by the read
+     * timeout, as every read on the socket is, but its failures aren't recorded as the connection's.
+     */
     val rawReadChannel: ByteReadChannel get() = readChannel
 
     suspend fun writeLine(line: String) {
