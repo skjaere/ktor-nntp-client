@@ -24,6 +24,7 @@ dependencies {
     testImplementation(libs.kotlin.test)
     testImplementation(libs.junit.jupiter)
     testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.logback.classic)
     testImplementation(libs.mock.nntp.testcontainer)
     testImplementation(libs.testcontainers)
     testImplementation(libs.testcontainers.junit.jupiter)

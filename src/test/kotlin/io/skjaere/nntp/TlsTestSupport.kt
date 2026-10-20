@@ -1,19 +1,24 @@
 package io.skjaere.nntp
 
+import java.io.BufferedReader
 import java.io.Closeable
 import java.io.IOException
+import java.io.OutputStream
+import java.net.ServerSocket
 import java.net.Socket
 import java.nio.file.Files
 import java.nio.file.Path
 import java.security.KeyStore
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.ExtendedSSLSession
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 import kotlin.test.fail
 
 private const val PASSWORD = "changeit"
@@ -158,6 +163,93 @@ internal class TlsNntpServer(keyStore: Path) : Closeable {
             } catch (_: IOException) {
                 // The client refused the certificate, or went away.
             }
+        }
+    }
+
+    override fun close() {
+        serverSocket.close()
+    }
+}
+
+/**
+ * A TLS NNTP server for the transport's tests, presenting the certificate in [keyStore] over [protocols]. Greets each
+ * connection whose handshake completes (unless [greet] is false), then hands it to [serve], and closes it with TLS's
+ * close_notify when [serve] returns. With [handshake] false it accepts connections and never answers them, the TLS
+ * handshake included. TLS is layered over a plain socket, so a connection can also end without close_notify.
+ */
+internal class ScriptedTlsServer(
+    keyStore: Path,
+    private val protocols: Array<String> = arrayOf("TLSv1.2"),
+    private val greet: Boolean = true,
+    private val handshake: Boolean = true,
+    private val serve: (TlsSession) -> Unit = {},
+) : Closeable {
+
+    /** One connection: what the client sent ([reader]) and the way back ([out]), over TLS. */
+    class TlsSession(private val tls: SSLSocket, private val tcp: Socket) {
+        val reader: BufferedReader = tls.inputStream.bufferedReader(Charsets.ISO_8859_1)
+        val out: OutputStream = tls.outputStream
+
+        /** Ends the connection as TLS means it to end: close_notify, then the TCP close. */
+        fun closeWithNotify() = tls.close()
+
+        /** Ends the TCP connection with no close_notify, as a server that crashed or a cut network does. */
+        fun closeWithoutNotify() = tcp.close()
+    }
+
+    private val serverSocket = ServerSocket(0)
+    private val factory: SSLSocketFactory
+
+    /** Connections accepted, handshake completed or not. */
+    val accepted get() = acceptedCount.get()
+    private val acceptedCount = AtomicInteger()
+
+    /** The protocol each completed handshake chose, in order: TLSv1.2 or TLSv1.3. */
+    val negotiated = CopyOnWriteArrayList<String>()
+
+    val port: Int get() = serverSocket.localPort
+
+    init {
+        val keys = KeyStore.getInstance("PKCS12").apply {
+            Files.newInputStream(keyStore).use { load(it, PASSWORD.toCharArray()) }
+        }
+        val keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+            .apply { init(keys, PASSWORD.toCharArray()) }.keyManagers
+        factory = SSLContext.getInstance("TLS").apply { init(keyManagers, null, null) }.socketFactory
+        Thread {
+            while (true) {
+                val tcp = try {
+                    serverSocket.accept()
+                } catch (_: IOException) {
+                    break
+                }
+                acceptedCount.incrementAndGet()
+                Thread { handle(tcp) }.apply { isDaemon = true }.start()
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    private fun handle(tcp: Socket) {
+        try {
+            if (!handshake) {
+                // Holds the connection open, reading what the client sends, until it goes away.
+                tcp.use { it.getInputStream().readAllBytes() }
+                return
+            }
+            val tls = (factory.createSocket(tcp, null, false) as SSLSocket).apply { enabledProtocols = protocols }
+            tls.startHandshake()
+            negotiated.add(tls.session.protocol)
+            val session = TlsSession(tls, tcp)
+            if (greet) {
+                session.out.write("200 welcome\r\n".toByteArray())
+                session.out.flush()
+            }
+            serve(session)
+            tls.close()
+        } catch (_: IOException) {
+            // The client refused the certificate, or went away.
+        } finally {
+            runCatching { tcp.close() }
         }
     }
 

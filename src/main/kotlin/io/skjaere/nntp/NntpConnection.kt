@@ -5,7 +5,6 @@ import io.ktor.network.sockets.Socket
 import io.ktor.network.sockets.aSocket
 import io.ktor.network.sockets.openReadChannel
 import io.ktor.network.sockets.openWriteChannel
-import io.ktor.network.tls.tls
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.readAvailable
@@ -15,8 +14,6 @@ import io.ktor.utils.io.writeStringUtf8
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CoroutineExceptionHandler
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
@@ -43,6 +40,8 @@ class NntpConnection private constructor(
     private val socket: Socket,
     private val readChannel: ByteReadChannel,
     private val writeChannel: ByteWriteChannel,
+    // With TLS, the session [readChannel] and [writeChannel] run through.
+    private val tls: PlatformTls?,
     val welcomeResponse: NntpResponse,
     private val readTimeoutMs: Long,
     // The pool.name tag of this connection's metrics.
@@ -95,6 +94,9 @@ class NntpConnection private constructor(
     // dropped on close, so a connection let go of doesn't keep them while something holds it.
     @Volatile
     private var decodeBuffers: YencDecoder.Buffers? = null
+
+    /** With TLS, the protocol and cipher suite its handshake chose ([PlatformTls.description]); null without. */
+    internal val tlsDescription: String? get() = tls?.description
 
     /** The yEnc decoder's buffers ([YencDecoder.Buffers]): made by the first BODY, used again by the next. */
     internal fun decodeBuffers(): YencDecoder.Buffers = decodeBuffers ?: YencDecoder.Buffers().also { decodeBuffers = it }
@@ -267,6 +269,8 @@ class NntpConnection private constructor(
          *   TCP connection after a network change. An idle timeout, not a deadline: a long
          *   BODY or pipelined STAT batch that keeps receiving bytes never times out, and an
          *   idle connection with no read pending is never affected. 0 or less disables it.
+         * @param useTls TLS from the platform (Conscrypt on Android, the JDK's elsewhere): 1.3 when the
+         *   server offers it, else 1.2. Its handshake's reads are bounded by [readTimeoutMs] too.
          * @param verifyHostname with [useTls], check that the server's certificate names [host]
          *   (a host name, or an IP address) and send a host name as the server name (SNI). Off,
          *   the certificate only has to be trusted, whatever host it names, and no server name
@@ -293,21 +297,22 @@ class NntpConnection private constructor(
             verifyHostname: Boolean,
             poolName: String
         ): NntpConnection {
-            val socket = try {
-                openSocket(host, port, selectorManager, useTls, verifyHostname)
+            val transport = try {
+                openTransport(host, port, selectorManager, useTls, verifyHostname, readTimeoutMs)
             } catch (e: UnresolvedAddressException) {
                 throw NntpConnectionException("Unknown host $host", e)
             } catch (e: IOException) {
+                // The TLS handshake's failures among them (SSLException), the trust manager's
+                // CertificateException as their cause.
                 throw NntpConnectionException("Could not connect to $host:$port: ${e.message}", e)
             } catch (e: GeneralSecurityException) {
-                // Ktor's TLS handshake lets the trust manager's CertificateException through.
+                // No TLS context to be had (NoSuchAlgorithmException, KeyManagementException).
                 throw NntpConnectionException("Could not connect to $host:$port: ${e.message}", e)
             }
-            // Anything that throws between openSocket and a successful return must close
+            // Anything that throws between openTransport and a successful return must close
             // the socket; otherwise its FD is held by the JVM until process exit.
             try {
-                val readChannel = socket.openReadChannel()
-                val writeChannel = socket.openWriteChannel(autoFlush = true)
+                val readChannel = transport.read
                 val welcomeLine = withReadTimeout(readChannel, readTimeoutMs, host, port) { readChannel.readLine() }
                     ?: throw NntpConnectionException("Connection closed before welcome message")
                 val welcomeResponse = parseResponseLine(welcomeLine)
@@ -318,51 +323,52 @@ class NntpConnection private constructor(
                     )
                 }
                 return NntpConnection(
-                    host, port, socket, readChannel, writeChannel, welcomeResponse, readTimeoutMs, poolName
+                    host, port, transport.socket, readChannel, transport.write, transport.tls, welcomeResponse,
+                    readTimeoutMs, poolName
                 )
             } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
-                runCatching { socket.socketContext.cancel() }
-                runCatching { socket.close() }
+                transport.abandon()
                 throw e
             }
         }
 
-        // Ktor's TLS actors run in this context. With CBC cipher suites they call
-        // generateNonce(), which runBlocking-waits on a nonce producer that runs on
-        // Dispatchers.Default. If the actors also ran on Default, a few concurrent handshakes
-        // would occupy every Default worker (one per CPU core, so 4 on many phones) and the
-        // producer could never run: a deadlock that surfaces as connect timeouts. IO threads
-        // are meant for blocking calls and leave Default's workers free.
-        private val tlsContext = Dispatchers.IO + CoroutineExceptionHandler { _, throwable ->
-            log.debug("TLS actor terminated: {}", throwable.message)
+        /** A connected socket and the channels the connection reads and writes: through [tls], with TLS. */
+        private class Transport(
+            val socket: Socket,
+            val read: ByteReadChannel,
+            val write: ByteWriteChannel,
+            val tls: PlatformTls?
+        ) {
+            /** Closes what a connect that failed after it was opened leaves. */
+            fun abandon() {
+                runCatching { socket.socketContext.cancel() }
+                runCatching { socket.close() }
+                tls?.let { runCatching { it.release() } }
+            }
         }
 
-        private suspend fun openSocket(
+        private suspend fun openTransport(
             host: String,
             port: Int,
             selectorManager: SelectorManager,
             useTls: Boolean,
-            verifyHostname: Boolean
-        ): Socket {
-            log.debug("openSocket called with host='{}', port={}, useTls={}", host, port, useTls)
-            val rawSocket = aSocket(selectorManager).tcp().connect(host, port)
-            return if (useTls) {
-                // TLS handshake can fail (cert mismatch, server abort, network); the raw
-                // TCP socket below is already open and would otherwise leak.
-                try {
-                    rawSocket.tls(coroutineContext = tlsContext) {
-                        if (verifyHostname) {
-                            // SNI names a host without a trailing dot; an IP address isn't one (RFC 6066 §3).
-                            if (ipAddress(host) == null) serverName = host.trimEnd('.')
-                            trustManager = HostnameVerifyingTrustManager(HostnameVerifyingTrustManager.platformDefault(), host)
-                        }
-                    }
-                } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
-                    runCatching { rawSocket.close() }
-                    throw e
+            verifyHostname: Boolean,
+            readTimeoutMs: Long
+        ): Transport {
+            log.debug("openTransport called with host='{}', port={}, useTls={}", host, port, useTls)
+            val socket = aSocket(selectorManager).tcp().connect(host, port)
+            val plain = Transport(socket, socket.openReadChannel(), socket.openWriteChannel(autoFlush = true), null)
+            if (!useTls) return plain
+            // The TLS handshake can fail (a certificate refused, the server's abort, the network); the TCP
+            // socket is open already and would otherwise leak.
+            return try {
+                val tls = PlatformTls.connect(host, port, verifyHostname, plain.read, plain.write) { read ->
+                    withReadTimeout(plain.read, readTimeoutMs, host, port, read)
                 }
-            } else {
-                rawSocket
+                Transport(socket, tls.read, tls.write, tls)
+            } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
+                plain.abandon()
+                throw e
             }
         }
     }
@@ -712,6 +718,7 @@ class NntpConnection private constructor(
             runCatching { socket.close() }.onFailure {
                 log.warn("Socket close failed for {}:{}: {}", host, port, it.message, it)
             }
+            tls?.let { runCatching { it.release() } }
             decodeBuffers = null
         }
     }

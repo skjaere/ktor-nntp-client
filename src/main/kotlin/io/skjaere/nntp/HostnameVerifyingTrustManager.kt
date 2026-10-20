@@ -15,8 +15,10 @@ import javax.net.ssl.X509TrustManager
  * address. The subject's common name doesn't count (RFC 6125 §6.4.4), as in browsers and
  * Android.
  *
- * Ktor 3.4 checks the name itself when given a server name, but passes a certificate that
- * lists no DNS names (or, for an IP address, no IP addresses) whatever it was issued for.
+ * The platform's TLS checks a name only when asked to (an endpoint identification algorithm),
+ * by its own rules and in its own words; this check's words are the ones the app shows. Ktor
+ * 3.4's TLS, used before, passed a certificate that lists no DNS names (or, for an IP address,
+ * no IP addresses) whatever it was issued for.
  */
 internal class HostnameVerifyingTrustManager(
     private val delegate: X509TrustManager,
@@ -51,7 +53,7 @@ internal class HostnameVerifyingTrustManager(
         private const val IP_ADDRESS = 7
         private const val NAMES_IN_MESSAGE = 5
 
-        /** The platform's default trust manager: the one Ktor's TLS uses when given none. */
+        /** The platform's default trust manager: the system's certificate authorities, or what the app configured. */
         fun platformDefault(): X509TrustManager =
             TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
                 .apply { init(null as KeyStore?) }

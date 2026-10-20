@@ -6,6 +6,7 @@ import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import io.skjaere.nntp.NntpClientPool.Companion.MIN_POOL_SIZE
@@ -197,6 +198,10 @@ class NntpClientPool(
 
     private val opened = AtomicLong()
 
+    // Set once a connection's TLS session has been logged: which protocol and suite a provider chose
+    // says much about its speed (CBC or GCM, 1.2 or 1.3), but once for the pool is enough.
+    private val tlsLogged = AtomicBoolean(false)
+
     // Until when new connections wait after a rejected connect; see CONNECT_REJECTED_BACKOFF_MS.
     @Volatile
     private var connectRejectedUntilMs = 0L
@@ -332,6 +337,9 @@ class NntpClientPool(
             }
             opened.incrementAndGet()
             recordConnectAttempt("success")
+            client.connection.tlsDescription?.let { tls ->
+                if (tlsLogged.compareAndSet(false, true)) logger.debug("Pool {} negotiated {}", poolName, tls)
+            }
             withContext(NonCancellable) {
                 connectSucceeded(launched)
                 addClientToPool(client)

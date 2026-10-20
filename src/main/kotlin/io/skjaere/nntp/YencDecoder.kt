@@ -298,8 +298,8 @@ internal object YencDecoder {
         }
     }
 
-    // EOF mid-article: the server closed the connection, or under TLS anything that ended
-    // it (Ktor reports a FIN, a reset and a missing close_notify alike as EOF).
+    // EOF mid-article: the server closed the connection, under TLS with its close_notify or
+    // without (PlatformTls takes a FIN without one for the end of the stream, as Ktor's TLS did).
     private fun closedMidArticle() =
         NntpConnectionException("Connection closed mid-article, before =yend or the article terminator")
 

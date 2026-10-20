@@ -21,7 +21,7 @@ A Kotlin NNTP (Network News Transfer Protocol) client library built on Ktor's as
 - SIMD-accelerated yEnc decoding via rapidyenc native library
 - CRC32 validation for yEnc articles
 - Coroutine-based async I/O with backpressure
-- TLS support, with SNI and certificate hostname verification
+- TLS from the platform (Conscrypt on Android, the JDK's on a JVM), 1.3 when the server offers it, with SNI and certificate hostname verification
 - Credential storage for automatic re-authentication on reconnect
 
 ## Requirements
@@ -92,6 +92,8 @@ val client = NntpClient.connect(
 // With TLS
 val client = NntpClient.connect("news.example.com", 563, selectorManager, useTls = true)
 ```
+
+TLS is the platform's (`javax.net.ssl`), run in the connection's own reads and writes: TLS 1.3 when the server offers it, else 1.2, with the platform's trust store and cipher suites. A pool logs the protocol and suite its first connection negotiated, at DEBUG.
 
 With TLS the server's certificate must be trusted and name the host you connect to (a host name, or an IP address), and the host name is sent as SNI. Pass `verifyHostname = false` (to `NntpClient.connect` or `NntpClientPool`) for a server reached by an address its certificate doesn't list: the certificate then only has to be trusted.
 
@@ -326,7 +328,7 @@ Connections also record `nntp.command.ack_latency`, the time from sending a comm
 - The pool uses `supervisorScope` to isolate failures and `NonCancellable` to ensure connections are always returned
 - When all connections are busy, waiting coroutines are dispatched by priority (higher first, FIFO within same priority). Cancelled waiters are cleaned up without leaking connections.
 - A command cancelled before its answer was read (e.g. a cancelled `bodyYenc()` or `stat()`) has the rest of the answer read off before its connection is reused, for up to 3 s; a cancelled `statPipelined()` returns at once and its answers are read off on the pool's scope. A connection that can't be brought back in step that way (a multi-line answer cut short, answers that don't come within the 3 s) is closed, and a new one is opened on demand
-- I/O errors (e.g., `ClosedWriteChannelException` from TLS) trigger automatic reconnect and retry with a different connection
+- I/O errors (e.g., an `SSLException` from TLS, or a `ClosedByteChannelException` once the server has closed the connection) trigger automatic reconnect and retry with a different connection
 - Each `NntpClient` instance is safe for sequential use from any coroutine
 - A single `SelectorManager` can be shared across all connections
 

@@ -1,5 +1,8 @@
 package io.skjaere.nntp
 
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
 import io.ktor.network.selector.SelectorManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -7,8 +10,11 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.AfterEach
@@ -16,7 +22,9 @@ import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
+import org.slf4j.LoggerFactory
 import java.security.cert.CertificateException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -128,6 +136,14 @@ class NntpTlsTest {
         }
     }
 
+    @Test
+    fun `with hostname verification off no server name is sent`() = runBlocking<Unit> {
+        TlsNntpServer(certificates.keyStore("localhost")).use { server ->
+            NntpClient.connect("localhost", server.port, selectorManager, useTls = true, verifyHostname = false).close()
+            assertEquals(listOf(emptyList()), server.requestedServerNames, "server names asked for")
+        }
+    }
+
     /**
      * Ktor checks the host name against the certificate's DNS names only when there are
      * some: a certificate that lists none (a common name only, or IP addresses only) would
@@ -201,6 +217,93 @@ class NntpTlsTest {
                 }
             }
         }
+
+    /** Answers STAT and QUIT on a [ScriptedTlsServer] connection until the client goes away. */
+    private val answeringStat: (ScriptedTlsServer.TlsSession) -> Unit = { session ->
+        while (true) {
+            val command = session.reader.readLine() ?: break
+            session.out.write((if (command == "QUIT") "205 bye\r\n" else "223 0 <a@b> exists\r\n").toByteArray())
+            session.out.flush()
+            if (command == "QUIT") break
+        }
+    }
+
+    /** TLS 1.3, which the platform's TLS speaks and Ktor's doesn't. */
+    @Test
+    fun `the newest TLS version a server offers is used`() = runBlocking<Unit> {
+        ScriptedTlsServer(certificates.keyStore("localhost"), protocols = arrayOf("TLSv1.2", "TLSv1.3")).use { server ->
+            NntpClient.connect("localhost", server.port, selectorManager, useTls = true).close()
+            assertEquals(listOf("TLSv1.3"), server.negotiated, "the protocol the handshake chose")
+        }
+    }
+
+    @Test
+    fun `a server that speaks only TLS 1_3 is reached`() = runBlocking<Unit> {
+        ScriptedTlsServer(certificates.keyStore("localhost"), protocols = arrayOf("TLSv1.3"), serve = answeringStat).use { server ->
+            NntpClient.connect("localhost", server.port, selectorManager, useTls = true).use { client ->
+                assertIs<StatResult.Found>(client.stat("<a@b>"))
+            }
+        }
+    }
+
+    /** The handshake's reads are the connection's reads: a server that goes silent in it is given up on as in any other. */
+    @Test
+    fun `a server that never answers the handshake fails the connect after the read timeout`() = runBlocking<Unit> {
+        ScriptedTlsServer(certificates.keyStore("localhost"), handshake = false).use { server ->
+            var failure: Throwable? = null
+            val finished = withTimeoutOrNull(5_000) {
+                failure = runCatching {
+                    NntpConnection.connect("localhost", server.port, selectorManager, useTls = true, readTimeoutMs = 300).close()
+                }.exceptionOrNull()
+            }
+            assertNotNull(finished, "the connect was still waiting for the handshake after 5 s")
+            assertIs<NntpConnectionException>(failure)
+        }
+    }
+
+    /** What a provider's TLS chose is worth a line when looking into its speed, but one per pool, not one per connection. */
+    @Test
+    fun `a pool logs the protocol and suite its connections negotiated once`() = runBlocking<Unit> {
+        val logger = LoggerFactory.getLogger(NntpClientPool::class.java) as ch.qos.logback.classic.Logger
+        val appender = ListAppender<ILoggingEvent>().apply { start() }
+        val level = logger.level
+        logger.level = Level.DEBUG
+        logger.addAppender(appender)
+        try {
+            val protocols = arrayOf("TLSv1.2", "TLSv1.3")
+            ScriptedTlsServer(certificates.keyStore("localhost"), protocols = protocols, serve = answeringStat).use { server ->
+                val pool = NntpClientPool(
+                    host = "localhost", port = server.port, selectorManager = selectorManager, useTls = true,
+                    maxConnections = 2, scope = poolScope, keepaliveIntervalMs = 0, idleGracePeriodMs = 0
+                )
+                try {
+                    // Two connections, each held until both are open.
+                    val bothOpen = CountDownLatch(2)
+                    coroutineScope {
+                        repeat(2) {
+                            launch {
+                                pool.withClient { client ->
+                                    bothOpen.countDown()
+                                    withContext(Dispatchers.IO) { bothOpen.await(5, TimeUnit.SECONDS) }
+                                    client.stat("<a@b>")
+                                }
+                            }
+                        }
+                    }
+                    assertEquals(2, server.accepted, "connections opened")
+                    val protocol = server.negotiated.first()
+                    val lines = appender.list.filter { it.level == Level.DEBUG }.map { it.formattedMessage }.filter { protocol in it }
+                    assertEquals(1, lines.size, "lines naming the protocol: $lines")
+                    assertTrue("TLS_" in lines.single(), "the line should name the suite: ${lines.single()}")
+                } finally {
+                    pool.close()
+                }
+            }
+        } finally {
+            logger.detachAppender(appender)
+            logger.level = level
+        }
+    }
 
     @Test
     fun `a certificate's DNS name matches the host ignoring case and a trailing dot`() {
