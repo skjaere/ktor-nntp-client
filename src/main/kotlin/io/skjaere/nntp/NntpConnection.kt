@@ -3,12 +3,14 @@ package io.skjaere.nntp
 import io.ktor.network.selector.SelectorManager
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
+import io.ktor.utils.io.ClosedByteChannelException
 import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.readByte
 import io.ktor.utils.io.readLine
 import io.ktor.utils.io.writeStringUtf8
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
+import java.io.EOFException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
@@ -175,13 +177,31 @@ class NntpConnection private constructor(
         return cause
     }
 
-    /** Runs [block], recording anything it throws but a cancellation as the connection's [failure]. */
+    /**
+     * Runs [block], recording anything it throws but a cancellation as the connection's [failure]. An I/O error is the
+     * connection's end, whatever the socket or Ktor's channel called it (a reset, the stream's end in the middle of a
+     * line, the connection closed under the read): it is thrown as an [NntpConnectionException], as the read timeout
+     * is, with the error as its cause.
+     */
     private inline fun <T> failing(block: () -> T): T = try {
         block()
     } catch (e: CancellationException) {
         throw e
+    } catch (e: IOException) {
+        throw failed(connectionFailure(e))
     } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
         throw failed(e)
+    }
+
+    private fun connectionFailure(e: IOException): NntpConnectionException {
+        // A close's channels fail their reads with the close's own exception as the cause: its message says it.
+        val closed = (e as? ClosedByteChannelException)?.cause as? NntpConnectionException
+        val message = when {
+            closed != null -> closed.message
+            e is EOFException -> "Connection to $host:$port closed unexpectedly"
+            else -> "Connection to $host:$port failed: ${e.message ?: e::class.simpleName}"
+        }
+        return NntpConnectionException(message ?: "Connection to $host:$port failed", e)
     }
 
     /**
