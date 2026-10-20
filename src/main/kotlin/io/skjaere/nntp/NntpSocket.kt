@@ -40,9 +40,14 @@ import kotlin.coroutines.CoroutineContext
  * A wait blocks its thread, so reads, writes and the connect run on [NntpDispatchers.IO], the library's view of
  * Dispatchers.IO: in place for a caller on it, else moved there. A caller on another dispatcher (Main, runBlocking's, a
  * test's, Dispatchers.IO itself) never has its thread blocked, nor a coroutine sharing that thread kept waiting, and
- * Dispatchers.IO's 64 threads are never held by waits. A coroutine started UNDISPATCHED runs on its starter's thread
- * until it first suspends, so one that reads at once holds its starter while it waits: it should yield first, as the
- * pool's drain does.
+ * Dispatchers.IO's 64 threads are never held by waits. Each wait holds its thread for as long as it lasts (a read's up
+ * to the read timeout), so as many threads wait as connections do, up to [NntpDispatchers.PARALLELISM] in the process.
+ * A coroutine started UNDISPATCHED runs on its starter's thread until it first suspends, so one that reads at once
+ * holds its starter while it waits: it should yield first, as the pool's drain does.
+ *
+ * Its [Reader] and writer are Ktor's ByteReadChannel and ByteWriteChannel, so readLine, the drain and TLS work over
+ * them as over Ktor's socket, through members Ktor marks @InternalAPI: built against Ktor 3.4.x, they need that version
+ * at run time (see the README).
  */
 internal class NntpSocket private constructor(
     private val channel: SocketChannel,
