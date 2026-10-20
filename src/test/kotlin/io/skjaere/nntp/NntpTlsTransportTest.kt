@@ -1,6 +1,7 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.SelectorManager
+import io.ktor.utils.io.readLine
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import io.skjaere.yenc.RapidYenc
@@ -404,6 +405,25 @@ class NntpTlsTransportTest {
             callers.cancel()
             client.close()
         }
+    }
+
+    /**
+     * A connection's close leaves its TLS engine closed both ways with nothing left to send: what closing queued (its
+     * close_notify, after a handshake) is taken out and dropped. Conscrypt frees its native state (the SSL, its buffers,
+     * the session) only then; a close_notify left queued kept it until the engine was finalized.
+     */
+    @Test
+    fun `a closed connection leaves its TLS engine closed with nothing left to send`() = runBlocking<Unit> {
+        val server = server(serve = answering())
+        val socket = NntpSocket.connect("localhost", server.port, NntpConnection.DEFAULT_READ_TIMEOUT_MS)
+        val tls = PlatformTls.connect("localhost", server.port, verifyHostname = true, socket.read, socket.write)
+        try {
+            assertEquals("200 welcome", tls.read.readLine())
+        } finally {
+            socket.close()
+            tls.release()
+        }
+        assertTrue(tls.released, "the engine isn't closed both ways, or has something left to send")
     }
 
     @Test

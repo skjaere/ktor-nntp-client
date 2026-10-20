@@ -162,8 +162,10 @@ internal class PlatformTls private constructor(
     }
 
     /**
-     * Frees the engine (Conscrypt's native state goes with it, not at finalization). The connection's channels are
-     * cancelled first, so no read or write is left to use it.
+     * Closes the engine both ways and takes out what closing queued (after a handshake, its close_notify) and drops it:
+     * Conscrypt frees its native state (the SSL, its buffers, the session) once the engine has nothing left to send,
+     * which a close_notify nobody takes out never is, so it waited for finalization. The connection's channels are
+     * cancelled first, so no read or write is left to use the engine, and the socket is closed or about to be.
      */
     fun release() {
         engine.closeOutbound()
@@ -172,7 +174,19 @@ internal class PlatformTls private constructor(
         } catch (_: SSLException) {
             // No close_notify came: nothing to read anyway.
         }
+        try {
+            var wraps = 0
+            while (!engine.isOutboundDone && wraps++ < MAX_CLOSING_WRAPS) {
+                netOut.clear()
+                if (engine.wrap(EMPTY, netOut).bytesProduced() == 0) break
+            }
+        } catch (_: SSLException) {
+            // Closed for good already: nothing left to take out.
+        }
     }
+
+    /** Whether the engine is closed both ways with nothing left to send, as [release] leaves it. */
+    internal val released: Boolean get() = engine.isInboundDone && engine.isOutboundDone
 
     /** What the server sent, decrypted as its reader asks for more. */
     @OptIn(InternalAPI::class)
@@ -315,6 +329,9 @@ internal class PlatformTls private constructor(
         private const val RECORD_HEADER = 5
 
         private val EMPTY: ByteBuffer = ByteBuffer.allocate(0)
+
+        // What closing queues is an alert or two: more wraps than this would be an engine that never says it is done.
+        private const val MAX_CLOSING_WRAPS = 4
 
         // TLS 1.2 and 1.3 only, as Ktor's spoke 1.2: never down to 1.0 or 1.1 with an old server.
         private val PROTOCOLS = setOf("TLSv1.3", "TLSv1.2")
