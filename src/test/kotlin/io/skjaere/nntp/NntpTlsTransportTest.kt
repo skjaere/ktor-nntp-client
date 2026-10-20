@@ -426,6 +426,25 @@ class NntpTlsTransportTest {
         assertTrue(tls.released, "the engine isn't closed both ways, or has something left to send")
     }
 
+    /**
+     * TLS reads the socket into its record buffer and nothing else: the socket's own buffer for line reads (64 KB of
+     * direct memory) is made only when a line is read from the socket itself, as on a plain connection.
+     */
+    @Test
+    fun `a TLS connection makes no buffer for reading lines from its socket`() = runBlocking<Unit> {
+        val data = Random(24).nextBytes(100_000)
+        val server = server(serve = answering(article(data)))
+        val socket = NntpSocket.connect("localhost", server.port, NntpConnection.DEFAULT_READ_TIMEOUT_MS)
+        val tls = PlatformTls.connect("localhost", server.port, verifyHostname = true, socket.read, socket.write)
+        try {
+            assertEquals("200 welcome", tls.read.readLine())
+            assertFalse(socket.read.hasLineBuffer, "the handshake and the welcome made it")
+        } finally {
+            socket.close()
+            tls.release()
+        }
+    }
+
     @Test
     fun `closing a connection fails a body waiting on it instead of cancelling it`() = runBlocking<Unit> {
         val whole = article(Random(23).nextBytes(100_000))

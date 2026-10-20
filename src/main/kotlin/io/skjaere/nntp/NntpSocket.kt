@@ -111,8 +111,10 @@ internal class NntpSocket private constructor(
         // What was read from the socket and not yet taken, as Ktor's channel kept it.
         private val buffer = Buffer()
 
-        // A read for [buffer]: what the socket holds, up to a burst's worth, in one call.
-        private val socketIn: ByteBuffer = ByteBuffer.allocateDirect(READ_BUFFER_SIZE)
+        // A read for [buffer]: what the socket holds, up to a burst's worth, in one call. Made at the first line read
+        // from the socket: with TLS nothing reads it that way (TLS reads the socket into its record buffer), and 64 KB
+        // of direct memory a connection would go unused.
+        private var socketIn: ByteBuffer? = null
 
         // The end of the stream: the server closed its side.
         private var ended = false
@@ -123,6 +125,9 @@ internal class NntpSocket private constructor(
         private val closedNow: () -> Throwable? = { closed }
 
         override val closedCause: Throwable? get() = closed
+
+        /** Whether a line read has made the socket's own read buffer. */
+        internal val hasLineBuffer: Boolean get() = socketIn != null
 
         override val isClosedForRead: Boolean get() = closed != null || (ended && buffer.exhausted())
 
@@ -135,12 +140,13 @@ internal class NntpSocket private constructor(
         override suspend fun awaitContent(min: Int): Boolean {
             closed?.let { throw it }
             while (buffer.size < min && !ended) {
-                socketIn.clear()
-                if (read(socketIn) < 0) {
+                val into = socketIn ?: ByteBuffer.allocateDirect(READ_BUFFER_SIZE).also { socketIn = it }
+                into.clear()
+                if (read(into) < 0) {
                     ended = true
                 } else {
-                    socketIn.flip()
-                    buffer.transferFrom(socketIn)
+                    into.flip()
+                    buffer.transferFrom(into)
                 }
             }
             return buffer.size >= min
