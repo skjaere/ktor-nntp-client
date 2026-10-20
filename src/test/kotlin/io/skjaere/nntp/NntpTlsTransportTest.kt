@@ -175,6 +175,22 @@ class NntpTlsTransportTest {
         }
     }
 
+    /**
+     * A short record (a status line) is decrypted as soon as it is in: only a long one still arriving waits for its
+     * bytes to gather (NntpSocket's gathering), or every command over TLS would wait a millisecond for its answer.
+     */
+    @Test
+    fun `short answers over TLS are read at once, not left to gather`() = runBlocking<Unit> {
+        val server = server(serve = answering())
+        client(server).use { client ->
+            repeat(20) { client.stat("<a@b>") }
+            val started = System.nanoTime()
+            repeat(300) { assertIs<StatResult.Found>(client.stat("<a@b>")) }
+            val tookMs = (System.nanoTime() - started) / 1_000_000
+            assertTrue(tookMs < 300, "300 STATs took $tookMs ms, a millisecond or more each")
+        }
+    }
+
     @Test
     fun `a body that stops mid-article fails after the read timeout and frees its slot`() = runBlocking<Unit> {
         val whole = article(Random(16).nextBytes(64 * 1024))

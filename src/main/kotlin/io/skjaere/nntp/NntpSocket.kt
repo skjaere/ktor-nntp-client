@@ -101,7 +101,7 @@ internal class NntpSocket private constructor(
 
     /** What the server sent: read from the socket as its reader asks for more, in the reader's own thread. */
     @OptIn(InternalAPI::class)
-    inner class Reader : ByteReadChannel {
+    inner class Reader : BulkReadChannel {
         // What was read from the socket and not yet taken, as Ktor's channel kept it.
         private val buffer = Buffer()
 
@@ -141,38 +141,37 @@ internal class NntpSocket private constructor(
         }
 
         /**
-         * Reads into [dst] what this channel holds, or else what the socket has, waiting for it if it has nothing: the
+         * Reads into [dst] all this channel holds, or else what the socket has, waiting for it if it has nothing: the
          * bytes read, or -1 at the end of the stream. A bulk reader's way past [buffer]: the socket's bytes go straight
-         * into [dst] (a decoder's direct buffer), with no copy on the way.
+         * into [dst] (a decoder's direct buffer, TLS's record buffer), with no copy on the way.
          */
-        suspend fun readAvailable(dst: ByteBuffer): Int {
+        override suspend fun readAvailable(dst: ByteBuffer, want: Int): Int {
             closed?.let { throw it }
-            if (!buffer.exhausted()) return buffer.readAtMostTo(dst)
+            if (!buffer.exhausted()) return buffer.drainInto(dst)
             if (ended) return -1
-            return read(dst).also { if (it < 0) ended = true }
+            return read(dst, want).also { if (it < 0) ended = true }
         }
 
-        private suspend fun read(dst: ByteBuffer): Int {
+        private suspend fun read(dst: ByteBuffer, want: Int = 0): Int {
             val context = currentCoroutineContext()
             return if (context.onIo()) {
-                readSocket(dst, context[Job])
+                readSocket(dst, context[Job], want)
             } else {
-                withContext(Dispatchers.IO) { readSocket(dst, coroutineContext[Job]) }
+                withContext(Dispatchers.IO) { readSocket(dst, coroutineContext[Job], want) }
             }
         }
 
-        /** What the socket holds, into [dst], waiting for some if it holds none: the bytes read, or -1 at its end. */
-        private fun readSocket(dst: ByteBuffer, job: Job?): Int {
+        /**
+         * What the socket holds, into [dst], waiting for some if it holds none: the bytes read, or -1 at its end. Fewer
+         * than [want] in one go, and more are let gather ([gatherMore]).
+         */
+        private fun readSocket(dst: ByteBuffer, job: Job?, want: Int): Int {
             // Before anything is taken: a read that finds bytes waits for nothing, and would not see a cancel otherwise.
             job?.ensureActive()
             while (true) {
-                val n = try {
-                    channel.read(dst)
-                } catch (e: IOException) {
-                    // Closed under the read (AsynchronousCloseException): the close's cause says why.
-                    throw closed ?: e
-                }
-                if (n != 0 || !dst.hasRemaining()) return n
+                val n = readNow(dst)
+                if (n > 0) return if (n < want) gatherMore(dst, n) else n
+                if (n < 0 || !dst.hasRemaining()) return n
                 if (!awaitReady(SelectionKey.OP_READ, job, readTimeoutMs, closedNow)) {
                     // A server gone silent mid-answer leaves the wire unusable: this read and every later one fail.
                     val timedOut = NntpConnectionException("No data from $host:$port for ${readTimeoutMs}ms")
@@ -180,6 +179,26 @@ internal class NntpSocket private constructor(
                     throw timedOut
                 }
             }
+        }
+
+        /**
+         * After [got] bytes, fewer than the reader wants: waits [GATHER_MS] for more to come, then takes them, so one
+         * wake-up brings what a millisecond's packets do (each woke the reader on its own on the emulator, 1.5 KB). The
+         * bytes in all; an end seen meanwhile shows at the next read. Only a close ends the wait early: the bytes taken
+         * may hold the end of the answer, and a cancel thrown now would leave them unseen. The next read sees it.
+         */
+        private fun gatherMore(dst: ByteBuffer, got: Int): Int {
+            if (!dst.hasRemaining()) return got
+            awaitReady(NO_OPS, null, GATHER_MS, closedNow)
+            val more = readNow(dst)
+            return if (more > 0) got + more else got
+        }
+
+        private fun readNow(dst: ByteBuffer): Int = try {
+            channel.read(dst)
+        } catch (e: IOException) {
+            // Closed under the read (AsynchronousCloseException): the close's cause says why.
+            throw closed ?: e
         }
 
         override fun cancel(cause: Throwable?) {
@@ -266,6 +285,12 @@ internal class NntpSocket private constructor(
         private const val WRITE_BUFFER_SIZE = 32 * 1024
 
         private const val NANOS_PER_MS = 1_000_000L
+
+        // How long a read that brought fewer bytes than its reader wants lets more gather ([Reader.gatherMore]).
+        private const val GATHER_MS = 1L
+
+        // Interest in nothing: a wait that only the time or a close ends.
+        private const val NO_OPS = 0
 
         /** Where a wait may block its thread: Dispatchers.IO, whose threads are for it. */
         private fun CoroutineContext.onIo(): Boolean = this[ContinuationInterceptor] === Dispatchers.IO

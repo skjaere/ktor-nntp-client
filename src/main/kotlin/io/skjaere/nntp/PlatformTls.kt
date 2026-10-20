@@ -4,7 +4,6 @@ import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.ClosedByteChannelException
 import io.ktor.utils.io.InternalAPI
-import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.CancellationException
 import kotlinx.io.Buffer
@@ -36,7 +35,7 @@ import javax.net.ssl.X509TrustManager
  */
 internal class PlatformTls private constructor(
     private val engine: SSLEngine,
-    private val rawRead: ByteReadChannel,
+    private val rawRead: BulkReadChannel,
     private val rawWrite: ByteWriteChannel,
 ) {
     // Records from the socket, one or more and maybe the start of the next. Each read from the socket takes what it
@@ -55,7 +54,7 @@ internal class PlatformTls private constructor(
     // What has been decrypted and not yet read: [read]'s buffer.
     private val plain = Buffer()
 
-    val read: ByteReadChannel = Reader()
+    val read: BulkReadChannel = Reader()
     val write: ByteWriteChannel = Writer()
 
     /** The protocol and cipher suite the handshake chose, as "TLSv1.3 TLS_AES_128_GCM_SHA256". */
@@ -76,7 +75,7 @@ internal class PlatformTls private constructor(
                 else -> {
                     val result = unwrap()
                     when (result.status) {
-                        Status.BUFFER_UNDERFLOW -> if (readSocket() < 0) {
+                        Status.BUFFER_UNDERFLOW -> if (readSocket(want = 0) < 0) {
                             throw EOFException("The server closed the connection in the TLS handshake")
                         }
                         Status.CLOSED -> throw SSLException("The server ended TLS in the handshake")
@@ -107,18 +106,32 @@ internal class PlatformTls private constructor(
     }
 
     /**
-     * Reads what the socket has into [netIn], after the part of a record it holds: the bytes read, or -1 at the end
-     * of the stream (a FIN or reset, TLS's close_notify missing).
+     * Reads what the socket has into [netIn], after the part of a record it holds, as much as there is room for: the
+     * bytes read, or -1 at the end of the stream (a FIN or reset, TLS's close_notify missing). Fewer than [want], and
+     * the socket lets more gather first ([BulkReadChannel.readAvailable]).
      */
-    private suspend fun readSocket(): Int {
+    private suspend fun readSocket(want: Int): Int {
         netIn.compact()
         if (!netIn.hasRemaining()) netIn = grow(netIn, engine.session.packetBufferSize)
         val n = try {
-            rawRead.readAvailable(netIn)
+            rawRead.readAvailable(netIn, want)
         } finally {
             netIn.flip()
         }
         return n
+    }
+
+    /**
+     * What the record [netIn] begins with still lacks, by the length its header gives: only so much is worth a wake-up,
+     * as the engine decrypts nothing before the record's end. Without its header, the header: a short record (a status
+     * line, the welcome) is then read at once, and only a long one still arriving lets the rest gather.
+     */
+    private fun recordShortfall(): Int {
+        val have = netIn.remaining()
+        if (have < RECORD_HEADER) return RECORD_HEADER - have
+        val at = netIn.position()
+        val length = RECORD_HEADER + ((netIn.get(at + 3).toInt() and 0xFF) shl 8 or (netIn.get(at + 4).toInt() and 0xFF))
+        return length - have
     }
 
     /**
@@ -163,7 +176,7 @@ internal class PlatformTls private constructor(
 
     /** What the server sent, decrypted as its reader asks for more. */
     @OptIn(InternalAPI::class)
-    private inner class Reader : ByteReadChannel {
+    private inner class Reader : BulkReadChannel {
         // The end of the stream: the server's close_notify, or the socket's end without it.
         private var ended = false
 
@@ -190,6 +203,15 @@ internal class PlatformTls private constructor(
         }
 
         /**
+         * All that is decrypted, as [dst] has room for, decrypting more first if nothing is: -1 at the end. [want] needs
+         * nothing here: a record is decrypted whole, its bytes let gather in the socket until then.
+         */
+        override suspend fun readAvailable(dst: ByteBuffer, want: Int): Int {
+            if (!awaitContent(1)) return -1
+            return plain.drainInto(dst)
+        }
+
+        /**
          * Decrypts the records [netIn] holds, reading from the socket until there is one: false at the end of the
          * stream. All the whole records read go in at once, so the reader gets bursts rather than a record at a time.
          */
@@ -208,7 +230,7 @@ internal class PlatformTls private constructor(
                         if (produced) return true
                         // Like Ktor's, a stream that ends without close_notify ends as at a FIN: the NNTP framing
                         // (the status line, the article terminator) says whether it was whole.
-                        if (readSocket() < 0) return false
+                        if (readSocket(want = recordShortfall()) < 0) return false
                     }
                     // A post-handshake message: a session ticket needs nothing, a key update may need an answer.
                     else -> if (result.handshakeStatus != HandshakeStatus.NOT_HANDSHAKING &&
@@ -289,6 +311,9 @@ internal class PlatformTls private constructor(
         // TLS's largest record of plaintext (RFC 8446 §5.1).
         private const val MAX_PLAINTEXT_RECORD = 16 * 1024
 
+        // A record's header: its type, version and length (RFC 8446 §5.1).
+        private const val RECORD_HEADER = 5
+
         private val EMPTY: ByteBuffer = ByteBuffer.allocate(0)
 
         // TLS 1.2 and 1.3 only, as Ktor's spoke 1.2: never down to 1.0 or 1.1 with an old server.
@@ -307,7 +332,7 @@ internal class PlatformTls private constructor(
             host: String,
             port: Int,
             verifyHostname: Boolean,
-            rawRead: ByteReadChannel,
+            rawRead: BulkReadChannel,
             rawWrite: ByteWriteChannel,
         ): PlatformTls {
             val trustManager: X509TrustManager = HostnameVerifyingTrustManager.platformDefault()

@@ -31,7 +31,7 @@ class NntpConnection private constructor(
     private val host: String,
     private val port: Int,
     private val socket: NntpSocket,
-    private val readChannel: ByteReadChannel,
+    private val readChannel: BulkReadChannel,
     private val writeChannel: ByteWriteChannel,
     // With TLS, the session [readChannel] and [writeChannel] run through.
     private val tls: PlatformTls?,
@@ -288,7 +288,7 @@ class NntpConnection private constructor(
         /** A connected socket and the channels the connection reads and writes: through [tls], with TLS. */
         private class Transport(
             val socket: NntpSocket,
-            val read: ByteReadChannel,
+            val read: BulkReadChannel,
             val write: ByteWriteChannel,
             val tls: PlatformTls?
         ) {
@@ -454,11 +454,12 @@ class NntpConnection private constructor(
         timedRead { readChannel.readAvailable(dst, offset, length) }
 
     /**
-     * Reads what's available into [dst], as much as it has room for, or -1 at EOF; bounded by the read timeout. Without
-     * TLS the socket's bytes go straight into [dst] ([NntpSocket.Reader.readAvailable]).
+     * Reads all that's available into [dst], as much as it has room for, or -1 at EOF; bounded by the read timeout.
+     * Without TLS the socket's bytes go straight into [dst] ([NntpSocket.Reader.readAvailable]). When fewer than [want]
+     * come, more are let gather for a moment ([BulkReadChannel.readAvailable]).
      */
-    internal suspend fun readAvailable(dst: ByteBuffer): Int =
-        timedRead { if (tls == null) socket.read.readAvailable(dst) else readChannel.readAvailable(dst) }
+    internal suspend fun readAvailable(dst: ByteBuffer, want: Int = 0): Int =
+        timedRead { readChannel.readAvailable(dst, want) }
 
     suspend fun readResponse(): NntpResponse {
         val line = timedRead { readChannel.readLine() }

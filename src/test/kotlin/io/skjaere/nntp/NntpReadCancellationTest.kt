@@ -187,6 +187,45 @@ class NntpReadCancellationTest {
     }
 
     @Test
+    fun `an article read whole ends as soon as its caller is cancelled while its bytes trickle in`() = runBlocking<Unit> {
+        val sending = CountDownLatch(1)
+        Thread {
+            runCatching {
+                serverSocket.accept().use { socket ->
+                    val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                    val out = socket.getOutputStream()
+                    out.write("200 welcome\r\n".toByteArray())
+                    out.flush()
+                    reader.readLine() // BODY
+                    out.write("222 0 <slow@test>\r\n=ybegin line=128 size=10000000 name=slow.bin\r\n".toByteArray())
+                    // A line of data every 10 ms, the article never finished: the reader reads it bit by bit.
+                    val line = ("a".repeat(128) + "\r\n").toByteArray()
+                    while (true) {
+                        out.write(line)
+                        out.flush()
+                        sending.countDown()
+                        Thread.sleep(10)
+                    }
+                }
+            }
+        }.apply { isDaemon = true }.start()
+        val client = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
+        try {
+            val pending = callers.async { client.bodyYencBytes("<slow@test>") }
+            assertTrue(sending.await(5, TimeUnit.SECONDS), "the server never sent the article")
+            delay(300) // the article arrives a line at a time
+            val started = System.nanoTime()
+            pending.cancel()
+            withTimeout(5_000) { pending.join() }
+            val tookMs = (System.nanoTime() - started) / 1_000_000
+            assertTrue(tookMs < 1_000, "the cancelled article ended $tookMs ms after its cancel")
+            assertTrue(pending.isCancelled, "the article was not cancelled: ${pending.getCompletionExceptionOrNull()}")
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
     fun `closed connections keep no descriptors open, whether a read waited on them or not`() = runBlocking<Unit> {
         val descriptors = File("/proc/self/fd")
         assumeTrue(descriptors.isDirectory, "needs /proc/self/fd")

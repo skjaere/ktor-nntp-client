@@ -23,6 +23,9 @@ internal object YencDecoder {
     // native calls with JNA's allocations, and a read brings what one wake-up found, a few KB at times.
     private const val BATCH_ROOM = 64 * 1024
 
+    // What a whole article's pump wants from a read: fewer, and the socket lets more gather first.
+    private const val GATHER_WANT = 16 * 1024
+
     // The article terminator, CRLF.CRLF, as the last five bytes read: the article is all in.
     private const val TERMINATOR = 0x0D0A2E0D0AL
     private const val LAST_FIVE = 0xFFFFFFFFFFL
@@ -59,8 +62,10 @@ internal object YencDecoder {
         val (headers, firstDataBytes, part) = readHeaders(connection)
         val body = DecodedBytes(presize(headers))
         val mismatch = failingTheBody(connection) {
-            // Nobody sees the body before its end: decode in batches.
-            pump(connection, firstDataBytes, part, batch = true) { decoded, length -> body.append(decoded, length) }
+            // Nobody sees the body before its end: decode in batches, and let the bytes of all but its end gather.
+            pump(connection, firstDataBytes, part, batch = true, expected = presize(headers).toLong()) { bytes, length ->
+                body.append(bytes, length)
+            }
         }
         val article = YencArticle(headers, body.toByteArray())
         mismatch?.let { throw it.toException(article) }
@@ -204,13 +209,16 @@ internal object YencDecoder {
      * has the body: [part] says which of the line's CRCs is the body's ([crcMismatch]). With [batch],
      * what is read is decoded only once srcBuf is nearly full or the article is all in (its terminator
      * the last bytes read, or the connection's end), for a caller that wants nothing before the end;
-     * without, after every read, so a reader of the Body channel gets each part as it comes.
+     * without, after every read, so a reader of the Body channel gets each part as it comes. With
+     * [batch], a read that brings fewer than [GATHER_WANT] bytes lets more gather, while the body is
+     * [expected] (its decoded size, by its headers) to go on for that much: encoded, it is longer.
      */
     private suspend fun pump(
         connection: NntpConnection,
         firstDataBytes: ByteArray?,
         part: Boolean,
         batch: Boolean = false,
+        expected: Long = 0,
         emit: suspend (decoded: ByteBuffer, length: Int) -> Unit,
     ): CrcMismatch? {
         val buffers = connection.decodeBuffers()
@@ -223,6 +231,8 @@ internal object YencDecoder {
         var eof = false
         // The last five bytes read, the newest lowest: [TERMINATOR] once the article is all in.
         var lastFive = 0L
+        // The body's bytes read so far, encoded: what is left of [expected] is what a read may want.
+        var taken = firstDataBytes?.size?.toLong() ?: 0L
 
         firstDataBytes?.let {
             srcBuf.put(it)
@@ -235,8 +245,11 @@ internal object YencDecoder {
             // it's fine to read more on top of it. The decoder will consume what it can
             // and compact the rest.
             if (!eof && srcBuf.position() < srcBuf.capacity()) {
-                // Into srcBuf after what it holds, as much as the connection has and there's room for.
-                val n = connection.readAvailable(srcBuf)
+                // Into srcBuf after what it holds, as much as the connection has and there's room for. A whole
+                // article's pump has nobody waiting for each part, and lets bytes gather.
+                val want = if (batch) (expected - taken).coerceIn(0L, GATHER_WANT.toLong()).toInt() else 0
+                val n = connection.readAvailable(srcBuf, want)
+                if (n > 0) taken += n
                 if (n == -1) {
                     eof = true
                     if (srcBuf.position() == 0) throw closedMidArticle()
