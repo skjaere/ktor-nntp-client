@@ -8,6 +8,7 @@ import io.skjaere.yenc.RapidYenc
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -184,6 +185,43 @@ class NntpReadTimeoutTest {
                 "the reader should see a connection failure, got $failure"
             )
             assertEquals(0.0, poolSize(), "the silent connection should be discarded, freeing its slot")
+        } finally {
+            pool.close()
+        }
+    }
+
+    /**
+     * A whole article (bodyYencBytes, as nzb-streamer streams and prepares) that stops mid-body fails after the read
+     * timeout too. What comes last before the stall is short of what a read wants, so that read lets more gather first:
+     * the gather ends of itself, and the next read's wait keeps to the read timeout.
+     */
+    @Test
+    @Timeout(20, unit = TimeUnit.SECONDS)
+    fun `a whole article that stops mid-body fails after the read timeout and frees its slot`() = runBlocking<Unit> {
+        launchServer { reader, out ->
+            reader.readLine() // BODY
+            val article = buildYencArticle(ByteArray(256 * 1024) { (it % 256).toByte() }, "stall.bin")
+            out.write("222 body follows\r\n".toByteArray())
+            out.write(article, 0, 100_000)
+            out.flush()
+            Thread.sleep(100) // read, and the next read waits
+            out.write(article, 100_000, 1_000) // less than a read wants: it lets more gather
+            out.flush()
+            ignoreCommands(reader)
+        }
+        val pool = pool(readTimeoutMs = 300)
+        pool.wake()
+        try {
+            // Apart from the test, which waits for it only so long: a wait that never ends would hold the test too.
+            val fetch = poolScope.async { runCatching { pool.withClient { it.bodyYencBytes("<stall@test>") } } }
+            val finished = withTimeoutOrNull(5_000) { fetch.await() }
+            assertNotNull(finished, "the article was still waiting for its rest after 5 s")
+            val failure = finished.exceptionOrNull()
+            assertTrue(
+                generateSequence(failure) { it.cause }.any { it is NntpConnectionException },
+                "expected a connection failure, got $failure"
+            )
+            assertEquals(0.0, poolSize(), "the silent connections should be discarded, freeing their slots")
         } finally {
             pool.close()
         }
