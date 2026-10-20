@@ -25,6 +25,8 @@ dependencies {
     testImplementation(libs.junit.jupiter)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.logback.classic)
+    // Android's TLS, BoringSSL under Conscrypt, for the transport's tests on the JVM (NntpTlsConscryptTransportTest).
+    testImplementation(libs.conscrypt.openjdk.uber)
     testImplementation(libs.mock.nntp.testcontainer)
     testImplementation(libs.testcontainers)
     testImplementation(libs.testcontainers.junit.jupiter)

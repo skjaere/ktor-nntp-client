@@ -39,10 +39,14 @@ import kotlin.test.assertTrue
 /**
  * The connection over TLS as over plain TCP: whole articles read across many TLS records, a connection reused after a
  * body, the CRC check, the read timeout, the end of a connection (with TLS's close_notify or without), a body cancelled
- * mid-article and drained, and a close that fails a read waiting on it.
+ * mid-article and drained, and a close that fails a read waiting on it. Over TLS 1.2 here; [NntpTls13TransportTest]
+ * runs them over 1.3, and [NntpTlsConscryptTransportTest] with Conscrypt's TLS, Android's, as the client's.
  */
 @Timeout(30, unit = TimeUnit.SECONDS)
-class NntpTlsTransportTest {
+internal open class NntpTlsTransportTest {
+
+    /** What the server speaks: TLS 1.2 here, 1.3 in [NntpTls13TransportTest]. */
+    protected open val protocols: Array<String> = arrayOf("TLSv1.2")
 
     companion object {
         private lateinit var certificates: TestCertificates
@@ -83,12 +87,12 @@ class NntpTlsTransportTest {
         certificates.restoreDefaultTrustStore()
     }
 
-    private fun server(
+    protected fun server(
         greet: Boolean = true,
         serve: (ScriptedTlsServer.TlsSession) -> Unit = {},
-    ) = ScriptedTlsServer(certificates.keyStore("localhost"), greet = greet, serve = serve).also { servers += it }
+    ) = ScriptedTlsServer(certificates.keyStore("localhost"), protocols, greet = greet, serve = serve).also { servers += it }
 
-    private suspend fun client(server: ScriptedTlsServer, readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS) =
+    protected suspend fun client(server: ScriptedTlsServer, readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS) =
         NntpClient.connect("localhost", server.port, selectorManager, useTls = true, readTimeoutMs = readTimeoutMs)
 
     private fun pool(server: ScriptedTlsServer, readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS) =
@@ -102,7 +106,7 @@ class NntpTlsTransportTest {
         registry.find("nntp.pool.size").tag("pool.name", "localhost:${server.port}").gauge()?.value()
 
     /** A yEnc article as a server sends it after BODY: its 222, a part of a larger file, its =yend with [crc], the terminator. */
-    private fun article(data: ByteArray, crc: UInt = RapidYenc.crc32(data)): ByteArray {
+    protected fun article(data: ByteArray, crc: UInt = RapidYenc.crc32(data)): ByteArray {
         val encoded = String(RapidYenc.encode(data), Charsets.ISO_8859_1)
         return buildString {
             append("222 body follows\r\n")
@@ -116,7 +120,7 @@ class NntpTlsTransportTest {
     }
 
     /** Answers BODY with each of [articles] in turn and STAT with 223, until the client goes away. */
-    private fun answering(vararg articles: ByteArray): (ScriptedTlsServer.TlsSession) -> Unit = { session ->
+    protected fun answering(vararg articles: ByteArray): (ScriptedTlsServer.TlsSession) -> Unit = { session ->
         val bodies = articles.iterator()
         while (true) {
             val command = session.reader.readLine() ?: break

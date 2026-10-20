@@ -195,6 +195,12 @@ internal class ScriptedTlsServer(
 
         /** Ends the TCP connection with no close_notify, as a server that crashed or a cut network does. */
         fun closeWithoutNotify() = tcp.close()
+
+        /**
+         * Over TLS 1.3, sends a KeyUpdate asking the client to update its keys too, as a JDK server does on reaching a
+         * key's limit (jdk.tls.keyLimits); the server's own are new from here on.
+         */
+        fun updateKeys() = tls.startHandshake()
     }
 
     private val serverSocket = ServerSocket(0)
@@ -215,7 +221,8 @@ internal class ScriptedTlsServer(
         }
         val keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
             .apply { init(keys, PASSWORD.toCharArray()) }.keyManagers
-        factory = SSLContext.getInstance("TLS").apply { init(keyManagers, null, null) }.socketFactory
+        // The JDK's TLS, whatever provider a test puts first for the client (NntpTlsConscryptTransportTest's).
+        factory = SSLContext.getInstance("TLS", "SunJSSE").apply { init(keyManagers, null, null) }.socketFactory
         Thread {
             while (true) {
                 val tcp = try {
