@@ -1,12 +1,14 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.SelectorManager
+import io.skjaere.yenc.RapidYenc
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -26,7 +28,11 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.random.Random
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
@@ -223,6 +229,97 @@ class NntpReadCancellationTest {
         } finally {
             client.close()
         }
+    }
+
+    /**
+     * A caller off Dispatchers.IO reads through a hop there. Cancelled after the hop has read an article's end but
+     * before the caller resumes (its thread busy meanwhile), the hop's result is dropped; the bytes it took are the
+     * drain's all the same, which finds the terminator at once and keeps the connection.
+     */
+    @Test
+    fun `a body cancelled after the hop to IO read its end is drained at once and its connection kept`() = runBlocking<Unit> {
+        val data = Random(7).nextBytes(64 * 1024)
+        val article = article(data)
+        val firstPart = article.size - 1_000
+        val firstSent = CountDownLatch(1)
+        val sendRest = CountDownLatch(1)
+        val accepted = AtomicInteger()
+        Thread {
+            while (true) {
+                val client = runCatching { serverSocket.accept() }.getOrNull() ?: break
+                accepted.incrementAndGet()
+                Thread {
+                    client.use { socket ->
+                        runCatching {
+                            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                            val out = socket.getOutputStream()
+                            out.write("200 welcome\r\n".toByteArray())
+                            out.flush()
+                            var bodies = 0
+                            while (true) {
+                                val command = reader.readLine() ?: break
+                                when {
+                                    command.startsWith("BODY") && bodies++ == 0 -> {
+                                        // All but the end, and the end once the test has the client's thread busy.
+                                        out.write(article, 0, firstPart)
+                                        out.flush()
+                                        firstSent.countDown()
+                                        sendRest.await(10, TimeUnit.SECONDS)
+                                        out.write(article, firstPart, article.size - firstPart)
+                                    }
+                                    command.startsWith("BODY") -> out.write(article)
+                                    command == "QUIT" -> out.write("205 bye\r\n".toByteArray())
+                                    else -> out.write("500 unknown\r\n".toByteArray())
+                                }
+                                out.flush()
+                            }
+                        }
+                    }
+                }.apply { isDaemon = true }.start()
+            }
+        }.apply { isDaemon = true }.start()
+        val callerThread = Executors.newSingleThreadExecutor()
+        val caller = callerThread.asCoroutineDispatcher()
+        val pool = NntpClientPool(
+            host = "localhost", port = serverSocket.localPort, selectorManager = selectorManager, maxConnections = 1,
+            scope = callers, keepaliveIntervalMs = 0, idleGracePeriodMs = 0,
+        )
+        try {
+            val pending = CoroutineScope(caller).async { pool.withClient { it.bodyYencBytes("<a@test>") } }
+            assertTrue(firstSent.await(5, TimeUnit.SECONDS), "the server never sent the article")
+            delay(300) // the client has the first part, and waits in its hop to IO for the rest
+            val busy = CountDownLatch(1)
+            callerThread.execute { busy.await(10, TimeUnit.SECONDS) }
+            sendRest.countDown()
+            delay(300) // the hop reads the article's end, and its result waits for the caller's thread
+            pending.cancel()
+            val started = System.nanoTime()
+            busy.countDown()
+            withTimeout(10_000) { pending.join() }
+            val tookMs = (System.nanoTime() - started) / 1_000_000
+            assertTrue(pending.isCancelled, "the article was not cancelled: ${pending.getCompletionExceptionOrNull()}")
+            assertTrue(tookMs < 1_000, "the cancelled article ended $tookMs ms after its cancel: its drain missed the terminator")
+            // The connection was kept: the next article comes over it.
+            assertContentEquals(data, pool.withClient { it.bodyYencBytes("<a@test>") }.data)
+            assertEquals(1, accepted.get(), "the connection was discarded and another one opened")
+        } finally {
+            pool.close()
+            caller.close()
+        }
+    }
+
+    /** A yEnc article as a server sends it after BODY: its 222, a part of a larger file, its =yend, the terminator. */
+    private fun article(data: ByteArray): ByteArray {
+        val encoded = String(RapidYenc.encode(data), Charsets.ISO_8859_1)
+        return buildString {
+            append("222 0 <a@test>\r\n")
+            append("=ybegin part=1 total=1 line=128 size=${data.size} name=data.bin\r\n")
+            append("=ypart begin=1 end=${data.size}\r\n")
+            append(encoded)
+            if (!encoded.endsWith("\r\n")) append("\r\n")
+            append("=yend size=${data.size} part=1 pcrc32=${RapidYenc.crc32(data).toString(16).padStart(8, '0')}\r\n")
+            append(".\r\n")
+        }.toByteArray(Charsets.ISO_8859_1)
     }
 
     @Test

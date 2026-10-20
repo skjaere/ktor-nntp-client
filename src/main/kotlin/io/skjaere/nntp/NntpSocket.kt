@@ -31,7 +31,8 @@ import kotlin.coroutines.CoroutineContext
 /**
  * A TCP connection read and written in its caller's own thread. A read takes what the socket holds, and one that finds
  * nothing waits there, on a selector of the connection's own, until bytes come, the read timeout runs out, the caller's
- * coroutine is cancelled (the bytes then stay in the socket for the next read, a drain's) or the connection is closed.
+ * coroutine is cancelled (what comes later, and what a read had taken when its caller was cancelled, is the next read's,
+ * a drain's) or the connection is closed.
  *
  * Ktor's socket put a coroutine between the socket and the reader, woken by its selector's thread: every burst of bytes
  * (8 KB at most) cost a selector wake-up and two dispatches, and the reader's coroutine was resumed last, with a timer
@@ -154,11 +155,24 @@ internal class NntpSocket private constructor(
 
         private suspend fun read(dst: ByteBuffer, want: Int = 0): Int {
             val context = currentCoroutineContext()
-            return if (context.onIo()) {
-                readSocket(dst, context[Job], want)
-            } else {
+            if (context.onIo()) return readSocket(dst, context[Job], want)
+            val start = dst.position()
+            return try {
                 withContext(Dispatchers.IO) { readSocket(dst, coroutineContext[Job], want) }
+            } catch (e: CancellationException) {
+                // Cancelled once the hop had read, withContext drops what it returned, but the bytes are out of the
+                // socket: they may hold an answer's end, which the drain after a cancel reads for.
+                keep(dst, start)
+                throw e
             }
+        }
+
+        /** Moves what a read put in [dst] from [start] on to [buffer], for the next read to take first, as if never read. */
+        private fun keep(dst: ByteBuffer, start: Int) {
+            val end = dst.position()
+            if (end <= start) return
+            buffer.transferFrom(dst.duplicate().position(start).limit(end))
+            dst.position(start)
         }
 
         /**
