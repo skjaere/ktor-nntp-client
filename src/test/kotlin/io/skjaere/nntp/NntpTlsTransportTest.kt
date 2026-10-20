@@ -10,9 +10,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withTimeout
@@ -189,10 +189,13 @@ internal open class NntpTlsTransportTest {
         val server = server(serve = answering())
         client(server).use { client ->
             repeat(20) { client.stat("<a@b>") }
-            val started = System.nanoTime()
-            repeat(300) { assertIs<StatResult.Found>(client.stat("<a@b>")) }
-            val tookMs = (System.nanoTime() - started) / 1_000_000
-            assertTrue(tookMs < 300, "300 STATs took $tookMs ms, a millisecond or more each")
+            // The quickest of 300: a busy host slows some of them, but an answer left to gather waits a millisecond every time.
+            val tookUs = List(300) {
+                val started = System.nanoTime()
+                assertIs<StatResult.Found>(client.stat("<a@b>"))
+                (System.nanoTime() - started) / 1_000
+            }.sorted()
+            assertTrue(tookUs.first() < 800, "the quickest of 300 STATs took ${tookUs.first()} us, the median ${tookUs[150]} us")
         }
     }
 
@@ -365,23 +368,36 @@ internal open class NntpTlsTransportTest {
         val first = Random(21).nextBytes(300_000)
         val second = Random(22).nextBytes(20_000)
         val firstArticle = article(first)
+        val firstPartSent = CountDownLatch(1)
+        val cancelled = CountDownLatch(1)
         val server = server { session ->
+            session.reader.readLine() // the STAT that opens the connection
+            session.out.write("223 0 <a@b> exists\r\n".toByteArray())
+            session.out.flush()
             session.reader.readLine() // the first BODY
             session.out.write(firstArticle, 0, 4_096)
             session.out.flush()
-            Thread.sleep(800) // the caller gives up at 300 ms
+            firstPartSent.countDown()
+            cancelled.await(10, TimeUnit.SECONDS) // the rest only once the caller has given up
             session.out.write(firstArticle, 4_096, firstArticle.size - 4_096)
             session.out.flush()
             answering(article(second))(session)
         }
         val pool = pool(server)
         try {
-            assertFailsWith<TimeoutCancellationException> {
-                withTimeout(300) { pool.withClient { it.bodyYencBytes("<first@test>") } }
-            }
+            // The connection opened first, so the cancel comes in the middle of the article, not of the connect.
+            assertIs<StatResult.Found>(pool.stat("<a@b>"))
+            val pending = async { pool.withClient { it.bodyYencBytes("<first@test>") } }
+            // Waited for here without holding this thread, which the BODY runs on too.
+            assertNotNull(withTimeoutOrNull(5_000) { while (firstPartSent.count > 0) delay(10) }, "the server never sent the start of the article")
+            delay(100) // the client has the start, and waits for the rest
+            pending.cancel()
+            cancelled.countDown()
+            assertFailsWith<CancellationException> { pending.await() }
             assertContentEquals(second, pool.withClient { it.bodyYencBytes("<second@test>") }.data)
             assertEquals(1, server.accepted, "connections: the drained one should have been reused")
         } finally {
+            cancelled.countDown()
             pool.close()
         }
     }
