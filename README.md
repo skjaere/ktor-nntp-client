@@ -20,7 +20,7 @@ A Kotlin NNTP (Network News Transfer Protocol) client library with Ktor's byte c
 - Pipelined `STAT` for checking many articles in few round trips
 - SIMD-accelerated yEnc decoding via rapidyenc native library
 - CRC32 validation for yEnc articles
-- Coroutine-based I/O: a connection reads its socket in the calling coroutine's own thread, on `Dispatchers.IO`, with no coroutine or dispatch between the socket and the reader; a read waiting for the server ends at once when its coroutine is cancelled
+- Coroutine-based I/O: a connection reads its socket in the calling coroutine's own thread, on `NntpDispatchers.IO` (the library's view of `Dispatchers.IO`), with no coroutine or dispatch between the socket and the reader; a read waiting for the server ends at once when its coroutine is cancelled
 - TLS from the platform (Conscrypt on Android, the JDK's on a JVM), 1.3 when the server offers it, with SNI and certificate hostname verification
 - Credential storage for automatic re-authentication on reconnect
 
@@ -52,7 +52,8 @@ dependencies {
 
 ```kotlin
 val selectorManager = SelectorManager(Dispatchers.IO)
-val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+// Its connects and keepalives read in place on the library's dispatcher, as do callers on it.
+val scope = CoroutineScope(NntpDispatchers.IO + SupervisorJob())
 
 val pool = NntpClientPool(
     host = "news.example.com",
@@ -330,7 +331,7 @@ Connections also record `nntp.command.ack_latency`, the time from sending a comm
 - A command cancelled before its answer was read (e.g. a cancelled `bodyYenc()` or `stat()`) has the rest of the answer read off before its connection is reused, for up to 3 s; a cancelled `statPipelined()` returns at once and its answers are read off on the pool's scope. A connection that can't be brought back in step that way (a multi-line answer cut short, answers that don't come within the 3 s) is closed, and a new one is opened on demand
 - I/O errors (e.g., an `SSLException` from TLS, or a `ClosedByteChannelException` once the server has closed the connection) trigger automatic reconnect and retry with a different connection
 - Each `NntpClient` instance is safe for sequential use from any coroutine
-- A connection's reads, writes and connect wait in the calling coroutine's thread when it runs on `Dispatchers.IO`, and move to `Dispatchers.IO` from any other dispatcher (Main, `runBlocking`'s, a test's), whose thread is never blocked
+- A connection's reads, writes and connect wait in the calling coroutine's thread when it runs on `NntpDispatchers.IO`, and move there from any other dispatcher (Main, `runBlocking`'s, a test's, `Dispatchers.IO` itself), whose thread is never blocked. `NntpDispatchers.IO` is a view of `Dispatchers.IO` that its 64-thread limit doesn't count, so waits for servers never keep the process's other IO work waiting
 - The `SelectorManager` that `NntpClientPool` and `connect` take is no longer used (each connection waits on a selector of its own); it is kept so callers compile as before
 
 ## Building

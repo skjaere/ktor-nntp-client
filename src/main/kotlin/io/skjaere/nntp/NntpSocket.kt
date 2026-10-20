@@ -5,7 +5,6 @@ import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.ClosedByteChannelException
 import io.ktor.utils.io.InternalAPI
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
@@ -38,11 +37,12 @@ import kotlin.coroutines.CoroutineContext
  * (8 KB at most) cost a selector wake-up and two dispatches, and the reader's coroutine was resumed last, with a timer
  * task per read for the read timeout (library issue K42). Here the thread the kernel wakes is the reader's.
  *
- * A wait blocks its thread, so reads, writes and the connect run on Dispatchers.IO: in place for a caller on it (the
- * pool's and nzb-streamer's work is), else moved there, so a caller on another dispatcher (Main, runBlocking's, a test's)
- * never has its thread blocked, nor a coroutine sharing that thread kept waiting. A coroutine started UNDISPATCHED runs
- * on its starter's thread until it first suspends, so one that reads at once holds its starter while it waits: it
- * should yield first, as the pool's drain does.
+ * A wait blocks its thread, so reads, writes and the connect run on [NntpDispatchers.IO], the library's view of
+ * Dispatchers.IO: in place for a caller on it, else moved there. A caller on another dispatcher (Main, runBlocking's, a
+ * test's, Dispatchers.IO itself) never has its thread blocked, nor a coroutine sharing that thread kept waiting, and
+ * Dispatchers.IO's 64 threads are never held by waits. A coroutine started UNDISPATCHED runs on its starter's thread
+ * until it first suspends, so one that reads at once holds its starter while it waits: it should yield first, as the
+ * pool's drain does.
  */
 internal class NntpSocket private constructor(
     private val channel: SocketChannel,
@@ -158,7 +158,7 @@ internal class NntpSocket private constructor(
             if (context.onIo()) return readSocket(dst, context[Job], want)
             val start = dst.position()
             return try {
-                withContext(Dispatchers.IO) { readSocket(dst, coroutineContext[Job], want) }
+                withContext(NntpDispatchers.IO) { readSocket(dst, coroutineContext[Job], want) }
             } catch (e: CancellationException) {
                 // Cancelled once the hop had read, withContext drops what it returned, but the bytes are out of the
                 // socket: they may hold an answer's end, which the drain after a cancel reads for.
@@ -252,7 +252,7 @@ internal class NntpSocket private constructor(
             closed?.let { throw it }
             if (pending.exhausted()) return
             val context = currentCoroutineContext()
-            if (context.onIo()) send(context[Job]) else withContext(Dispatchers.IO) { send(coroutineContext[Job]) }
+            if (context.onIo()) send(context[Job]) else withContext(NntpDispatchers.IO) { send(coroutineContext[Job]) }
         }
 
         private fun send(job: Job?) {
@@ -306,8 +306,8 @@ internal class NntpSocket private constructor(
         // Interest in nothing: a wait that only the time or a close ends.
         private const val NO_OPS = 0
 
-        /** Where a wait may block its thread: Dispatchers.IO, whose threads are for it. */
-        private fun CoroutineContext.onIo(): Boolean = this[ContinuationInterceptor] === Dispatchers.IO
+        /** Where a wait may block its thread: the library's own view of Dispatchers.IO, whose threads are for it. */
+        private fun CoroutineContext.onIo(): Boolean = this[ContinuationInterceptor] === NntpDispatchers.IO
 
         /**
          * Connects to [host]:[port] (a name resolved here, as Ktor's socket did), waiting for the connect in an IO
@@ -318,7 +318,7 @@ internal class NntpSocket private constructor(
             if (context.onIo()) return open(host, port, readTimeoutMs, context[Job])
             var opened: NntpSocket? = null
             try {
-                return withContext(Dispatchers.IO) { open(host, port, readTimeoutMs, coroutineContext[Job]).also { opened = it } }
+                return withContext(NntpDispatchers.IO) { open(host, port, readTimeoutMs, coroutineContext[Job]).also { opened = it } }
             } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
                 // Cancelled once the hop had connected, withContext drops the socket it returns: nobody else could close it.
                 opened?.close()

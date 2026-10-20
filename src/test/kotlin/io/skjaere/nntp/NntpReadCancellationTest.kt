@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assumptions.assumeTrue
@@ -152,6 +153,34 @@ class NntpReadCancellationTest {
             assertEquals(111, withTimeout(10_000) { connection.command("DATE") }.code)
         } finally {
             connection.close()
+        }
+    }
+
+    /**
+     * A read that waits holds its thread. Dispatchers.IO has 64 for the whole process, so more waits than that at once
+     * (a provider gone silent with many connections) would leave every other IO task waiting behind them: waits run on
+     * the library's own view of it ([NntpDispatchers.IO]), whose threads IO's limit doesn't count, a caller on IO too.
+     */
+    @Test
+    fun `waits on more connections than Dispatchers IO has threads leave it to the rest of the process`() = runBlocking<Unit> {
+        val waits = 80
+        val received = CountDownLatch(waits)
+        silentServer(received)
+        val connections = List(waits) { NntpConnection.connect("localhost", serverSocket.localPort, selectorManager, readTimeoutMs = 10_000) }
+        try {
+            val pending = connections.map { connection -> callers.async { connection.command("DATE") } }
+            received.await(5, TimeUnit.SECONDS)
+            delay(200) // every command that could start waits for its answer
+            val waiting = waits - received.count
+            val started = System.nanoTime()
+            withTimeoutOrNull(5_000) { withContext(Dispatchers.IO) { } }
+            val tookMs = (System.nanoTime() - started) / 1_000_000
+            assertTrue(tookMs < 500, "a task on Dispatchers.IO waited $tookMs ms behind $waiting waiting reads")
+            assertEquals(0, received.count, "commands that never started, for want of a thread")
+            assertTrue(pending.all { it.isActive }, "a command ended before its answer")
+            pending.forEach { it.cancel() }
+        } finally {
+            connections.forEach { it.close() }
         }
     }
 
