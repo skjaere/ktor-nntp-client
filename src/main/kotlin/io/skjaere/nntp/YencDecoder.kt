@@ -19,6 +19,14 @@ internal object YencDecoder {
     // The most decodeWhole allocates up front, for headers that claim a huge body: it grows past it.
     private const val MAX_PRESIZE = 16 * 1024 * 1024
 
+    // A whole article's pump decodes once srcBuf has less room than this, not after every read: each decode is two
+    // native calls with JNA's allocations, and a read brings what one wake-up found, a few KB at times.
+    private const val BATCH_ROOM = 64 * 1024
+
+    // The article terminator, CRLF.CRLF, as the last five bytes read: the article is all in.
+    private const val TERMINATOR = 0x0D0A2E0D0AL
+    private const val LAST_FIVE = 0xFFFFFFFFFFL
+
     /**
      * Stream a yenc-encoded BODY response into the producer scope. Caller has exclusive
      * ownership of [connection] for the whole BODY operation (one [NntpClientPool.withClient]
@@ -51,7 +59,8 @@ internal object YencDecoder {
         val (headers, firstDataBytes, part) = readHeaders(connection)
         val body = DecodedBytes(presize(headers))
         val mismatch = failingTheBody(connection) {
-            pump(connection, firstDataBytes, part) { decoded, length -> body.append(decoded, length) }
+            // Nobody sees the body before its end: decode in batches.
+            pump(connection, firstDataBytes, part, batch = true) { decoded, length -> body.append(decoded, length) }
         }
         val article = YencArticle(headers, body.toByteArray())
         mismatch?.let { throw it.toException(article) }
@@ -192,12 +201,16 @@ internal object YencDecoder {
 
     /**
      * Returns the body's CRC mismatch with its =yend line, if any, for the caller to throw once it
-     * has the body: [part] says which of the line's CRCs is the body's ([crcMismatch]).
+     * has the body: [part] says which of the line's CRCs is the body's ([crcMismatch]). With [batch],
+     * what is read is decoded only once srcBuf is nearly full or the article is all in (its terminator
+     * the last bytes read, or the connection's end), for a caller that wants nothing before the end;
+     * without, after every read, so a reader of the Body channel gets each part as it comes.
      */
     private suspend fun pump(
         connection: NntpConnection,
         firstDataBytes: ByteArray?,
         part: Boolean,
+        batch: Boolean = false,
         emit: suspend (decoded: ByteBuffer, length: Int) -> Unit,
     ): CrcMismatch? {
         val buffers = connection.decodeBuffers()
@@ -208,8 +221,13 @@ internal object YencDecoder {
         var decoderState = RapidYencDecoderState.CRLF
         var crc = 0u
         var eof = false
+        // The last five bytes read, the newest lowest: [TERMINATOR] once the article is all in.
+        var lastFive = 0L
 
-        firstDataBytes?.let { srcBuf.put(it) }
+        firstDataBytes?.let {
+            srcBuf.put(it)
+            for (b in it) lastFive = (lastFive shl 8 or (b.toLong() and 0xFF)) and LAST_FIVE
+        }
 
         while (true) {
             // Top up srcBuf from the socket if there's room and we haven't seen EOF yet.
@@ -226,6 +244,13 @@ internal object YencDecoder {
                     // n == 0: nothing immediately available; if we have buffered data,
                     // proceed to decode it; otherwise keep waiting.
                     if (srcBuf.position() == 0) continue
+                } else {
+                    val end = srcBuf.position()
+                    for (i in maxOf(end - n, end - 5) until end) {
+                        lastFive = (lastFive shl 8 or (srcBuf.get(i).toLong() and 0xFF)) and LAST_FIVE
+                    }
+                    // More of the article is coming and there's room for it: read it before decoding.
+                    if (batch && lastFive != TERMINATOR && srcBuf.remaining() >= BATCH_ROOM) continue
                 }
             }
 

@@ -8,6 +8,8 @@ import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStream
@@ -129,6 +131,31 @@ class NntpWholeBodyTest {
             assertContentEquals(shorter, client.bodyYencBytes("<shorter@test>").data)
         }
     }
+
+    /**
+     * An article's last bytes may come by themselves, after a pause: the article ends there, with nothing more to wait
+     * for, wherever the cut falls (in the =yend line, its CRLF, the terminator's dot or its CRLF).
+     */
+    @ParameterizedTest
+    @ValueSource(ints = [1, 2, 3, 4, 5, 6, 40])
+    fun `an article whose last bytes come by themselves after a pause is read whole at once`(last: Int) =
+        runBlocking<Unit> {
+            val data = Random(30).nextBytes(500_000)
+            val whole = article(data)
+            serve({ out ->
+                out.write(whole, 0, whole.size - last)
+                out.flush()
+                Thread.sleep(300)
+                out.write(whole, whole.size - last, last)
+            })
+            NntpClient.connect("localhost", serverSocket.localPort, selectorManager, readTimeoutMs = 10_000).use { client ->
+                val started = System.nanoTime()
+                assertContentEquals(data, client.bodyYencBytes("<last@test>").data)
+                val tookMs = (System.nanoTime() - started) / 1_000_000
+                assertTrue(tookMs < 3_000, "the article took $tookMs ms, waiting for more after its end")
+                assertTrue(client.connection.isReusable)
+            }
+        }
 
     @Test
     fun `a missing article fails as not found and leaves the connection in step`() = runBlocking<Unit> {
