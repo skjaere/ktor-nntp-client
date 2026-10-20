@@ -4,7 +4,7 @@
 [![codecov](https://codecov.io/gh/skjaere/ktor-nntp-client/branch/main/graph/badge.svg)](https://codecov.io/gh/skjaere/ktor-nntp-client)
 [![](https://jitpack.io/v/skjaere/ktor-nntp-client.svg)](https://jitpack.io/#skjaere/ktor-nntp-client)
 
-A Kotlin NNTP (Network News Transfer Protocol) client library built on Ktor's asynchronous socket API. Implements all RFC 3977 commands plus streaming yEnc body decoding via [rapidyenc-kotlin-wrapper](https://github.com/skjaere/rapidyenc-kotlin-wrapper).
+A Kotlin NNTP (Network News Transfer Protocol) client library with Ktor's byte channels over the platform's sockets. Implements all RFC 3977 commands plus streaming yEnc body decoding via [rapidyenc-kotlin-wrapper](https://github.com/skjaere/rapidyenc-kotlin-wrapper).
 
 ## Features
 
@@ -20,7 +20,7 @@ A Kotlin NNTP (Network News Transfer Protocol) client library built on Ktor's as
 - Pipelined `STAT` for checking many articles in few round trips
 - SIMD-accelerated yEnc decoding via rapidyenc native library
 - CRC32 validation for yEnc articles
-- Coroutine-based async I/O with backpressure
+- Coroutine-based I/O: a connection reads its socket in the calling coroutine's own thread, on `Dispatchers.IO`, with no coroutine or dispatch between the socket and the reader; a read waiting for the server ends at once when its coroutine is cancelled
 - TLS from the platform (Conscrypt on Android, the JDK's on a JVM), 1.3 when the server offers it, with SNI and certificate hostname verification
 - Credential storage for automatic re-authentication on reconnect
 
@@ -219,7 +219,7 @@ Set `keepaliveIntervalMs = 0` to disable keepalive, and `idleGracePeriodMs = 0` 
 
 ### Read Timeout
 
-A read that gets no bytes from the server for `readTimeoutMs` (30 s by default) fails with `NntpConnectionException`, and the pool discards the connection, so a stalled server or a connection left half-open by a network change can't hang a command. It is an idle timeout: a long `BODY` or pipelined `STAT` batch that keeps receiving bytes is never cut off, and idle pooled connections are not affected. Pass `readTimeoutMs` to `NntpClientPool` or `NntpClient.connect`; `0` disables it.
+A read that gets no bytes from the server for `readTimeoutMs` (30 s by default) fails with `NntpConnectionException`, and the pool discards the connection, so a stalled server or a connection left half-open by a network change can't hang a command. It is an idle timeout: a long `BODY` or pipelined `STAT` batch that keeps receiving bytes is never cut off, and idle pooled connections are not affected. Pass `readTimeoutMs` to `NntpClientPool` or `NntpClient.connect`; `0` disables it. It runs on a real clock, under a test dispatcher too.
 
 ### Priority Scheduling
 
@@ -330,7 +330,8 @@ Connections also record `nntp.command.ack_latency`, the time from sending a comm
 - A command cancelled before its answer was read (e.g. a cancelled `bodyYenc()` or `stat()`) has the rest of the answer read off before its connection is reused, for up to 3 s; a cancelled `statPipelined()` returns at once and its answers are read off on the pool's scope. A connection that can't be brought back in step that way (a multi-line answer cut short, answers that don't come within the 3 s) is closed, and a new one is opened on demand
 - I/O errors (e.g., an `SSLException` from TLS, or a `ClosedByteChannelException` once the server has closed the connection) trigger automatic reconnect and retry with a different connection
 - Each `NntpClient` instance is safe for sequential use from any coroutine
-- A single `SelectorManager` can be shared across all connections
+- A connection's reads, writes and connect wait in the calling coroutine's thread when it runs on `Dispatchers.IO`, and move to `Dispatchers.IO` from any other dispatcher (Main, `runBlocking`'s, a test's), whose thread is never blocked
+- The `SelectorManager` that `NntpClientPool` and `connect` take is no longer used (each connection waits on a selector of its own); it is kept so callers compile as before
 
 ## Building
 

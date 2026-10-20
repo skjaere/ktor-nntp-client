@@ -1,10 +1,6 @@
 package io.skjaere.nntp
 
 import io.ktor.network.selector.SelectorManager
-import io.ktor.network.sockets.Socket
-import io.ktor.network.sockets.aSocket
-import io.ktor.network.sockets.openReadChannel
-import io.ktor.network.sockets.openWriteChannel
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.readAvailable
@@ -14,16 +10,13 @@ import io.ktor.utils.io.writeStringUtf8
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.io.IOException
+import java.nio.ByteBuffer
 import java.nio.channels.UnresolvedAddressException
 import java.security.GeneralSecurityException
-import java.util.concurrent.ScheduledThreadPoolExecutor
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Owns exactly one socket for its lifetime. Open in [connect], close in [close]. Never
@@ -37,13 +30,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 class NntpConnection private constructor(
     private val host: String,
     private val port: Int,
-    private val socket: Socket,
+    private val socket: NntpSocket,
     private val readChannel: ByteReadChannel,
     private val writeChannel: ByteWriteChannel,
     // With TLS, the session [readChannel] and [writeChannel] run through.
     private val tls: PlatformTls?,
     val welcomeResponse: NntpResponse,
-    private val readTimeoutMs: Long,
     // The pool.name tag of this connection's metrics.
     private val poolName: String
 ) : Closeable {
@@ -221,54 +213,15 @@ class NntpConnection private constructor(
         /** Default for how long a read waits for the server's next bytes (see [connect]). */
         const val DEFAULT_READ_TIMEOUT_MS = 30_000L
 
-        // Fires read timeouts on a real clock. A coroutine timeout would follow the caller's
-        // dispatcher, and on a test dispatcher's virtual clock it expires at once while a
-        // read waits on the network.
-        private val readTimeouts = ScheduledThreadPoolExecutor(1) { task ->
-            Thread(task, "nntp-read-timeout").apply { isDaemon = true }
-        }.apply { removeOnCancelPolicy = true }
-
-        /**
-         * Runs [read] on [channel], failing it with [NntpConnectionException] if it gets no
-         * bytes for [timeoutMs]. On expiry the channel is cancelled, which ends the
-         * connection: a server that went silent mid-response leaves the wire unusable.
-         */
-        private suspend fun <T> withReadTimeout(
-            channel: ByteReadChannel,
-            timeoutMs: Long,
-            host: String,
-            port: Int,
-            read: suspend () -> T
-        ): T {
-            if (timeoutMs <= 0) return read()
-            fun timedOut() = "No data from $host:$port for ${timeoutMs}ms"
-            // Settled by whichever comes first: the read finishing or the timer cancelling it.
-            val settled = AtomicBoolean(false)
-            val timer = readTimeouts.schedule({
-                if (settled.compareAndSet(false, true)) channel.cancel(NntpConnectionException(timedOut()))
-            }, timeoutMs, TimeUnit.MILLISECONDS)
-            val result = try {
-                read()
-            } catch (e: CancellationException) {
-                settled.set(true)
-                throw e
-            } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
-                if (settled.compareAndSet(false, true)) throw e
-                throw NntpConnectionException(timedOut(), e)
-            } finally {
-                timer.cancel(false)
-            }
-            // The timer fired as the read finished: the channel is cancelled all the same.
-            if (!settled.compareAndSet(false, true)) throw NntpConnectionException(timedOut())
-            return result
-        }
-
         /**
          * @param readTimeoutMs how long a read may wait without receiving a byte before the
          *   operation fails with [NntpConnectionException]: a stalled server, or a half-open
          *   TCP connection after a network change. An idle timeout, not a deadline: a long
          *   BODY or pipelined STAT batch that keeps receiving bytes never times out, and an
-         *   idle connection with no read pending is never affected. 0 or less disables it.
+         *   idle connection with no read pending is never affected. 0 or less disables it. It runs on a real
+         *   clock, also under a test dispatcher.
+         * @param selectorManager no longer used: a connection reads its socket in its caller's thread ([NntpSocket]).
+         *   Kept so callers compile as before.
          * @param useTls TLS from the platform (Conscrypt on Android, the JDK's elsewhere): 1.3 when the
          *   server offers it, else 1.2. Its handshake's reads are bounded by [readTimeoutMs] too.
          * @param verifyHostname with [useTls], check that the server's certificate names [host]
@@ -291,14 +244,14 @@ class NntpConnection private constructor(
         internal suspend fun connect(
             host: String,
             port: Int,
-            selectorManager: SelectorManager,
+            @Suppress("UNUSED_PARAMETER") selectorManager: SelectorManager,
             useTls: Boolean,
             readTimeoutMs: Long,
             verifyHostname: Boolean,
             poolName: String
         ): NntpConnection {
             val transport = try {
-                openTransport(host, port, selectorManager, useTls, verifyHostname, readTimeoutMs)
+                openTransport(host, port, useTls, verifyHostname, readTimeoutMs)
             } catch (e: UnresolvedAddressException) {
                 throw NntpConnectionException("Unknown host $host", e)
             } catch (e: IOException) {
@@ -312,8 +265,8 @@ class NntpConnection private constructor(
             // Anything that throws between openTransport and a successful return must close
             // the socket; otherwise its FD is held by the JVM until process exit.
             try {
-                val readChannel = transport.read
-                val welcomeLine = withReadTimeout(readChannel, readTimeoutMs, host, port) { readChannel.readLine() }
+                // Bounded by the read timeout, as every read on the socket is.
+                val welcomeLine = transport.read.readLine()
                     ?: throw NntpConnectionException("Connection closed before welcome message")
                 val welcomeResponse = parseResponseLine(welcomeLine)
                 if (welcomeResponse.code != 200 && welcomeResponse.code != 201) {
@@ -323,8 +276,8 @@ class NntpConnection private constructor(
                     )
                 }
                 return NntpConnection(
-                    host, port, transport.socket, readChannel, transport.write, transport.tls, welcomeResponse,
-                    readTimeoutMs, poolName
+                    host, port, transport.socket, transport.read, transport.write, transport.tls, welcomeResponse,
+                    poolName
                 )
             } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
                 transport.abandon()
@@ -334,15 +287,14 @@ class NntpConnection private constructor(
 
         /** A connected socket and the channels the connection reads and writes: through [tls], with TLS. */
         private class Transport(
-            val socket: Socket,
+            val socket: NntpSocket,
             val read: ByteReadChannel,
             val write: ByteWriteChannel,
             val tls: PlatformTls?
         ) {
             /** Closes what a connect that failed after it was opened leaves. */
             fun abandon() {
-                runCatching { socket.socketContext.cancel() }
-                runCatching { socket.close() }
+                socket.close()
                 tls?.let { runCatching { it.release() } }
             }
         }
@@ -350,21 +302,19 @@ class NntpConnection private constructor(
         private suspend fun openTransport(
             host: String,
             port: Int,
-            selectorManager: SelectorManager,
             useTls: Boolean,
             verifyHostname: Boolean,
             readTimeoutMs: Long
         ): Transport {
             log.debug("openTransport called with host='{}', port={}, useTls={}", host, port, useTls)
-            val socket = aSocket(selectorManager).tcp().connect(host, port)
-            val plain = Transport(socket, socket.openReadChannel(), socket.openWriteChannel(autoFlush = true), null)
+            val socket = NntpSocket.connect(host, port, readTimeoutMs)
+            val plain = Transport(socket, socket.read, socket.write, null)
             if (!useTls) return plain
             // The TLS handshake can fail (a certificate refused, the server's abort, the network); the TCP
             // socket is open already and would otherwise leak.
             return try {
-                val tls = PlatformTls.connect(host, port, verifyHostname, plain.read, plain.write) { read ->
-                    withReadTimeout(plain.read, readTimeoutMs, host, port, read)
-                }
+                // Its reads from the socket are bounded by the read timeout, as the connection's are.
+                val tls = PlatformTls.connect(host, port, verifyHostname, plain.read, plain.write)
                 Transport(socket, tls.read, tls.write, tls)
             } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
                 plain.abandon()
@@ -493,13 +443,22 @@ class NntpConnection private constructor(
         .tag("pool.name", poolName)
         .register(registry)
 
-    /** [withReadTimeout] with this connection's read timeout. A read that fails is its [failure]. */
-    private suspend fun <T> timedRead(read: suspend () -> T): T =
-        failing { withReadTimeout(readChannel, readTimeoutMs, host, port, read) }
+    /**
+     * A read, bounded by the read timeout as every read on the socket is ([NntpSocket]). A read that fails is the
+     * connection's [failure]. Inline, so a read allocates no lambda.
+     */
+    private inline fun <T> timedRead(read: () -> T): T = failing(read)
 
     /** Reads what's available, up to [length] bytes, or -1 at EOF; bounded by the read timeout. */
     internal suspend fun readAvailable(dst: ByteArray, offset: Int = 0, length: Int = dst.size - offset): Int =
         timedRead { readChannel.readAvailable(dst, offset, length) }
+
+    /**
+     * Reads what's available into [dst], as much as it has room for, or -1 at EOF; bounded by the read timeout. Without
+     * TLS the socket's bytes go straight into [dst] ([NntpSocket.Reader.readAvailable]).
+     */
+    internal suspend fun readAvailable(dst: ByteBuffer): Int =
+        timedRead { if (tls == null) socket.read.readAvailable(dst) else readChannel.readAvailable(dst) }
 
     suspend fun readResponse(): NntpResponse {
         val line = timedRead { readChannel.readLine() }
@@ -694,30 +653,18 @@ class NntpConnection private constructor(
     }
 
     /**
-     * Cancel the actor coroutines, wait for them to settle, then close the SocketChannel
-     * in a `finally` so the FD is released even if the join propagates a Throwable.
-     *
-     * Why join before close: under Ktor 3.x, [Socket.close] called immediately after
-     * `socketContext.cancel()` can land while the read/write actor still holds the
-     * channel — close() then returns without releasing the underlying FD, producing
-     * orphan socket FDs (visible in /proc/<pid>/fd but not in /proc/net/tcp).
-     *
-     * A coroutine still reading or writing (the pool's close() closes connections callers
-     * have checked out) fails with an I/O error whose cause says the connection was closed.
-     * The socket's cancellation alone would reach it as a CancellationException, which it
-     * would take for its own cancellation.
+     * Closes the socket, its descriptor with it. A coroutine still reading or writing (the pool's close() closes
+     * connections callers have checked out) fails with an I/O error whose cause says the connection was closed: the
+     * channels are cancelled with it first (with TLS, TLS's pass it on to the socket's). A cancellation would reach it
+     * as a CancellationException, which it would take for its own.
      */
     override fun close() {
         try {
             val closedCause = NntpConnectionException("Connection to $host:$port closed")
             readChannel.cancel(closedCause)
             writeChannel.cancel(closedCause)
-            socket.socketContext.cancel()
-            runBlocking { runCatching { socket.socketContext.join() } }
         } finally {
-            runCatching { socket.close() }.onFailure {
-                log.warn("Socket close failed for {}:{}: {}", host, port, it.message, it)
-            }
+            socket.close()
             tls?.let { runCatching { it.release() } }
             decodeBuffers = null
         }

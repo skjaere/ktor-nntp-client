@@ -7,6 +7,7 @@ import io.skjaere.yenc.RapidYenc
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
@@ -361,6 +362,31 @@ class NntpTlsTransportTest {
             assertEquals(1, server.accepted, "connections: the drained one should have been reused")
         } finally {
             pool.close()
+        }
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `a STAT waiting on a server that never answers ends as soon as its caller is cancelled`() = runBlocking<Unit> {
+        val received = CountDownLatch(1)
+        val server = server { session ->
+            while (session.reader.readLine() != null) received.countDown()
+        }
+        val client = client(server)
+        val callers = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        try {
+            val pending = callers.async { client.stat("<a@b>") }
+            assertTrue(received.await(5, TimeUnit.SECONDS), "the STAT never reached the server")
+            Thread.sleep(100) // the STAT waits for its answer
+            val started = System.nanoTime()
+            pending.cancel()
+            withTimeout(5_000) { pending.join() }
+            val tookMs = (System.nanoTime() - started) / 1_000_000
+            assertTrue(tookMs < 1_000, "the cancelled STAT ended $tookMs ms after its cancel")
+            assertTrue(pending.isCancelled, "the STAT was not cancelled: ${pending.getCompletionExceptionOrNull()}")
+        } finally {
+            callers.cancel()
+            client.close()
         }
     }
 

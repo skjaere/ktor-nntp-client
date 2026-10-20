@@ -44,6 +44,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.io.IOException
@@ -1016,6 +1017,9 @@ class NntpClientPool(
         // otherwise the connection would never be handed back, and its slot would be lost.
         scope.launch(start = CoroutineStart.UNDISPATCHED) {
             withContext(NonCancellable) {
+                // Off the caller's thread before the first read: a read that waits blocks its thread (NntpSocket),
+                // and the caller goes on at once.
+                yield()
                 val drained = try {
                     withTimeoutOrNull(DRAIN_TIMEOUT_MS) { client.connection.drainUntilArticleEnd() } ?: false
                 } catch (e: CancellationException) {

@@ -62,10 +62,10 @@ internal class PlatformTls private constructor(
     val description: String get() = engine.session.let { "${it.protocol} ${it.cipherSuite}" }
 
     /**
-     * Runs the handshake, each read from the socket in it bounded by [timedRead] as the connection's reads are. The
-     * welcome or anything else the server sends with its last flight is kept for [read].
+     * Runs the handshake, each read from the socket in it bounded by the socket's read timeout as the connection's reads
+     * are. The welcome or anything else the server sends with its last flight is kept for [read].
      */
-    private suspend fun handshake(timedRead: suspend (suspend () -> Int) -> Int) {
+    private suspend fun handshake() {
         engine.beginHandshake()
         while (true) {
             when (engine.handshakeStatus) {
@@ -76,7 +76,7 @@ internal class PlatformTls private constructor(
                 else -> {
                     val result = unwrap()
                     when (result.status) {
-                        Status.BUFFER_UNDERFLOW -> if (timedRead { readSocket() } < 0) {
+                        Status.BUFFER_UNDERFLOW -> if (readSocket() < 0) {
                             throw EOFException("The server closed the connection in the TLS handshake")
                         }
                         Status.CLOSED -> throw SSLException("The server ended TLS in the handshake")
@@ -299,9 +299,9 @@ internal class PlatformTls private constructor(
             ByteBuffer.allocate(maxOf(size, buffer.capacity() * 2)).put(buffer.flip())
 
         /**
-         * TLS to [host]:[port] over [rawRead] and [rawWrite], after its handshake ([handshake]'s [timedRead]). With
-         * [verifyHostname] the certificate must name [host] ([HostnameVerifyingTrustManager]) and a host name is sent
-         * as the server name (SNI); without it the certificate only has to be trusted, and no server name is sent.
+         * TLS to [host]:[port] over [rawRead] and [rawWrite], after its handshake. With [verifyHostname] the certificate
+         * must name [host] ([HostnameVerifyingTrustManager]) and a host name is sent as the server name (SNI); without it
+         * the certificate only has to be trusted, and no server name is sent.
          */
         suspend fun connect(
             host: String,
@@ -309,7 +309,6 @@ internal class PlatformTls private constructor(
             verifyHostname: Boolean,
             rawRead: ByteReadChannel,
             rawWrite: ByteWriteChannel,
-            timedRead: suspend (suspend () -> Int) -> Int,
         ): PlatformTls {
             val trustManager: X509TrustManager = HostnameVerifyingTrustManager.platformDefault()
                 .let { if (verifyHostname) HostnameVerifyingTrustManager(it, host) else it }
@@ -328,7 +327,7 @@ internal class PlatformTls private constructor(
             }
             val tls = PlatformTls(engine, rawRead, rawWrite)
             try {
-                tls.handshake(timedRead)
+                tls.handshake()
             } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
                 tls.release()
                 throw e
