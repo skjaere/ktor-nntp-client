@@ -315,10 +315,14 @@ internal class NntpSocket private constructor(
          */
         suspend fun connect(host: String, port: Int, readTimeoutMs: Long): NntpSocket {
             val context = currentCoroutineContext()
-            return if (context.onIo()) {
-                open(host, port, readTimeoutMs, context[Job])
-            } else {
-                withContext(Dispatchers.IO) { open(host, port, readTimeoutMs, coroutineContext[Job]) }
+            if (context.onIo()) return open(host, port, readTimeoutMs, context[Job])
+            var opened: NntpSocket? = null
+            try {
+                return withContext(Dispatchers.IO) { open(host, port, readTimeoutMs, coroutineContext[Job]).also { opened = it } }
+            } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {
+                // Cancelled once the hop had connected, withContext drops the socket it returns: nobody else could close it.
+                opened?.close()
+                throw e
             }
         }
 

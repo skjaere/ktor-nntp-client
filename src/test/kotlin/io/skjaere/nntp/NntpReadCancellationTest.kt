@@ -4,6 +4,7 @@ import io.ktor.network.selector.SelectorManager
 import io.skjaere.yenc.RapidYenc
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
@@ -304,6 +305,43 @@ class NntpReadCancellationTest {
             assertEquals(1, accepted.get(), "the connection was discarded and another one opened")
         } finally {
             pool.close()
+            caller.close()
+        }
+    }
+
+    /**
+     * A caller off Dispatchers.IO connects through a hop there. Cancelled once the hop has connected but before the
+     * caller resumes (its thread busy meanwhile), the hop's socket is dropped with its result: it must be closed, not
+     * left open with its descriptors and the server's session.
+     */
+    @Test
+    fun `a connect cancelled after the hop to IO connected closes its socket`() = runBlocking<Unit> {
+        val callerThread = Executors.newSingleThreadExecutor()
+        val caller = callerThread.asCoroutineDispatcher()
+        val busy = CountDownLatch(1)
+        try {
+            // The caller's thread busy from the start: the connect runs up to its hop here, and its result waits.
+            callerThread.execute { busy.await(10, TimeUnit.SECONDS) }
+            val pending = CoroutineScope(caller).async(start = CoroutineStart.UNDISPATCHED) {
+                NntpConnection.connect("localhost", serverSocket.localPort, selectorManager)
+            }
+            serverSocket.soTimeout = 5_000
+            val accepted = serverSocket.accept()
+            held += accepted
+            delay(300) // the hop has connected, and its result waits for the caller's thread
+            pending.cancel()
+            busy.countDown()
+            withTimeout(5_000) { pending.join() }
+            assertTrue(pending.isCancelled, "the connect was not cancelled: ${pending.getCompletionExceptionOrNull()}")
+            accepted.soTimeout = 3_000
+            val read = try {
+                accepted.getInputStream().read()
+            } catch (_: SocketTimeoutException) {
+                null
+            }
+            assertEquals(-1, read, "the client's socket is still open")
+        } finally {
+            busy.countDown()
             caller.close()
         }
     }
