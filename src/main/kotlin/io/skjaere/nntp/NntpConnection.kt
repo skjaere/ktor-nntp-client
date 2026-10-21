@@ -179,9 +179,9 @@ class NntpConnection private constructor(
 
     /**
      * Runs [block], recording anything it throws but a cancellation as the connection's [failure]. An I/O error is the
-     * connection's end, whatever the socket or Ktor's channel called it (a reset, the stream's end in the middle of a
-     * line, the connection closed under the read): it is thrown as an [NntpConnectionException], as the read timeout
-     * is, with the error as its cause.
+     * connection's end, whatever the socket or Ktor's channel called it, and is thrown with the error as its cause: as an
+     * [NntpConnectionLostException] when the server or the network ended it (a reset, the stream's end in the middle of
+     * a line), as a plain [NntpConnectionException], as the read timeout is, when [close] closed it under the read.
      */
     private inline fun <T> failing(block: () -> T): T = try {
         block()
@@ -194,14 +194,18 @@ class NntpConnection private constructor(
     }
 
     private fun connectionFailure(e: IOException): NntpConnectionException {
-        // A close's channels fail their reads with the close's own exception as the cause: its message says it.
-        val closed = (e as? ClosedByteChannelException)?.cause as? NntpConnectionException
-        val message = when {
-            closed != null -> closed.message
-            e is EOFException -> "Connection to $host:$port closed unexpectedly"
+        // A close's channels fail their reads with the close's own exception as the cause: its message says it. Under
+        // coroutines' stack trace recovery (assertions on, as in tests) a copy of the channel's exception wraps it.
+        val closed = generateSequence<Throwable>(e) { (it as? ClosedByteChannelException)?.cause }
+            .take(MAX_CLOSE_WRAPPING).firstNotNullOfOrNull { it as? NntpConnectionException }
+        if (closed != null) return NntpConnectionException(closed.message ?: "Connection to $host:$port closed", e)
+        // Anything else is the server or the network ending a connection that was up, which a caller may want to tell
+        // from a server it can't reach.
+        val message = when (e) {
+            is EOFException -> "Connection to $host:$port closed unexpectedly"
             else -> "Connection to $host:$port failed: ${e.message ?: e::class.simpleName}"
         }
-        return NntpConnectionException(message ?: "Connection to $host:$port failed", e)
+        return NntpConnectionLostException(message, e)
     }
 
     /**
@@ -710,3 +714,6 @@ class NntpConnection private constructor(
 }
 
 private const val DEFAULT_QUIT_TIMEOUT_MS = 5_000L
+
+// How deep [NntpConnection]'s failures look for a close's own exception under the channel exceptions wrapping it.
+private const val MAX_CLOSE_WRAPPING = 4

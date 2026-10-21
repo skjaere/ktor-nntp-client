@@ -336,8 +336,9 @@ internal object YencDecoder {
 
     // EOF mid-article: the server closed the connection, under TLS with its close_notify or
     // without (PlatformTls takes a FIN without one for the end of the stream, as Ktor's TLS did).
+    // A connection lost on the way, as a reset there is.
     private fun closedMidArticle() =
-        NntpConnectionException("Connection closed mid-article, before =yend or the article terminator")
+        NntpConnectionLostException("Connection closed mid-article, before =yend or the article terminator")
 
     /** What followed the "=y" rapidyenc stopped at: its [yendLine] (null if cut short), and whether the article terminator [ended] it. */
     private class Tail(val yendLine: String?, val ended: Boolean)

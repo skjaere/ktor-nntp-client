@@ -21,11 +21,14 @@ import java.util.concurrent.TimeUnit
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * A connection that fails under a command fails it with an [NntpConnectionException], whatever ended it: the server
- * closing in the middle of a line, a reset, or the connection closed under the read. Its cause is the I/O error.
+ * A connection that fails under a command fails it with an [NntpConnectionException], whatever ended it. One the server
+ * or the network ended (a close in the middle of a line or of an article's data, a reset) is an
+ * [NntpConnectionLostException], its cause the I/O error if there was one; one the read timeout or our own close ended
+ * stays a plain [NntpConnectionException], as does a connect that fails.
  */
 @Timeout(30, unit = TimeUnit.SECONDS)
 class NntpConnectionFailureTest {
@@ -64,10 +67,20 @@ class NntpConnectionFailureTest {
         }.apply { isDaemon = true }.start()
     }
 
-    private suspend fun client() = NntpClient.connect("localhost", serverSocket.localPort, selectorManager)
+    private suspend fun client(readTimeoutMs: Long = NntpConnection.DEFAULT_READ_TIMEOUT_MS) =
+        NntpClient.connect("localhost", serverSocket.localPort, selectorManager, readTimeoutMs = readTimeoutMs)
+
+    /** Sends a BODY's status line, its yEnc headers and a line of its data, the rest of the article not following. */
+    private fun Socket.sendArticleStart() {
+        getOutputStream().apply {
+            write("222 0 <cut@test>\r\n=ybegin part=1 line=128 size=716800 name=x.bin\r\n=ypart begin=1 end=716800\r\n".toByteArray())
+            write("0123456789abcdefghijklmnopqrstuvwxyz\r\n".toByteArray())
+            flush()
+        }
+    }
 
     @Test
-    fun `a server that closes after an article's =ybegin line fails the body as a closed connection`() = runBlocking<Unit> {
+    fun `a server that closes after an article's =ybegin line fails the body as a lost connection`() = runBlocking<Unit> {
         serveOnce { socket ->
             socket.getOutputStream().apply {
                 write("222 0 <cut@test>\r\n=ybegin part=1 line=128 size=716800 name=x.bin\r\n".toByteArray())
@@ -75,27 +88,66 @@ class NntpConnectionFailureTest {
             }
         }
         client().use { client ->
-            val failure = assertFailsWith<NntpConnectionException> { client.bodyYencBytes("<cut@test>") }
+            val failure = assertFailsWith<NntpConnectionLostException> { client.bodyYencBytes("<cut@test>") }
             assertTrue(failure.cause is java.io.EOFException, "the cause should be the end of the stream: ${failure.cause}")
             assertFalse(client.connection.isReusable)
         }
     }
 
     @Test
-    fun `a reset fails the command as a connection failure`() = runBlocking<Unit> {
+    fun `a server that closes in the middle of an article's data fails the body as a lost connection`() = runBlocking<Unit> {
+        serveOnce { socket -> socket.sendArticleStart() }
+        client().use { client ->
+            val failure = assertFailsWith<NntpConnectionLostException> { client.bodyYencBytes("<cut@test>") }
+            // The socket's end: no I/O error, just no more bytes.
+            assertNull(failure.cause, "a close in the data ends the stream without an I/O error: ${failure.cause}")
+            assertFalse(client.connection.isReusable)
+        }
+    }
+
+    @Test
+    fun `a reset fails the command as a lost connection`() = runBlocking<Unit> {
         serveOnce { socket ->
             // Closed with SO_LINGER 0: the client gets a reset, not a FIN.
             socket.setSoLinger(true, 0)
         }
         client().use { client ->
-            val failure = assertFailsWith<NntpConnectionException> { client.stat("<a@b>") }
+            val failure = assertFailsWith<NntpConnectionLostException> { client.stat("<a@b>") }
             assertIs<java.io.IOException>(failure.cause)
             assertFalse(client.connection.isReusable)
         }
     }
 
     @Test
-    fun `a connection closed under a waiting STAT fails it as a closed connection`() = runBlocking<Unit> {
+    fun `a reset in the middle of an article's data fails the body as a lost connection`() = runBlocking<Unit> {
+        serveOnce { socket ->
+            socket.sendArticleStart()
+            socket.setSoLinger(true, 0)
+        }
+        client().use { client ->
+            val failure = assertFailsWith<NntpConnectionLostException> { client.bodyYencBytes("<cut@test>") }
+            assertIs<java.io.IOException>(failure.cause)
+            assertFalse(client.connection.isReusable)
+        }
+    }
+
+    @Test
+    fun `the read timeout fails the command as a connection failure, not a lost connection`() = runBlocking<Unit> {
+        val answer = CountDownLatch(1)
+        serveOnce { answer.await(10, TimeUnit.SECONDS) }
+        try {
+            client(readTimeoutMs = 300).use { client ->
+                val failure = assertFailsWith<NntpConnectionException> { client.stat("<a@b>") }
+                assertFalse(failure is NntpConnectionLostException, "the read timeout isn't a lost connection: $failure")
+                assertFalse(client.connection.isReusable)
+            }
+        } finally {
+            answer.countDown()
+        }
+    }
+
+    @Test
+    fun `a connection closed under a waiting STAT fails it as a closed connection, not a lost one`() = runBlocking<Unit> {
         val received = CountDownLatch(1)
         val answer = CountDownLatch(1)
         serveOnce {
@@ -111,6 +163,7 @@ class NntpConnectionFailureTest {
             withTimeout(5_000) { pending.join() }
             val failure = pending.getCompletionExceptionOrNull()
             assertIs<NntpConnectionException>(failure, "expected a connection failure, got $failure")
+            assertFalse(failure is NntpConnectionLostException, "our own close isn't a lost connection: $failure")
         } finally {
             answer.countDown()
             client.close()
