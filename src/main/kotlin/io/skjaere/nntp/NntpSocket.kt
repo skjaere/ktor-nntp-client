@@ -46,7 +46,7 @@ import kotlin.coroutines.CoroutineContext
  * holds its starter while it waits: it should yield first, as the pool's drain does.
  *
  * Its [Reader] and writer are Ktor's ByteReadChannel and ByteWriteChannel, so readLine, the drain and TLS work over
- * them as over Ktor's socket, through members Ktor marks @InternalAPI: built against Ktor 3.4.x, they need that version
+ * them as over Ktor's socket, through members Ktor marks @InternalAPI: built against Ktor 3.5.x, they need that version
  * at run time (see the README).
  */
 internal class NntpSocket private constructor(

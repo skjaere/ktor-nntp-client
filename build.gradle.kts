@@ -29,6 +29,9 @@ dependencies {
     // Android's TLS, BoringSSL under Conscrypt, for the transport's tests on the JVM (NntpTlsConscryptTransportTest).
     testImplementation(libs.conscrypt.openjdk.uber)
     testImplementation(libs.mock.nntp.testcontainer)
+    // The mock's release brings Ktor 3.4.0's client and server: lifted to the Ktor this library is built with, so the
+    // tests don't run them beside a newer ktor-io. Until the mock moves to that Ktor itself.
+    testImplementation(platform(libs.ktor.bom))
     testImplementation(libs.testcontainers)
     testImplementation(libs.testcontainers.junit.jupiter)
 }

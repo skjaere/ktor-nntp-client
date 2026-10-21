@@ -335,7 +335,7 @@ Connections also record `nntp.command.ack_latency`, the time from sending a comm
 - The `SelectorManager` that `NntpClientPool` and `connect` take is no longer used (each connection waits on a selector of its own); it is kept so callers compile as before
 - Each read, write or connect that waits for the server holds one of `NntpDispatchers.IO`'s threads while it waits: a read for up to `readTimeoutMs` (30 s by default), a connect until it succeeds or fails (a pool's for 20 s at most), a write for as long as the server takes to read. At most `NntpDispatchers.PARALLELISM` (512) wait at once, across every pool and connection in the process; one more waits its turn. `Dispatchers.IO`'s own threads (64 by default, `kotlinx.coroutines.io.parallelism`) are never held by them
 - A caller on `NntpDispatchers.IO` waits in place; a caller anywhere else (`runBlocking`, Main, `Dispatchers.IO`, `Dispatchers.Default`) moves to it and back for each read that waits, two dispatches each, which costs some CPU at streaming rates. Run work that reads a lot, such as a stream's fetches, on `NntpDispatchers.IO`
-- A connection's read and write channels implement Ktor's `ByteReadChannel` and `ByteWriteChannel` (`rawReadChannel` returns one), interfaces built to be implemented within Ktor: their `readBuffer` and `writeBuffer` are `@InternalAPI`, and a Ktor release may change them. Keep Ktor at the version this library was built with (3.4.x, see Dependencies) rather than letting a dependency update move it alone: a mismatch shows only at run time, as an `AbstractMethodError` or `NoSuchMethodError` on the first read
+- A connection's read and write channels implement Ktor's `ByteReadChannel` and `ByteWriteChannel` (`rawReadChannel` returns one), interfaces built to be implemented within Ktor: their `readBuffer` and `writeBuffer` are `@InternalAPI`, and a Ktor release may change them. Keep Ktor at the version this library was built with (3.5.x, see Dependencies) rather than letting a dependency update move it alone: a mismatch shows only at run time, as an `AbstractMethodError` or `NoSuchMethodError` on the first read
 
 ## Building
 
@@ -347,7 +347,7 @@ Connections also record `nntp.command.ack_latency`, the time from sending a comm
 
 ## Dependencies
 
-- Ktor Network 3.4.1
+- Ktor Network 3.5.2
 - rapidyenc-kotlin-wrapper 0.3.0
-- Kotlin Coroutines 1.10.1
+- Kotlin Coroutines 1.11.0
 - Micrometer 1.14.4
