@@ -3,7 +3,7 @@ kotlin = "2.3.0"
 ktor = "3.4.1"
 junit = "5.11.4"
 kotlinx-coroutines = "1.10.1"
-testcontainers = "2.0.3"
+testcontainers = "2.0.5"
 micrometer = "1.14.4"
 
 [libraries]
@@ -25,4 +25,4 @@ testcontainers-junit-jupiter = { module = "org.testcontainers:testcontainers-jun
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
-kotlinx-kover = { id = "org.jetbrains.kotlinx.kover", version = "0.9.1" }
+kotlinx-kover = { id = "org.jetbrains.kotlinx.kover", version = "0.9.11" }
