@@ -1,0 +1,2 @@
+# Heap dumps: a Gradle daemon that runs out of memory writes one into the build's directory.
+*.hprof
