@@ -4,7 +4,7 @@ ktor = "3.5.2"
 junit = "5.11.4"
 kotlinx-coroutines = "1.11.0"
 testcontainers = "2.0.5"
-micrometer = "1.14.4"
+micrometer = "1.16.7"
 
 [libraries]
 ktor-network = { module = "io.ktor:ktor-network", version.ref = "ktor" }

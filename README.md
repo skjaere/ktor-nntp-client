@@ -350,4 +350,4 @@ Connections also record `nntp.command.ack_latency`, the time from sending a comm
 - Ktor Network 3.5.2
 - rapidyenc-kotlin-wrapper 0.3.0
 - Kotlin Coroutines 1.11.0
-- Micrometer 1.14.4
+- Micrometer 1.16.7
