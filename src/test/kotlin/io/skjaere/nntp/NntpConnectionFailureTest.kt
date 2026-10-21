@@ -131,6 +131,27 @@ class NntpConnectionFailureTest {
         }
     }
 
+    /** A connect fails with an [NntpConnectionException] as its KDoc says, also when the greeting is cut off (K48). */
+    @Test
+    fun `a reset while the welcome is read fails the connect as a connection failure, not a lost connection`() = runBlocking<Unit> {
+        Thread {
+            runCatching {
+                serverSocket.accept().use { socket ->
+                    socket.getOutputStream().apply {
+                        write("200 wel".toByteArray())
+                        flush()
+                    }
+                    // Long enough for the client to have connected and wait for the rest of the line.
+                    Thread.sleep(200)
+                    socket.setSoLinger(true, 0)
+                }
+            }
+        }.apply { isDaemon = true }.start()
+        val failure = assertFailsWith<NntpConnectionException> { client() }
+        assertFalse(failure is NntpConnectionLostException, "a connect that fails isn't a lost connection: $failure")
+        assertIs<java.io.IOException>(failure.cause)
+    }
+
     @Test
     fun `the read timeout fails the command as a connection failure, not a lost connection`() = runBlocking<Unit> {
         val answer = CountDownLatch(1)

@@ -253,7 +253,8 @@ class NntpConnection private constructor(
          *   the certificate only has to be trusted, whatever host it names, and no server name
          *   is sent: for a server reached by an address its certificate doesn't list.
          * @throws NntpConnectionException if the connection can't be opened: the host name
-         *   doesn't resolve, the connect is refused or fails, or the TLS handshake fails.
+         *   doesn't resolve, the connect is refused or fails, the TLS handshake fails, or the
+         *   greeting doesn't come whole.
          */
         suspend fun connect(
             host: String,
@@ -290,8 +291,12 @@ class NntpConnection private constructor(
             // the socket; otherwise its FD is held by the JVM until process exit.
             try {
                 // Bounded by the read timeout, as every read on the socket is.
-                val welcomeLine = transport.read.readLine()
-                    ?: throw NntpConnectionException("Connection closed before welcome message")
+                val welcomeLine = try {
+                    transport.read.readLine()
+                } catch (e: IOException) {
+                    // A reset, or TLS failing, before the greeting's end: the connect failed, as a refused one does.
+                    throw NntpConnectionException("Could not connect to $host:$port: ${e.message ?: e::class.simpleName}", e)
+                } ?: throw NntpConnectionException("Connection closed before welcome message")
                 val welcomeResponse = parseResponseLine(welcomeLine)
                 if (welcomeResponse.code != 200 && welcomeResponse.code != 201) {
                     throw NntpProtocolException(
