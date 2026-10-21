@@ -526,6 +526,13 @@ class NntpConnection private constructor(
     }
 
     /**
+     * As [readLine], for a line of an article after its status line: the stream's end there is the connection lost
+     * mid-article, as anywhere else in the article.
+     */
+    internal suspend fun readArticleLine(): String = readLineOrNull()
+        ?: throw failed(NntpConnectionLostException("Connection closed mid-article, before its =ybegin line"))
+
+    /**
      * Read a line as raw bytes (ISO-8859-1), without UTF-8 interpretation.
      * Returns the line content without the trailing CRLF.
      * Use this for reading data that may contain non-ASCII bytes (e.g., yenc-encoded data).

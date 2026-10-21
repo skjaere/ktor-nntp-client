@@ -26,7 +26,7 @@ import kotlin.test.assertTrue
 
 /**
  * A connection that fails under a command fails it with an [NntpConnectionException], whatever ended it. One the server
- * or the network ended (a close in the middle of a line or of an article's data, a reset) is an
+ * or the network ended (a close in the middle of a line or of an article, a reset) is an
  * [NntpConnectionLostException], its cause the I/O error if there was one; one the read timeout or our own close ended
  * stays a plain [NntpConnectionException], as does a connect that fails.
  */
@@ -84,6 +84,15 @@ class NntpConnectionFailureTest {
         getOutputStream().apply {
             write(text.toByteArray())
             flush()
+        }
+    }
+
+    @Test
+    fun `a server that closes right after a BODY's status line fails the body as a lost connection`() = runBlocking<Unit> {
+        serveOnce { socket -> socket.send("222 0 <cut@test>\r\n") }
+        client().use { client ->
+            assertFailsWith<NntpConnectionLostException> { client.bodyYencBytes("<cut@test>") }
+            assertFalse(client.connection.isReusable)
         }
     }
 

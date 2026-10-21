@@ -83,7 +83,7 @@ internal object YencDecoder {
         // Skip blank lines before =ybegin (real NNTP servers send header/body separator)
         var ybeginLine: String
         while (true) {
-            ybeginLine = connection.readLine()
+            ybeginLine = connection.readArticleLine()
             if (ybeginLine.startsWith("=ybegin ")) break
             if (ybeginLine.isNotBlank()) {
                 throw YencDecodingException("Expected =ybegin line, got: $ybeginLine")
