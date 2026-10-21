@@ -142,6 +142,37 @@ class NntpPoolWireStateTest {
         }
     }
 
+    /** The answer the drain reads off cut short by the server's close: the connection is gone, not back in step. */
+    @Test
+    @Timeout(15, unit = TimeUnit.SECONDS)
+    fun `a STAT cancelled before its answer, which the server cuts off and closes, does not pool its connection`() =
+        runBlocking<Unit> {
+            val accepted = launchServer { _, cmd, _, out ->
+                when (cmd) {
+                    "STAT <slow@test>" -> {
+                        Thread.sleep(SLOW_ANSWER_MS)
+                        out.write("223 0 <slow@te".toByteArray())
+                        out.flush()
+                        out.close()
+                    }
+                    else -> out.send("430 no such article")
+                }
+            }
+            val pool = pool(commandRetries = 0)
+            pool.wake()
+            try {
+                assertIs<StatResult.NotFound>(pool.stat("<warm@test>"))
+
+                assertNull(withTimeoutOrNull(CANCEL_AFTER_MS) { pool.stat("<slow@test>") })
+
+                val next = pool.stat("<missing@test>")
+                assertIs<StatResult.NotFound>(next, "the next STAT went to the closed connection: $next")
+                assertEquals(2, accepted.get(), "the closed connection should have been left out")
+            } finally {
+                pool.close()
+            }
+        }
+
     @Test
     @Timeout(15, unit = TimeUnit.SECONDS)
     fun `a HEAD cancelled mid-response does not leave the rest for the next command`() = runBlocking<Unit> {

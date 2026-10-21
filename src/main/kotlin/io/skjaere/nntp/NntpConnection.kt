@@ -6,7 +6,7 @@ import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.ClosedByteChannelException
 import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.readByte
-import io.ktor.utils.io.readLine
+import io.ktor.utils.io.readLineStrict
 import io.ktor.utils.io.writeStringUtf8
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.Timer
@@ -292,9 +292,10 @@ class NntpConnection private constructor(
             try {
                 // Bounded by the read timeout, as every read on the socket is.
                 val welcomeLine = try {
-                    transport.read.readLine()
+                    transport.read.readLineStrict()
                 } catch (e: IOException) {
-                    // A reset, or TLS failing, before the greeting's end: the connect failed, as a refused one does.
+                    // A reset, TLS failing, or the stream's end before the greeting's end: the connect failed, as a
+                    // refused one does.
                     throw NntpConnectionException("Could not connect to $host:$port: ${e.message ?: e::class.simpleName}", e)
                 } ?: throw NntpConnectionException("Connection closed before welcome message")
                 val welcomeResponse = parseResponseLine(welcomeLine)
@@ -490,8 +491,14 @@ class NntpConnection private constructor(
     internal suspend fun readAvailable(dst: ByteBuffer, want: Int = 0): Int =
         timedRead { readChannel.readAvailable(dst, want) }
 
+    /**
+     * The next line, or null at the stream's end between lines. The end in the middle of a line fails the read as a
+     * connection lost on the way ([failing]): what came of it may look whole ("430 No Su" for a "430 No Such Article").
+     */
+    private suspend fun readLineOrNull(): String? = timedRead { readChannel.readLineStrict() }
+
     suspend fun readResponse(): NntpResponse {
-        val line = timedRead { readChannel.readLine() }
+        val line = readLineOrNull()
             ?: throw failed(NntpConnectionException("Connection closed unexpectedly"))
         // Not a status line: whatever it belongs to, the wire is out of step.
         return failing { parseResponseLine(line) }
@@ -500,7 +507,7 @@ class NntpConnection private constructor(
     suspend fun readMultiLineData(): List<String> {
         val lines = mutableListOf<String>()
         while (true) {
-            val line = timedRead { readChannel.readLine() }
+            val line = readLineOrNull()
                 ?: throw failed(NntpConnectionException("Connection closed during multi-line read"))
             if (line == ".") break
             // Dot-unstuffing: lines starting with ".." have leading dot removed
@@ -514,7 +521,7 @@ class NntpConnection private constructor(
     }
 
     suspend fun readLine(): String {
-        return timedRead { readChannel.readLine() }
+        return readLineOrNull()
             ?: throw failed(NntpConnectionException("Connection closed unexpectedly"))
     }
 
@@ -574,6 +581,8 @@ class NntpConnection private constructor(
      *   the server closed mid-stream (EOF) without giving us a clean state, a read or
      *   write or the body pump had already failed ([failure]), or what's owed can't be
      *   drained.
+     * @throws NntpConnectionException if a read fails: a reset, the read timeout, or the
+     *   stream's end in the middle of a line.
      */
     suspend fun drainUntilArticleEnd(): Boolean {
         failure?.let {
@@ -582,7 +591,7 @@ class NntpConnection private constructor(
         }
         // Pipelined STATs never overlap a BODY: read off the status lines still owed.
         while (pendingStatusLines > 0) {
-            timedRead { readChannel.readLine() } ?: run {
+            readLineOrNull() ?: run {
                 log.debug("conn={} drain: EOF with {} pipelined responses outstanding", id, pendingStatusLines)
                 return false
             }
@@ -668,8 +677,9 @@ class NntpConnection private constructor(
             true
         }
         InFlight.STATUS_LINE -> {
-            // Whole, or what's left of it after a cancelled read: either way it ends the answer.
-            val line = timedRead { readChannel.readLine() }
+            // Whole, or what's left of it after a cancelled read: either way it ends the answer. Cut off by the
+            // stream's end, it fails the drain, and the pool leaves the connection out.
+            val line = readLineOrNull()
             if (line == null) {
                 log.debug("conn={} drain: EOF with a status line outstanding", id)
                 false

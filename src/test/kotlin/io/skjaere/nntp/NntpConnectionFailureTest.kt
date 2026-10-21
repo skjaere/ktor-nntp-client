@@ -79,6 +79,14 @@ class NntpConnectionFailureTest {
         }
     }
 
+    /** Sends [text] as it is, a line's end only where it has one. */
+    private fun Socket.send(text: String) {
+        getOutputStream().apply {
+            write(text.toByteArray())
+            flush()
+        }
+    }
+
     @Test
     fun `a server that closes after an article's =ybegin line fails the body as a lost connection`() = runBlocking<Unit> {
         serveOnce { socket ->
@@ -104,6 +112,38 @@ class NntpConnectionFailureTest {
             assertFalse(client.connection.isReusable)
         }
     }
+
+    @Test
+    fun `a server that closes in the middle of a BODY's status line fails it as a lost connection`() = runBlocking<Unit> {
+        // What came of the line would read as a whole answer: the article missing, the connection fine to reuse.
+        serveOnce { socket -> socket.send("430 No Su") }
+        client().use { client ->
+            val failure = assertFailsWith<NntpConnectionLostException> { client.bodyYencBytes("<cut@test>") }
+            assertIs<java.io.EOFException>(failure.cause)
+            assertFalse(client.connection.isReusable)
+        }
+    }
+
+    @Test
+    fun `a server that closes in the middle of a STAT's status line fails it as a lost connection`() = runBlocking<Unit> {
+        serveOnce { socket -> socket.send("430 No Su") }
+        client().use { client ->
+            val failure = assertFailsWith<NntpConnectionLostException> { client.stat("<a@b>") }
+            assertIs<java.io.EOFException>(failure.cause)
+            assertFalse(client.connection.isReusable)
+        }
+    }
+
+    @Test
+    fun `a server that closes in the middle of a line of a multi-line answer fails it as a lost connection`() =
+        runBlocking<Unit> {
+            serveOnce { socket -> socket.send("224 Overview follows\r\n1\tPar") }
+            client().use { client ->
+                val failure = assertFailsWith<NntpConnectionLostException> { client.over(1L..2L) }
+                assertIs<java.io.EOFException>(failure.cause)
+                assertFalse(client.connection.isReusable)
+            }
+        }
 
     @Test
     fun `a reset fails the command as a lost connection`() = runBlocking<Unit> {
@@ -150,6 +190,17 @@ class NntpConnectionFailureTest {
         val failure = assertFailsWith<NntpConnectionException> { client() }
         assertFalse(failure is NntpConnectionLostException, "a connect that fails isn't a lost connection: $failure")
         assertIs<java.io.IOException>(failure.cause)
+    }
+
+    /** A greeting cut off by the server's close: the connect failed, as when a reset cuts it off. */
+    @Test
+    fun `a server that closes in the middle of the welcome fails the connect as a connection failure`() = runBlocking<Unit> {
+        Thread {
+            runCatching { serverSocket.accept().use { socket -> socket.send("200 wel") } }
+        }.apply { isDaemon = true }.start()
+        val failure = assertFailsWith<NntpConnectionException> { client() }
+        assertFalse(failure is NntpConnectionLostException, "a connect that fails isn't a lost connection: $failure")
+        assertIs<java.io.EOFException>(failure.cause)
     }
 
     @Test
