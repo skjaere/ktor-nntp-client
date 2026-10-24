@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class YencHeadersTest {
 
@@ -51,6 +52,53 @@ class YencHeadersTest {
     fun `parse throws on missing size field`() {
         assertThrows<YencDecodingException> {
             YencHeaders.parse("=ybegin line=128 name=test.bin")
+        }
+    }
+
+    // K55: a header with an empty or non-numeric number is a malformed article, reported as a YencDecodingException
+    // that names the field, so a caller can take the copy as bad and try another provider's.
+
+    @Test
+    fun `an empty or non-numeric number in =ybegin names its field`() {
+        for (field in listOf("size", "part", "total")) {
+            for (value in listOf("", "12a")) {
+                val fields = mapOf("part" to "1", "total" to "3", "line" to "128", "size" to "500000") + (field to value)
+                val ybegin = "=ybegin " + fields.entries.joinToString(" ") { "${it.key}=${it.value}" } + " name=a.bin"
+                val e = assertThrows<YencDecodingException>("$field=$value") {
+                    YencHeaders.parse(ybegin, "=ypart begin=1 end=166667")
+                }
+                assertTrue("'$field'" in e.message.orEmpty(), "$field=$value: ${e.message}")
+            }
+        }
+    }
+
+    @Test
+    fun `an empty or non-numeric number in =ypart names its field`() {
+        for ((field, ypart) in listOf(
+            "begin" to "=ypart begin= end=166667",
+            "begin" to "=ypart begin=x1 end=166667",
+            "end" to "=ypart begin=1 end=",
+            "end" to "=ypart begin=1 end=16a667",
+        )) {
+            val e = assertThrows<YencDecodingException>(ypart) {
+                YencHeaders.parse("=ybegin part=1 total=3 line=128 size=500000 name=a.bin", ypart)
+            }
+            assertTrue("'$field'" in e.message.orEmpty(), "$ypart: ${e.message}")
+        }
+    }
+
+    @Test
+    fun `an unreadable line length is read as 0, as nothing but a copy uses it`() {
+        for (value in listOf("", "x")) {
+            val headers = YencHeaders.parse(
+                "=ybegin part=2 total=3 line=$value size=500000 name=a.bin",
+                "=ypart begin=166668 end=333334"
+            )
+            assertEquals(0, headers.line)
+            assertEquals(500000L, headers.size)
+            assertEquals(2, headers.part)
+            assertEquals(166668L, headers.partBegin)
+            assertEquals(333334L, headers.partEnd)
         }
     }
 

@@ -1,5 +1,10 @@
 package io.skjaere.nntp
 
+/**
+ * An article's =ybegin and =ypart lines. [parse] throws a [YencDecodingException] naming the field for a number it
+ * can't read (empty, or not a number) in [size], [part], [total], [partBegin] or [partEnd]: the copy is malformed, and
+ * another provider's may be good. [line] is only copied, never used, so a value it can't read is taken as 0.
+ */
 data class YencHeaders(
     val line: Int,
     val size: Long,
@@ -35,24 +40,26 @@ data class YencHeaders(
                     .forEach { token ->
                         val (key, value) = token.split("=", limit = 2)
                         when (key) {
-                            "begin" -> partBegin = value.toLong()
-                            "end" -> partEnd = value.toLong()
+                            "begin" -> partBegin = number(key, value, "=ypart", String::toLongOrNull)
+                            "end" -> partEnd = number(key, value, "=ypart", String::toLongOrNull)
                         }
                     }
             }
 
             return YencHeaders(
-                line = fields["line"]?.toInt()
-                    ?: throw YencDecodingException("Missing 'line' in =ybegin"),
-                size = fields["size"]?.toLong()
+                line = (fields["line"] ?: throw YencDecodingException("Missing 'line' in =ybegin")).toIntOrNull() ?: 0,
+                size = fields["size"]?.let { number("size", it, "=ybegin", String::toLongOrNull) }
                     ?: throw YencDecodingException("Missing 'size' in =ybegin"),
                 name = name,
-                part = fields["part"]?.toInt(),
-                total = fields["total"]?.toInt(),
+                part = fields["part"]?.let { number("part", it, "=ybegin", String::toIntOrNull) },
+                total = fields["total"]?.let { number("total", it, "=ybegin", String::toIntOrNull) },
                 partBegin = partBegin,
                 partEnd = partEnd
             )
         }
+
+        private fun <T : Any> number(field: String, value: String, line: String, read: (String) -> T?): T =
+            read(value) ?: throw YencDecodingException("Unreadable '$field' in $line: \"$value\"")
     }
 }
 
