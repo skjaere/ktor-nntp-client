@@ -549,12 +549,21 @@ class NntpClientPool(
         }
     }
 
-    /** DATE on an idle connection: false if it failed or hung, and the connection should go. */
+    /** DATE on an idle connection: false if it failed, hung or got any answer but 111, and the connection should go. */
     private suspend fun answersKeepalive(client: NntpClient): Boolean {
         val answered = withTimeoutOrNull(keepaliveTimeoutMs.milliseconds) {
             try {
-                client.date()
-                true
+                val answer = client.date()
+                // Anything else is no DATE's answer: a server that writes "400 idle timeout" before it closes an
+                // idle connection has that line read as the answer, and the connection would be kept until its
+                // next command failed.
+                (answer.code == DATE_ANSWER).also { alive ->
+                    if (!alive) {
+                        logger.debug(
+                            "Keepalive DATE answered {} {}; discarding connection", answer.code, answer.message
+                        )
+                    }
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
@@ -1195,6 +1204,9 @@ class NntpClientPool(
             .counters().forEach { registry.remove(it.id) }
     }
 }
+
+// DATE's answer (RFC 3977 §7.1). Any other means the connection is gone, or about to go.
+private const val DATE_ANSWER = 111
 
 // AUTHINFO answers that reject the login itself: 481 (rejected), 482 (out of sequence) and 502
 // (not allowed, e.g. too many connections for the account). Asking again gets the same answer.

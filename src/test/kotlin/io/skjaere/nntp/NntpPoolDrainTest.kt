@@ -74,7 +74,8 @@ class NntpPoolDrainTest {
                     val returnedMs = msSince(started)
                     assertTrue(returnedMs < RETURN_BOUND_MS, "the cancelled BODY held its caller for $returnedMs ms")
 
-                    // The one connection is held while its drain waits, then discarded: the next command gets a new one.
+                    // The one connection is held while its drain waits, then discarded: the next command gets a
+                    // new one.
                     val returned = System.nanoTime()
                     val next = withTimeoutOrNull(SLOT_BOUND_MS) { pool.stat("<next@test>") }
                     assertIs<StatResult.Found>(next, "the next STAT got $next after ${msSince(returned)} ms")
@@ -112,7 +113,8 @@ class NntpPoolDrainTest {
                                         Thread.sleep(SECOND_PIECE_AFTER_MS)
                                         send(" article\r\n")
                                     }
-                                    line.startsWith("STAT ") -> send("223 0 ${line.removePrefix("STAT ")} article exists\r\n")
+                                    line.startsWith("STAT ") ->
+                                        send("223 0 ${line.removePrefix("STAT ")} article exists\r\n")
                                     else -> send("500 unknown command\r\n")
                                 }
                             }
@@ -130,7 +132,8 @@ class NntpPoolDrainTest {
             assertFailsWith<TimeoutCancellationException> {
                 withTimeout(SECOND_PIECE_AFTER_MS / 2) { pool.withClient { it.bodyYencBytes("<missing@test>") } }
             }
-            assertTrue(msSince(started) < RETURN_BOUND_MS, "the cancelled BODY held its caller for ${msSince(started)} ms")
+            val returnedMs = msSince(started)
+            assertTrue(returnedMs < RETURN_BOUND_MS, "the cancelled BODY held its caller for $returnedMs ms")
             val next = withTimeoutOrNull(SLOT_BOUND_MS) { pool.stat("<next@test>") }
             assertIs<StatResult.Found>(next, "the next STAT got $next")
             assertEquals(1, accepted.get(), "the 430 should have been read off and the connection kept")

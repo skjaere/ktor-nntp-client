@@ -3,6 +3,7 @@ package io.skjaere.nntp
 import io.ktor.network.selector.SelectorManager
 import io.micrometer.core.instrument.Metrics
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
+import io.skjaere.nntp.IdleSilenceServer.OnIdle
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -160,6 +161,29 @@ class NntpPoolKeepaliveTest {
                 assertNotNull(gone, "pool size ${gauge(server, "nntp.pool.size")} a second after the DATEs")
                 // Nobody asked for a connection meanwhile, so none was opened in their place.
                 assertEquals(2, server.accepted.get(), "connections opened")
+            } finally {
+                pool.close()
+            }
+        }
+    }
+
+    /**
+     * Any answer to a keepalive DATE counted: the "400 idle timeout" a server sends before it closes an idle connection
+     * was taken for DATE's, and the connection kept until the next command on it failed.
+     */
+    @Test
+    fun `a sweep discards a connection whose DATE gets any answer but 111`() = runBlocking<Unit> {
+        IdleSilenceServer(idleAfterMs = SILENT_AFTER_MS, onIdle = OnIdle.KICK).use { server ->
+            val pool = pool(server, maxConnections = 1, keepaliveIntervalMs = INTERVAL_MS)
+            try {
+                pool.wake()
+                pool.fillIdle(1)
+                val kicked = withTimeoutOrNull(3 * INTERVAL_MS) { while (server.silenced.get() == 0) delay(5) }
+                assertNotNull(kicked, "the sweep never sent DATE")
+                // Well before the next sweep, which would find the connection closed.
+                delay(INTERVAL_MS / 3)
+                assertEquals(0.0, gauge(server, "nntp.pool.idle"), "idle connections after the sweep")
+                assertEquals(0.0, gauge(server, "nntp.pool.size"), "pool size after the sweep")
             } finally {
                 pool.close()
             }
