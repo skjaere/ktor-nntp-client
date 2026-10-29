@@ -75,6 +75,11 @@ class NntpClientPool(
     name: String = "$host:$port",
     // How long the keepalive waits for an idle connection's DATE before it takes the connection for dead.
     private val keepaliveTimeoutMs: Long = KEEPALIVE_COMMAND_TIMEOUT_MS,
+    // A connection nobody has used or checked for this long is checked with a DATE before it is lent, and has
+    // validateTimeoutMs to answer 111; 0 or less: never. One a NAT, a VPN or the provider dropped while it sat idle
+    // then costs at most validateTimeoutMs and a connect, where a command on it would wait out the read timeout.
+    private val validateAfterIdleMs: Long = 0,
+    private val validateTimeoutMs: Long = DEFAULT_VALIDATE_TIMEOUT_MS,
 ) : Closeable {
 
     companion object {
@@ -83,6 +88,7 @@ class NntpClientPool(
         const val DEFAULT_IDLE_EVICTION_TIMEOUT_MS = 180_000L // 3 minutes
         // The default keepaliveTimeoutMs: how long a keepalive DATE may take before its connection is taken for dead.
         const val KEEPALIVE_COMMAND_TIMEOUT_MS = 10_000L
+        const val DEFAULT_VALIDATE_TIMEOUT_MS = 2_000L
         const val MIN_POOL_SIZE = 1  // always keep at least one connection
         const val CONNECT_RETRY_BASE_DELAY_MS = 1_000L
         const val CONNECT_RETRY_MAX_DELAY_MS = 30_000L
@@ -150,7 +156,13 @@ class NntpClientPool(
         const val CONNECT_TIMEOUT_MS = 20_000L
     }
 
-    private data class IdleEntry(val client: NntpClient, val returnedAtMs: Long)
+    private data class IdleEntry(
+        val client: NntpClient,
+        // When a caller last gave it back: idle eviction and the keepalive count from it.
+        val returnedAtMs: Long,
+        // When it last answered, a caller's command or a check's DATE: a borrow's check counts from it.
+        val checkedAtMs: Long = returnedAtMs,
+    )
 
     private class PriorityWaiter(
         val priority: Int,
@@ -518,25 +530,26 @@ class NntpClientPool(
             evictIdleConnections()
             // Only the connections nobody used for a whole interval: one a caller uses between its commands stays
             // theirs, and a sweep never makes them wait for it.
-            keepaliveSweep(takeIdle(unusedForMs = keepaliveIntervalMs))
+            val now = System.currentTimeMillis()
+            checkIdle(takeIdle { now - it.returnedAtMs >= keepaliveIntervalMs }, keepaliveTimeoutMs, KEEPALIVE)
         }
     }
 
     /**
-     * Sends DATE on each of [entries], idle connections taken out of the pool, all at once, and hands each back as it
-     * answers: to the pool if it answered, else discarded. One that doesn't answer keeps no other out of use. Until
-     * handed back they're the sweep's alone, so when it's cancelled (by sleep, close, a new keepalive) the rest are
-     * handed back as they stand, under NonCancellable as in [withdraw]. Otherwise they'd never be closed, and would
-     * still count against maxConnections.
+     * Sends DATE on each of [entries], idle connections taken out of the pool, all at once, giving each [timeoutMs] to
+     * answer, and hands each back as it answers: to the pool if it answered, else discarded. One that doesn't answer
+     * keeps no other out of use. Until handed back they're the check's alone, so when it's cancelled (by sleep, close,
+     * a new keepalive) the rest are put back as they stand, under NonCancellable as in [withdraw]. Otherwise they'd
+     * never be closed, and would still count against maxConnections. [by] names the check in the log.
      */
-    private suspend fun keepaliveSweep(entries: List<IdleEntry>) {
+    private suspend fun checkIdle(entries: List<IdleEntry>, timeoutMs: Long, by: String) {
         val unchecked = ConcurrentHashMap.newKeySet<IdleEntry>().apply { addAll(entries) }
         try {
             coroutineScope {
                 entries.forEach { entry ->
                     launch {
-                        val alive = answersKeepalive(entry.client)
-                        // Handed back once: here, or below when the sweep is cut short first.
+                        val alive = answersDate(entry.client, timeoutMs, by)
+                        // Handed back once: here, or below when the check is cut short first.
                         if (unchecked.remove(entry)) handBack(entry, alive)
                     }
                 }
@@ -544,14 +557,17 @@ class NntpClientPool(
         } finally {
             withContext(NonCancellable) {
                 // A DATE cut short still owes its answer, which isReusable sees: each one costs its connection.
-                unchecked.forEach { handBack(it, it.client.connection.isReusable) }
+                unchecked.forEach { putBack(it) }
             }
         }
     }
 
-    /** DATE on an idle connection: false if it failed, hung or got any answer but 111, and the connection should go. */
-    private suspend fun answersKeepalive(client: NntpClient): Boolean {
-        val answered = withTimeoutOrNull(keepaliveTimeoutMs.milliseconds) {
+    /**
+     * DATE on an idle connection, given [timeoutMs] to answer: false if it failed, hung or got any answer but 111, and
+     * the connection should go. [by] names the check in the log.
+     */
+    private suspend fun answersDate(client: NntpClient, timeoutMs: Long, by: String): Boolean {
+        val answered = withTimeoutOrNull(timeoutMs.milliseconds) {
             try {
                 val answer = client.date()
                 // Anything else is no DATE's answer: a server that writes "400 idle timeout" before it closes an
@@ -559,33 +575,95 @@ class NntpClientPool(
                 // next command failed.
                 (answer.code == DATE_ANSWER).also { alive ->
                     if (!alive) {
-                        logger.debug(
-                            "Keepalive DATE answered {} {}; discarding connection", answer.code, answer.message
-                        )
+                        logger.debug("{} DATE answered {} {}; discarding connection", by, answer.code, answer.message)
                     }
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (@Suppress("TooGenericExceptionCaught") e: Exception) {
-                logger.debug("Keepalive failed, discarding connection: {}", e.message)
+                logger.debug("{} failed, discarding connection: {}", by, e.message)
                 false
             }
         }
         if (answered == null) {
             // DATE hung — socket is half-broken. Discard so a single stuck connection
             // can't block eviction or the grace-period check.
-            logger.debug("Keepalive DATE timed out after {}ms; discarding connection", keepaliveTimeoutMs)
+            logger.debug("{} DATE timed out after {}ms; discarding connection", by, timeoutMs)
         }
         return answered == true
     }
 
-    /** Puts a connection the keepalive took out back in the pool, or discards it. */
-    private suspend fun handBack(entry: IdleEntry, alive: Boolean) {
-        if (alive) {
+    /** Puts a connection a check took out back in the pool if it [answered], checked now; else discards it. */
+    private suspend fun handBack(entry: IdleEntry, answered: Boolean) {
+        if (answered) {
             // Preserve the original idle timestamp so keepalive itself doesn't reset eviction.
-            returnToPool(entry.client, entry.returnedAtMs)
+            returnToPool(entry.client, entry.returnedAtMs, checkedAtMs = System.currentTimeMillis())
         } else {
             discardClient(entry.client)
+        }
+    }
+
+    /**
+     * Puts back a connection taken out for a check that was cut short: as it stood, unless the DATE cut short still
+     * owes its answer, which isReusable sees, and the connection is discarded.
+     */
+    private suspend fun putBack(entry: IdleEntry) {
+        if (entry.client.connection.isReusable) {
+            returnToPool(entry.client, entry.returnedAtMs, entry.checkedAtMs)
+        } else {
+            discardClient(entry.client)
+        }
+    }
+
+    /** Under [poolMutex]: whether [entry] is to be checked before it's lent (validateAfterIdleMs). */
+    private fun dueCheck(entry: IdleEntry, now: Long): Boolean =
+        validateAfterIdleMs > 0 && now - entry.checkedAtMs >= validateAfterIdleMs
+
+    /**
+     * Checks [entry], an idle connection an acquire took out that nobody has used or checked for validateAfterIdleMs,
+     * before it is lent: true if it answered 111 within validateTimeoutMs, and it's the acquire's. Otherwise it is
+     * discarded, without QUIT, and the other idle connections due a check are checked at once on the pool's scope:
+     * connections die together (a NAT or a VPN dropping its flows, the provider ending idle sessions), and a borrower
+     * meeting them one after another would wait out each one's check. They go back to the pool as they answer, to the
+     * acquires waiting first. A connection opens in place of one only for an acquire that waits.
+     */
+    private suspend fun validated(entry: IdleEntry): Boolean {
+        val alive = try {
+            answersDate(entry.client, validateTimeoutMs, CHECK_ON_BORROW)
+        } catch (e: CancellationException) {
+            // The acquire was cancelled with the connection still its own.
+            withContext(NonCancellable) { putBack(entry) }
+            throw e
+        }
+        if (alive) {
+            // The pool may have closed meanwhile without it: it was neither idle nor lent.
+            val open = try {
+                poolMutex.withLock { !closed }
+            } catch (e: CancellationException) {
+                // Cancelled while it waited for the lock: the connection goes back, or its slot would be lost.
+                withContext(NonCancellable) { handBack(entry, answered = true) }
+                throw e
+            }
+            if (open) return true
+            discardClient(entry.client)
+            throw IllegalStateException("Pool closed")
+        }
+        discardClient(entry.client)
+        val now = System.currentTimeMillis()
+        val suspects = takeIdle { dueCheck(it, now) }
+        if (suspects.isNotEmpty()) checkOnPoolScope(suspects)
+        return false
+    }
+
+    /** [checkIdle] of [entries], given validateTimeoutMs each, on the pool's scope: the borrower goes on at once. */
+    private fun checkOnPoolScope(entries: List<IdleEntry>) {
+        // As in drainOnPoolScope: started even on a cancelled scope, and let finish, so each one is handed back.
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            withContext(NonCancellable) {
+                // Off the borrower's thread before the first read, as in drainOnPoolScope.
+                yield()
+                checkIdle(entries, validateTimeoutMs, CHECK_ON_BORROW)
+            }
         }
     }
 
@@ -654,10 +732,9 @@ class NntpClientPool(
         }
     }
 
-    /** Takes out of the pool the idle connections nobody has used for [unusedForMs] or longer, oldest first. */
-    private suspend fun takeIdle(unusedForMs: Long): List<IdleEntry> = poolMutex.withLock {
-        val now = System.currentTimeMillis()
-        val (taken, kept) = idleClients.partition { now - it.returnedAtMs >= unusedForMs }
+    /** Takes out of the pool the idle connections [picked] picks, oldest first. */
+    private suspend fun takeIdle(picked: (IdleEntry) -> Boolean): List<IdleEntry> = poolMutex.withLock {
+        val (taken, kept) = idleClients.partition(picked)
         idleClients.clear()
         idleClients.addAll(kept)
         taken
@@ -737,32 +814,43 @@ class NntpClientPool(
         // A timeout names a connect failure after these as its cause.
         val failuresBefore = connectFailures.get()
         val deferred = CompletableDeferred<NntpClient>()
-        val waiter = poolMutex.withLock {
-            // As close() fails the acquires already waiting. Not retried by withClient, so work
-            // in flight at close ends here too, without a new connection.
-            check(!closed) { "Pool closed" }
-            // LIFO: take the most-recently-used connection. Under steady-state
-            // trickle traffic, this keeps the "hot" connections refreshed at the
-            // tail while older connections age out at the head.
-            val entry = idleClients.removeLastOrNull()
-            if (entry != null) {
-                deferred.complete(entry.client)
-                return@withLock null
+        var waiter: PriorityWaiter?
+        while (true) {
+            // An idle connection due a check before it's lent (validateAfterIdleMs), checked outside the lock.
+            var due: IdleEntry? = null
+            waiter = poolMutex.withLock {
+                // As close() fails the acquires already waiting. Not retried by withClient, so work
+                // in flight at close ends here too, without a new connection.
+                check(!closed) { "Pool closed" }
+                // LIFO: take the most-recently-used connection. Under steady-state
+                // trickle traffic, this keeps the "hot" connections refreshed at the
+                // tail while older connections age out at the head.
+                val entry = idleClients.removeLastOrNull()
+                if (entry != null) {
+                    if (dueCheck(entry, System.currentTimeMillis())) due = entry else deferred.complete(entry.client)
+                    return@withLock null
+                }
+                // Nothing to wait for, and logging in again would be rejected: fail now.
+                loginRejectedNow()?.let { rejection ->
+                    recordAcquireFailure(priority, "connect_failed")
+                    throw failureFor(rejection)
+                }
+                val w = PriorityWaiter(priority, deferred, waiterSequence++)
+                waiters.add(w)
+                incWaiter(priority)
+                // Launch a new connection if we haven't reached the max
+                if (canOpenConnection()) {
+                    currentSize++
+                    launchConnection()
+                }
+                w
             }
-            // Nothing to wait for, and logging in again would be rejected: fail now.
-            loginRejectedNow()?.let { rejection ->
-                recordAcquireFailure(priority, "connect_failed")
-                throw failureFor(rejection)
+            val checking = due ?: break
+            if (validated(checking)) {
+                deferred.complete(checking.client)
+                break
             }
-            val w = PriorityWaiter(priority, deferred, waiterSequence++)
-            waiters.add(w)
-            incWaiter(priority)
-            // Launch a new connection if we haven't reached the max
-            if (canOpenConnection()) {
-                currentSize++
-                launchConnection()
-            }
-            w
+            // Found dead and discarded: the next idle connection, or a new one.
         }
         if (waiter == null) {
             recordAcquire(sample, priority)
@@ -823,9 +911,13 @@ class NntpClientPool(
     /**
      * Called under [poolMutex]: dispatch the client to the highest-priority waiter,
      * skipping cancelled waiters. If no waiters, park in [idleClients] with the given
-     * idle timestamp (defaults to now).
+     * idle timestamps (defaults to now).
      */
-    private fun dispatchOrPark(client: NntpClient, returnedAtMs: Long = System.currentTimeMillis()) {
+    private fun dispatchOrPark(
+        client: NntpClient,
+        returnedAtMs: Long = System.currentTimeMillis(),
+        checkedAtMs: Long = returnedAtMs,
+    ) {
         while (true) {
             val waiter = waiters.poll() ?: break
             // Removed from queue → decrement gauge for that priority. Whether the deferred
@@ -834,7 +926,7 @@ class NntpClientPool(
             if (waiter.deferred.complete(client)) return
             // Waiter was cancelled, try next
         }
-        idleClients.addLast(IdleEntry(client, returnedAtMs))
+        idleClients.addLast(IdleEntry(client, returnedAtMs, checkedAtMs))
     }
 
     private suspend fun addClientToPool(client: NntpClient) {
@@ -1050,7 +1142,11 @@ class NntpClientPool(
         }
     }
 
-    private suspend fun returnToPool(client: NntpClient, returnedAtMs: Long = System.currentTimeMillis()) {
+    private suspend fun returnToPool(
+        client: NntpClient,
+        returnedAtMs: Long = System.currentTimeMillis(),
+        checkedAtMs: Long = returnedAtMs,
+    ) {
         withContext(NonCancellable) {
             val toClose = poolMutex.withLock {
                 val priority = activeClients.remove(client)
@@ -1067,7 +1163,7 @@ class NntpClientPool(
                     }
 
                     else -> {
-                        dispatchOrPark(client, returnedAtMs)
+                        dispatchOrPark(client, returnedAtMs, checkedAtMs)
                         null
                     }
                 }
@@ -1207,6 +1303,10 @@ class NntpClientPool(
 
 // DATE's answer (RFC 3977 §7.1). Any other means the connection is gone, or about to go.
 private const val DATE_ANSWER = 111
+
+// The checks of idle connections, as the log names them.
+private const val KEEPALIVE = "Keepalive"
+private const val CHECK_ON_BORROW = "Check on borrow"
 
 // AUTHINFO answers that reject the login itself: 481 (rejected), 482 (out of sequence) and 502
 // (not allowed, e.g. too many connections for the account). Asking again gets the same answer.
