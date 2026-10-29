@@ -222,6 +222,8 @@ Set `keepaliveIntervalMs = 0` to disable keepalive, and `idleGracePeriodMs = 0` 
 
 Set `validateAfterIdleMs` to have a connection that nobody has used or checked for that long answer a `DATE` before it is lent, within `validateTimeoutMs` (2 s by default) and with `111`. One that doesn't is closed without `QUIT`, the other connections idle as long are checked at once, and the command goes to one that answered or to a new connection, opened only for a command that waits. A connection a NAT, a VPN or the provider dropped while it sat idle then costs at most the check and a connect, where a command on it would wait out `readTimeoutMs`. Off (`0`) by default.
 
+When the keepalive or a borrow's check finds idle connections dead, the pool logs it at INFO: how many, how many were silent (no answer: a NAT or a VPN dropped the flow) and how many closed (the provider or the network ended them), how long they had sat unused, and which check found them. At most one such line per pool every 10 s; the ones found meanwhile are summed into the next.
+
 ### Read Timeout
 
 A read that gets no bytes from the server for `readTimeoutMs` (30 s by default) fails with `NntpConnectionException`, and the pool discards the connection, so a stalled server or a connection left half-open by a network change can't hang a command. It is an idle timeout: a long `BODY` or pipelined `STAT` batch that keeps receiving bytes is never cut off, and idle pooled connections are not affected. Pass `readTimeoutMs` to `NntpClientPool` or `NntpClient.connect`; `0` disables it. It runs on a real clock, under a test dispatcher too.
