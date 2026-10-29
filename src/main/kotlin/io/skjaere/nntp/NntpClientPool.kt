@@ -92,6 +92,12 @@ class NntpClientPool(
 
         // At most one line about the dead idle connections the checks found per pool this often ([reportDead]).
         internal const val DEAD_REPORT_INTERVAL_MS = 10_000L
+
+        // A connection a caller gave back within this fraction of keepaliveIntervalMs is in use, and the keepalive
+        // leaves it alone: every other idle connection is checked each tick, so none goes much over an interval
+        // without a command.
+        private const val IN_USE_FRACTION_OF_INTERVAL = 10
+
         const val MIN_POOL_SIZE = 1  // always keep at least one connection
         const val CONNECT_RETRY_BASE_DELAY_MS = 1_000L
         const val CONNECT_RETRY_MAX_DELAY_MS = 30_000L
@@ -580,10 +586,16 @@ class NntpClientPool(
                 continue
             }
             evictIdleConnections()
-            // Only the connections nobody used for a whole interval: one a caller uses between its commands stays
-            // theirs, and a sweep never makes them wait for it.
+            // The connections nobody used in the last tenth of an interval: one a caller uses between its commands
+            // stays theirs. Not only those idle a whole interval: one given back just after a tick would be a little
+            // short of it at the next, and go nearly two intervals without a command, past a NAT or a provider that
+            // ends flows idle a little over one.
             val now = System.currentTimeMillis()
-            checkIdle(takeIdle { now - it.returnedAtMs >= keepaliveIntervalMs }, keepaliveTimeoutMs, CheckBy.KEEPALIVE)
+            checkIdle(
+                takeIdle { now - it.returnedAtMs >= keepaliveIntervalMs / IN_USE_FRACTION_OF_INTERVAL },
+                keepaliveTimeoutMs,
+                CheckBy.KEEPALIVE,
+            )
         }
     }
 

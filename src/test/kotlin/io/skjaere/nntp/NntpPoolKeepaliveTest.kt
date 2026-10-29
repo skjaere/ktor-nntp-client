@@ -27,8 +27,9 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
- * The keepalive checks the connections that sat idle a whole interval, all at once, and hands each back as it
- * answers: a connection in use between ticks is never taken out, nor one that answered kept behind one that doesn't.
+ * The keepalive checks, all at once, the connections nobody used in the last tenth of an interval, and hands each back
+ * as it answers: one a caller keeps using stays theirs or comes back at once, none that answered is kept behind one
+ * that doesn't, and none goes much over an interval unchecked.
  */
 @Timeout(30, unit = TimeUnit.SECONDS)
 class NntpPoolKeepaliveTest {
@@ -114,8 +115,12 @@ class NntpPoolKeepaliveTest {
                     }
                 }
                 assertTrue(slowest < STAT_BOUND_MS, "slowest STAT: $slowest ms")
-                // Two sweeps have run, and the cold ones were checked.
-                assertEquals(2, server.dates().map { it.connection }.distinct().size, "connections DATEd")
+                // Two sweeps have run, and the cold ones were checked. The hot one may have been too, when a tick
+                // came more than a tenth of an interval after its last STAT: it answered, and was back at once.
+                val hot = server.commands.filter { it.line.startsWith("STAT <hot") }.map { it.connection }.toSet()
+                assertEquals(1, hot.size, "connections the STATs were served on")
+                val dated = server.dates().map { it.connection }.toSet()
+                assertEquals(setOf(0, 1, 2) - hot, dated - hot, "cold connections DATEd")
                 assertEquals(3, server.accepted.get(), "connections opened")
             } finally {
                 pool.close()
@@ -225,6 +230,30 @@ class NntpPoolKeepaliveTest {
             }
         }
 
+    /**
+     * Only the connections idle a whole interval were checked. One given back just after a tick was a little short of
+     * it at the next, and went nearly two intervals without a command: past a NAT or a provider that ends flows idle a
+     * little over one interval, where checking every idle connection each tick had kept it.
+     */
+    @Test
+    fun `a connection given back just after a tick is checked at the next`() = runBlocking<Unit> {
+        IdleSilenceServer().use { server ->
+            val pool = pool(server, maxConnections = 1, keepaliveIntervalMs = GAP_INTERVAL_MS)
+            try {
+                // The keepalive's ticks count from the wake, and the connection is given back just after it.
+                pool.wake()
+                pool.stat("<once@test>")
+                val dated = withTimeoutOrNull(3 * GAP_INTERVAL_MS) { while (server.dates().isEmpty()) delay(10) }
+                assertNotNull(dated, "the keepalive never sent DATE")
+                val stat = server.commands.first { it.line.startsWith("STAT") }
+                val gapMs = (server.dates().first().atNanos - stat.atNanos) / NANOS_PER_MS
+                assertTrue(gapMs < GAP_BOUND_MS, "the first DATE came $gapMs ms after the connection's STAT")
+            } finally {
+                pool.close()
+            }
+        }
+    }
+
     @Test
     fun `the keepalive's defaults are as before`() {
         assertEquals(60_000L, NntpClientPool.DEFAULT_KEEPALIVE_INTERVAL_MS)
@@ -244,5 +273,11 @@ class NntpPoolKeepaliveTest {
         const val SHRINK_INTERVAL_MS = 300L
         const val EVICT_AFTER_MS = 1_000L
         const val SHRINK_BOUND_MS = 5_000L
+
+        // An interval, and the bound on the first DATE after a connection's last command: half an interval over one,
+        // and half short of two.
+        const val GAP_INTERVAL_MS = 1_000L
+        const val GAP_BOUND_MS = 1_500L
+        const val NANOS_PER_MS = 1_000_000L
     }
 }
