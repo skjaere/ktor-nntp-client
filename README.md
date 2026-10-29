@@ -202,7 +202,7 @@ coroutineScope {
 
 ### Keepalive, Sleep/Wake, and Pool Shrinking
 
-The pool periodically sends `DATE` commands to keep connections alive. If no activity occurs within the idle grace period, the pool automatically closes all connections (sleeps). The next `withClient` call transparently wakes the pool.
+The pool periodically sends `DATE` commands to keep connections alive. Each tick it checks the connections nobody has used for a whole interval, all at once, and hands each back as it answers: a connection in use between a caller's commands is never taken out, and one that doesn't answer keeps no other out of use. One that hasn't answered within `keepaliveTimeoutMs` (10 s by default) is discarded. If no activity occurs within the idle grace period, the pool automatically closes all connections (sleeps). The next `withClient` call transparently wakes the pool.
 
 When demand drops, the pool shrinks: on each keepalive tick it closes the connections that have been idle for longer than `idleEvictionTimeoutMs` (3 minutes by default), keeping at least 1. New connections are created again on demand when traffic increases.
 

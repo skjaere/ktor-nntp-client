@@ -28,9 +28,9 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.first
@@ -72,15 +72,17 @@ class NntpClientPool(
     // The pool.name tag of this pool's metrics and its connections'. Pools on one server (two
     // accounts, say) need a name each: a meter is shared by its name and tags, and close()
     // removes those of its pool's name.
-    name: String = "$host:$port"
+    name: String = "$host:$port",
+    // How long the keepalive waits for an idle connection's DATE before it takes the connection for dead.
+    private val keepaliveTimeoutMs: Long = KEEPALIVE_COMMAND_TIMEOUT_MS,
 ) : Closeable {
 
     companion object {
         const val DEFAULT_KEEPALIVE_INTERVAL_MS = 60_000L
         const val DEFAULT_IDLE_GRACE_PERIOD_MS = 300_000L // 5 minutes
         const val DEFAULT_IDLE_EVICTION_TIMEOUT_MS = 180_000L // 3 minutes
-        const val KEEPALIVE_COMMAND_TIMEOUT_MS =
-            10_000L // bound per-connection DATE so a hung socket can't stall eviction
+        // The default keepaliveTimeoutMs: how long a keepalive DATE may take before its connection is taken for dead.
+        const val KEEPALIVE_COMMAND_TIMEOUT_MS = 10_000L
         const val MIN_POOL_SIZE = 1  // always keep at least one connection
         const val CONNECT_RETRY_BASE_DELAY_MS = 1_000L
         const val CONNECT_RETRY_MAX_DELAY_MS = 30_000L
@@ -515,38 +517,42 @@ class NntpClientPool(
                 continue
             }
             evictIdleConnections()
-            keepaliveSweep(drainIdle())
+            // Only the connections nobody used for a whole interval: one a caller uses between its commands stays
+            // theirs, and a sweep never makes them wait for it.
+            keepaliveSweep(takeIdle(unusedForMs = keepaliveIntervalMs))
         }
     }
 
     /**
-     * Sends DATE on each of [entries], idle connections taken out of the pool, and hands each
-     * back: to the pool if it answered, else discarded. Until then they're the sweep's alone,
-     * so when it's cancelled (by sleep, close, a new keepalive) the rest are handed back as
-     * they stand, under NonCancellable as in [withdraw]. Otherwise they'd never be closed, and
-     * would still count against maxConnections.
+     * Sends DATE on each of [entries], idle connections taken out of the pool, all at once, and hands each back as it
+     * answers: to the pool if it answered, else discarded. One that doesn't answer keeps no other out of use. Until
+     * handed back they're the sweep's alone, so when it's cancelled (by sleep, close, a new keepalive) the rest are
+     * handed back as they stand, under NonCancellable as in [withdraw]. Otherwise they'd never be closed, and would
+     * still count against maxConnections.
      */
     private suspend fun keepaliveSweep(entries: List<IdleEntry>) {
-        var checked = 0
+        val unchecked = ConcurrentHashMap.newKeySet<IdleEntry>().apply { addAll(entries) }
         try {
-            for (entry in entries) {
-                // Once cancelled, no more DATEs: one cut short costs its connection.
-                currentCoroutineContext().ensureActive()
-                val alive = answersKeepalive(entry.client)
-                checked++
-                handBack(entry, alive)
+            coroutineScope {
+                entries.forEach { entry ->
+                    launch {
+                        val alive = answersKeepalive(entry.client)
+                        // Handed back once: here, or below when the sweep is cut short first.
+                        if (unchecked.remove(entry)) handBack(entry, alive)
+                    }
+                }
             }
         } finally {
             withContext(NonCancellable) {
-                // The one whose DATE was cut short still owes its answer, which isReusable sees.
-                entries.drop(checked).forEach { handBack(it, it.client.connection.isReusable) }
+                // A DATE cut short still owes its answer, which isReusable sees: each one costs its connection.
+                unchecked.forEach { handBack(it, it.client.connection.isReusable) }
             }
         }
     }
 
     /** DATE on an idle connection: false if it failed or hung, and the connection should go. */
     private suspend fun answersKeepalive(client: NntpClient): Boolean {
-        val answered = withTimeoutOrNull(KEEPALIVE_COMMAND_TIMEOUT_MS.milliseconds) {
+        val answered = withTimeoutOrNull(keepaliveTimeoutMs.milliseconds) {
             try {
                 client.date()
                 true
@@ -560,10 +566,7 @@ class NntpClientPool(
         if (answered == null) {
             // DATE hung — socket is half-broken. Discard so a single stuck connection
             // can't block eviction or the grace-period check.
-            logger.debug(
-                "Keepalive DATE timed out after {}ms; discarding connection",
-                KEEPALIVE_COMMAND_TIMEOUT_MS
-            )
+            logger.debug("Keepalive DATE timed out after {}ms; discarding connection", keepaliveTimeoutMs)
         }
         return answered == true
     }
@@ -641,6 +644,15 @@ class NntpClientPool(
             idleClients.clear()
             return entries
         }
+    }
+
+    /** Takes out of the pool the idle connections nobody has used for [unusedForMs] or longer, oldest first. */
+    private suspend fun takeIdle(unusedForMs: Long): List<IdleEntry> = poolMutex.withLock {
+        val now = System.currentTimeMillis()
+        val (taken, kept) = idleClients.partition { now - it.returnedAtMs >= unusedForMs }
+        idleClients.clear()
+        idleClients.addAll(kept)
+        taken
     }
 
     suspend fun sleep() {
