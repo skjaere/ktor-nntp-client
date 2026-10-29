@@ -94,6 +94,9 @@ class NntpPoolKeepaliveTest {
 
     private fun IdleSilenceServer.dates() = commands.filter { it.line == "DATE" }
 
+    /** The connections that were sent QUIT. */
+    private fun IdleSilenceServer.quitOn() = commands.filter { it.line == "QUIT" }.map { it.connection }.toSet()
+
     /**
      * The sweep used to take every idle connection out of the pool, the one in use between a caller's commands too,
      * and DATE them one after another, oldest first: behind each silent one the rest waited out its 10 s timeout, and
@@ -221,9 +224,13 @@ class NntpPoolKeepaliveTest {
                         }
                     }
                     assertNotNull(shrunk, "pool size ${gauge(server, "nntp.pool.size")} after $stats STATs")
-                    // The cold ones were checked meanwhile: the pool shrank by eviction, not by finding them dead.
+                    // The cold ones were checked meanwhile.
                     assertTrue(server.dates().isNotEmpty(), "the keepalive never sent DATE")
-                    assertEquals(3, server.accepted.get(), "connections opened")
+                    // And the pool shrank by eviction, which sends QUIT, not by finding them dead, which doesn't. Not
+                    // told by the connections opened: a STAT during the DATE an eviction's tick sends the warm one may
+                    // open another, evicted in its turn. The QUITs go out just after the size drops.
+                    val quit = withTimeoutOrNull(QUIT_BOUND_MS) { while (server.quitOn().size < 2) delay(10) }
+                    assertNotNull(quit, "connections QUIT: ${server.quitOn()}")
                 } finally {
                     pool.close()
                 }
@@ -273,6 +280,9 @@ class NntpPoolKeepaliveTest {
         const val SHRINK_INTERVAL_MS = 300L
         const val EVICT_AFTER_MS = 1_000L
         const val SHRINK_BOUND_MS = 5_000L
+
+        // The QUITs eviction sends: local round trips, the bound far past them.
+        const val QUIT_BOUND_MS = 2_000L
 
         // An interval, and the bound on the first DATE after a connection's last command: half an interval over one,
         // and half short of two.
