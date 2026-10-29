@@ -122,15 +122,14 @@ class NntpClientPool(
         // run their QUITs in parallel, so this caps the overall shutdown wall time, not a serial sum.
         const val POOL_CLOSE_QUIT_TIMEOUT_MS = 1500L
 
-        // Upper bound on the cancellation-recovery drain. drainUntilArticleEnd's job is to
-        // read the rest of a half-consumed body so the connection can be reused — but it
-        // runs under withContext(NonCancellable), so a server that stops sending bytes after
-        // a cancelled fetch (article missing post-status, network glitch mid-body, etc.) will
-        // pin the calling coroutine on `readAvailable` indefinitely. That coroutine still
-        // holds the pool slot via activeClients, so each leaked drain permanently removes
-        // one connection from circulation. A 3-second cap is well above the worst-case
-        // drain on a healthy wire (~one yenc-segment worth of bytes ≈ 750 KB) and well below
-        // any reasonable client patience for "we already cancelled this anyway".
+        // Upper bound on the cancellation-recovery drain (drainOnPoolScope). drainUntilArticleEnd's
+        // job is to read the rest of a half-consumed answer so the connection can be reused — but
+        // it runs under NonCancellable, so a server that stops sending bytes after a cancelled
+        // fetch (article missing post-status, network glitch mid-body, etc.) would pin it on
+        // `readAvailable` indefinitely. The connection stays checked out until drained, so each
+        // leaked drain would permanently remove one connection from circulation. A 3-second cap
+        // is well above the worst-case drain on a healthy wire (~one yenc-segment worth of bytes
+        // ≈ 750 KB). The cancelled caller doesn't wait for it; the connection's slot is held that long.
         const val DRAIN_TIMEOUT_MS = 3_000L
 
         // Upper bound on a single TCP+TLS+welcome+AUTHINFO handshake. NntpConnection.connect
@@ -921,61 +920,21 @@ class NntpClientPool(
                     if (client?.connection?.isReusable == false) dead = true
                     throw e
                 } catch (e: CancellationException) {
-                    // Mid-block cancellation (e.g. an outer withTimeout firing while a
-                    // bodyYenc stream is still reading article bytes off the wire) leaves
-                    // the wire in a half-read state. Drain inline — wrapped in
-                    // NonCancellable so the parent cancellation doesn't kill the drain
-                    // mid-read — to article-end before letting the cancellation propagate.
-                    // If drain succeeds the connection stays reusable (the finally below
-                    // returns it); if drain fails/times-out we mark dead so the finally
-                    // discards instead.
-                    //
-                    // Inline (rather than handing off to a background coroutine) is the
-                    // simpler design: the caller waits for the drain, but we don't have
-                    // to reason about a race between the drain and the next acquire of
-                    // the same connection. The benign post-emit case (blockCompleted=true)
-                    // skips the drain entirely. A pipelined STAT batch's answers are read off
-                    // without the caller (drainOnPoolScope): an availability check stops at its
-                    // first missing article with up to a window of them owed, which a server
-                    // slow to answer takes seconds to send.
-                    val pipelined = client?.takeIf { it.connection.pipelinedAnswersOwed > 0 }
-                    if (!blockCompleted && pipelined != null) {
+                    // Mid-block cancellation (e.g. an outer withTimeout firing while a bodyYenc stream is still
+                    // reading article bytes off the wire) leaves the rest of the answer on the wire, or the socket
+                    // dead. What's owed is read off on the pool's scope (drainOnPoolScope), the connection checked
+                    // out until then so no other caller gets it half-read, and this caller goes on at once: a fetch's
+                    // timeout or a seek used to wait up to the drain's whole budget for a server gone silent (K31). A
+                    // connection still in step needs no drain, and the finally returns it. The benign post-emit case
+                    // (blockCompleted=true) skips all of this.
+                    val owing = client?.takeIf { !it.connection.isReusable }
+                    if (!blockCompleted && owing != null) {
                         logger.debug(
-                            "conn={} cancelled with {} pipelined answers owed, draining on the pool's scope",
-                            pipelined.connection.id, pipelined.connection.pipelinedAnswersOwed
+                            "conn={} cancelled mid-block, draining on the pool's scope ({} pipelined answers owed)",
+                            owing.connection.id, owing.connection.pipelinedAnswersOwed
                         )
-                        drainOnPoolScope(pipelined)
+                        drainOnPoolScope(owing)
                         handedOff = true
-                    } else if (!blockCompleted) {
-                        client?.let { c ->
-                            logger.debug(
-                                "conn={} cancellation mid-block, draining inline",
-                                c.connection.id
-                            )
-                            // Nested withTimeoutOrNull inside NonCancellable: the outer
-                            // context blocks PARENT cancellation from reaching us, but the
-                            // timeout's own Job (a child of NonCancellable) can still cancel
-                            // the inner readAvailable on expiry. Without this bound, a server
-                            // that stops sending after a cancelled fetch pins the drain
-                            // coroutine forever — and the connection along with it — because
-                            // readAvailable just keeps waiting for bytes that will never come.
-                            // On timeout we treat the wire as unrecoverable: mark dead so the
-                            // finally below discards the client and frees its pool slot.
-                            val drained = withContext(NonCancellable) {
-                                runCatching {
-                                    withTimeoutOrNull(DRAIN_TIMEOUT_MS) {
-                                        c.connection.drainUntilArticleEnd()
-                                    } ?: false
-                                }.getOrDefault(false)
-                            }
-                            if (!drained) {
-                                logger.debug(
-                                    "conn={} drain failed or timed out after {}ms; will discard in finally",
-                                    c.connection.id, DRAIN_TIMEOUT_MS,
-                                )
-                                dead = true
-                            }
-                        }
                     }
                     throw e
                 } catch (@Suppress("TooGenericExceptionCaught") e: Throwable) {

@@ -4,6 +4,8 @@ import io.ktor.network.selector.SelectorManager
 import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.ClosedByteChannelException
+import io.ktor.utils.io.InternalAPI
+import io.ktor.utils.io.availableForRead
 import io.ktor.utils.io.readAvailable
 import io.ktor.utils.io.readByte
 import io.ktor.utils.io.readLineStrict
@@ -13,6 +15,7 @@ import io.micrometer.core.instrument.Timer
 import java.io.EOFException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.io.indexOf
 import org.slf4j.LoggerFactory
 import java.io.Closeable
 import java.io.IOException
@@ -120,9 +123,8 @@ class NntpConnection private constructor(
 
         /**
          * A response with a data block, a POST's article, a login, or [commandRaw]'s status
-         * line, which the caller follows up. No drain brings these back in step for sure: a
-         * cancelled readLine drops the part of a line it had read, which may be the start of
-         * the status line or of the terminator.
+         * line, which the caller follows up. No drain brings these back in step for sure: how
+         * much of what follows the status line was read is the caller's to know.
          */
         UNRECOVERABLE
     }
@@ -494,8 +496,19 @@ class NntpConnection private constructor(
     /**
      * The next line, or null at the stream's end between lines. The end in the middle of a line fails the read as a
      * connection lost on the way ([failing]): what came of it may look whole ("430 No Su" for a "430 No Such Article").
+     * None of the line is taken before all of it has come: a read cancelled while it waits leaves the line whole for
+     * the drain, which tells a status line by its first characters (K38: a 430 that came in two pieces, cancelled in
+     * between, left the drain " article" and the connection was lost).
      */
-    private suspend fun readLineOrNull(): String? = timedRead { readChannel.readLineStrict() }
+    @OptIn(InternalAPI::class)
+    private suspend fun readLineOrNull(): String? = timedRead {
+        var scanned = 0
+        while (readChannel.readBuffer.indexOf(LF, scanned.toLong()) < 0) {
+            scanned = readChannel.availableForRead
+            if (!readChannel.awaitContent(scanned + 1)) break
+        }
+        readChannel.readLineStrict()
+    }
 
     suspend fun readResponse(): NntpResponse {
         val line = readLineOrNull()
@@ -684,8 +697,8 @@ class NntpConnection private constructor(
             true
         }
         InFlight.STATUS_LINE -> {
-            // Whole, or what's left of it after a cancelled read: either way it ends the answer. Cut off by the
-            // stream's end, it fails the drain, and the pool leaves the connection out.
+            // Whole: a read cancelled while it waited took none of it (readLineOrNull). Cut off by the stream's end,
+            // it fails the drain, and the pool leaves the connection out.
             val line = readLineOrNull()
             if (line == null) {
                 log.debug("conn={} drain: EOF with a status line outstanding", id)
@@ -736,6 +749,9 @@ class NntpConnection private constructor(
 }
 
 private const val DEFAULT_QUIT_TIMEOUT_MS = 5_000L
+
+// A line's end, CRLF's last byte.
+private const val LF = '\n'.code.toByte()
 
 // How deep [NntpConnection]'s failures look for a close's own exception under the channel exceptions wrapping it.
 private const val MAX_CLOSE_WRAPPING = 4
