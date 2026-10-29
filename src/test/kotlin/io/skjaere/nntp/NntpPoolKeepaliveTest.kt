@@ -60,6 +60,7 @@ class NntpPoolKeepaliveTest {
         maxConnections: Int,
         keepaliveIntervalMs: Long,
         keepaliveTimeoutMs: Long = NntpClientPool.KEEPALIVE_COMMAND_TIMEOUT_MS,
+        idleEvictionTimeoutMs: Long = NntpClientPool.DEFAULT_IDLE_EVICTION_TIMEOUT_MS,
     ) = NntpClientPool(
         host = "localhost",
         port = server.port,
@@ -69,6 +70,7 @@ class NntpPoolKeepaliveTest {
         keepaliveIntervalMs = keepaliveIntervalMs,
         idleGracePeriodMs = 0,
         keepaliveTimeoutMs = keepaliveTimeoutMs,
+        idleEvictionTimeoutMs = idleEvictionTimeoutMs,
     )
 
     private fun gauge(server: IdleSilenceServer, name: String): Double? =
@@ -190,6 +192,39 @@ class NntpPoolKeepaliveTest {
         }
     }
 
+    /**
+     * A sweep put the connections it checked back after the one in use, at the end the pool lends from: the next
+     * borrow took a cold one, and eviction, which stops at the first connection used within idleEvictionTimeoutMs
+     * from the oldest end, always met the one in use until the last sweep. A pool a caller kept using never shrank.
+     */
+    @Test
+    fun `a pool a caller keeps using shrinks to one connection while the keepalive checks the others`() =
+        runBlocking<Unit> {
+            IdleSilenceServer().use { server ->
+                val pool = pool(
+                    server, maxConnections = 3, keepaliveIntervalMs = SHRINK_INTERVAL_MS,
+                    idleEvictionTimeoutMs = EVICT_AFTER_MS,
+                )
+                try {
+                    pool.wake()
+                    pool.fillIdle(3)
+                    var stats = 0
+                    val shrunk = withTimeoutOrNull(SHRINK_BOUND_MS) {
+                        while (gauge(server, "nntp.pool.size") != 1.0) {
+                            delay(STAT_EVERY_MS)
+                            pool.stat("<trickle${stats++}@test>")
+                        }
+                    }
+                    assertNotNull(shrunk, "pool size ${gauge(server, "nntp.pool.size")} after $stats STATs")
+                    // The cold ones were checked meanwhile: the pool shrank by eviction, not by finding them dead.
+                    assertTrue(server.dates().isNotEmpty(), "the keepalive never sent DATE")
+                    assertEquals(3, server.accepted.get(), "connections opened")
+                } finally {
+                    pool.close()
+                }
+            }
+        }
+
     @Test
     fun `the keepalive's defaults are as before`() {
         assertEquals(60_000L, NntpClientPool.DEFAULT_KEEPALIVE_INTERVAL_MS)
@@ -204,5 +239,10 @@ class NntpPoolKeepaliveTest {
 
         // Two sweeps' worth of STATs, and some.
         const val STATS = 20
+
+        // Eviction under a trickle: three intervals of checks before the cold ones are due, and the bound well past.
+        const val SHRINK_INTERVAL_MS = 300L
+        const val EVICT_AFTER_MS = 1_000L
+        const val SHRINK_BOUND_MS = 5_000L
     }
 }

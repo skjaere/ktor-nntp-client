@@ -788,8 +788,9 @@ class NntpClientPool(
             val evicted = poolMutex.withLock {
                 val keepFloor = MIN_POOL_SIZE.coerceAtLeast(0)
                 val removed = mutableListOf<IdleEntry>()
-                // Oldest idle entries sit at the head of the deque (we addLast on return),
-                // so scan from the front. Stop once the remaining pool would dip below the floor.
+                // Oldest idle entries sit at the head of the deque (dispatchOrPark keeps it in
+                // returnedAtMs order), so scan from the front. Stop once the remaining pool would
+                // dip below the floor.
                 while (idleClients.isNotEmpty() && currentSize > keepFloor) {
                     val oldest = idleClients.first()
                     if (now - oldest.returnedAtMs < idleEvictionTimeoutMs) break
@@ -1016,7 +1017,9 @@ class NntpClientPool(
     /**
      * Called under [poolMutex]: dispatch the client to the highest-priority waiter,
      * skipping cancelled waiters. If no waiters, park in [idleClients] with the given
-     * idle timestamps (defaults to now).
+     * idle timestamps (defaults to now), in its place by [returnedAtMs]: oldest at the
+     * head, where eviction looks, and the one a caller gave back last at the tail, which
+     * the next borrow takes.
      */
     private fun dispatchOrPark(
         client: NntpClient,
@@ -1031,7 +1034,11 @@ class NntpClientPool(
             if (waiter.deferred.complete(client)) return
             // Waiter was cancelled, try next
         }
-        idleClients.addLast(IdleEntry(client, returnedAtMs, checkedAtMs))
+        // A connection a check hands back keeps its old returnedAtMs. At the tail, after one in use since, the next
+        // borrow would take it instead of the warm one, and eviction would stop at the warm one before it, so a pool
+        // a caller kept using never shrank. Anything a caller gives back is the newest, and goes last at once.
+        val at = idleClients.indexOfLast { it.returnedAtMs <= returnedAtMs } + 1
+        idleClients.add(at, IdleEntry(client, returnedAtMs, checkedAtMs))
     }
 
     private suspend fun addClientToPool(client: NntpClient) {
