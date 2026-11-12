@@ -360,3 +360,11 @@ Connections also record `nntp.command.ack_latency`, the time from sending a comm
 - rapidyenc-kotlin-wrapper 0.3.0
 - Kotlin Coroutines 1.11.0
 - Micrometer 1.16.7
+
+## License
+
+This repository's own code is under the [PolyForm Noncommercial License 1.0.0](LICENSE.md) (SPDX `PolyForm-Noncommercial-1.0.0`): it is free for any non-commercial use, and commercial use needs the author's permission.
+
+These files keep their own licence:
+
+- The Gradle wrapper (`gradlew`, `gradlew.bat` and `gradle/wrapper/`): Apache License 2.0 (SPDX `Apache-2.0`).
