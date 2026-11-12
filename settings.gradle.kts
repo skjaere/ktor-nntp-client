@@ -4,8 +4,9 @@ plugins {
 
 rootProject.name = "ktor-nntp-client"
 
-if (file("../yenc_kotlin_wrapper").exists()) {
-    includeBuild("../yenc_kotlin_wrapper") {
+// A checkout of the rapidyenc wrapper beside this one, under its repository's name or as yenc_kotlin_wrapper.
+listOf("../rapidyenc-kotlin-wrapper", "../yenc_kotlin_wrapper").map(::file).firstOrNull { it.exists() }?.let { wrapper ->
+    includeBuild(wrapper) {
         dependencySubstitution {
             substitute(module("com.github.skjaere:rapidyenc-kotlin-wrapper")).using(project(":"))
         }
