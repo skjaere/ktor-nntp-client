@@ -353,12 +353,12 @@ Connections also record `nntp.command.ack_latency`, the time from sending a comm
 - The main code is compiled for Java 17 with a JDK 17 toolchain, which Gradle downloads when none is installed. The Gradle wrapper (Gradle 9.3.1) runs on JDK 17 or newer; CI runs it on JDK 25.
 - The tests compile and run on a JDK 25 toolchain, as the `mock-nntp-server` test dependency is published for Java 25 only. They run their NNTP servers in process, so they need no Docker.
 - yEnc decoding loads the `librapidyenc.so` bundled in [rapidyenc-kotlin-wrapper](https://github.com/skjaere/rapidyenc-kotlin-wrapper). When a checkout of it sits beside this one, as `../rapidyenc-kotlin-wrapper` (the name a clone gets) or `../yenc_kotlin_wrapper`, the build uses it in place of the published version.
-- Without that checkout the build takes the wrapper from JitPack at the commit pinned in `gradle/libs.versions.toml`, which is built for Java 17. Its releases up to v0.3.0 are built for Java 25, so this library can't use them.
+- Without that checkout the build takes the wrapper's release pinned in `gradle/libs.versions.toml` from JitPack. Its releases from v0.4.0 on are built for Java 17; those up to v0.3.0 are built for Java 25, so this library can't use them.
 
 ## Dependencies
 
 - Ktor Network 3.5.2
-- rapidyenc-kotlin-wrapper 0.3.0 and later (pinned to a commit built for Java 17)
+- rapidyenc-kotlin-wrapper 0.4.0
 - Kotlin Coroutines 1.11.0
 - Micrometer 1.16.7
 
