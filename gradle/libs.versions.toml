@@ -18,7 +18,7 @@ junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "jun
 slf4j-api = { module = "org.slf4j:slf4j-api", version = "2.0.20" }
 logback-classic = { module = "ch.qos.logback:logback-classic", version = "1.5.16" }
 conscrypt-openjdk-uber = { module = "org.conscrypt:conscrypt-openjdk-uber", version = "2.5.2" }
-rapidyenc = { module = "com.github.skjaere:rapidyenc-kotlin-wrapper", version = "v0.3.0" }
+rapidyenc = { module = "com.github.skjaere:rapidyenc-kotlin-wrapper", version = "54c9ed1e77" }
 micrometer-core = { module = "io.micrometer:micrometer-core", version.ref = "micrometer" }
 mock-nntp-testcontainer = { module = "com.github.skjaere:mock-nntp-server", version = "v0.1.0" }
 testcontainers = { module = "org.testcontainers:testcontainers", version.ref = "testcontainers" }
