@@ -26,7 +26,7 @@ A Kotlin NNTP (Network News Transfer Protocol) client library with Ktor's byte c
 
 ## Requirements
 
-- Java 17+ (the tests run on JDK 25)
+- Java 17+ (the tests run on JDK 25), from the first release made from the current code. Releases up to v0.7.0 need Java 25+.
 - Kotlin 2.3+
 
 ## Installation
