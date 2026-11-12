@@ -169,7 +169,7 @@ class NntpPoolLifecycleTest {
         assertNotNull(settled, "$what was still running ${PROMPT_MS}ms after the pool closed")
     }
 
-    // --- K15: close ---
+    // --- close ---
 
     @ParameterizedTest(name = "closed while asleep: {0}")
     @ValueSource(booleans = [false, true])
@@ -228,7 +228,7 @@ class NntpPoolLifecycleTest {
         assertEquals(1, server.accepted.get(), "connects after close")
     }
 
-    // --- K16: the per-attempt connect timeout ---
+    // --- the per-attempt connect timeout ---
 
     private class FakeClient : Closeable {
         @Volatile
@@ -294,7 +294,7 @@ class NntpPoolLifecycleTest {
         assertNull(connected, "a connect still running at its deadline should give up")
     }
 
-    // --- K17: sleep and wake ---
+    // --- sleep and wake ---
 
     /** The pool's private lock, so a test can hold it the way a concurrent pool operation does. */
     private fun NntpClientPool.poolMutex(): Mutex =

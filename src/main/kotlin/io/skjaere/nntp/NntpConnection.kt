@@ -497,8 +497,8 @@ class NntpConnection private constructor(
      * The next line, or null at the stream's end between lines. The end in the middle of a line fails the read as a
      * connection lost on the way ([failing]): what came of it may look whole ("430 No Su" for a "430 No Such Article").
      * None of the line is taken before all of it has come: a read cancelled while it waits leaves the line whole for
-     * the drain, which tells a status line by its first characters (K38: a 430 that came in two pieces, cancelled in
-     * between, left the drain " article" and the connection was lost).
+     * the drain, which tells a status line by its first characters (a 430 that came in two pieces, cancelled in
+     * between, once left the drain " article" and the connection was lost).
      */
     @OptIn(InternalAPI::class)
     private suspend fun readLineOrNull(): String? = timedRead {

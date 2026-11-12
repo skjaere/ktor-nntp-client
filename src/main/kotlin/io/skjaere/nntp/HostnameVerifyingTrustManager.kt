@@ -16,7 +16,7 @@ import javax.net.ssl.X509TrustManager
  * Android.
  *
  * The platform's TLS checks a name only when asked to (an endpoint identification algorithm),
- * by its own rules and in its own words; this check's words are the ones the app shows. Ktor
+ * by its own rules and in its own words; this check's words are the ones a caller shows. Ktor
  * 3.4's TLS, used before, passed a certificate that lists no DNS names (or, for an IP address,
  * no IP addresses) whatever it was issued for.
  */
@@ -53,7 +53,7 @@ internal class HostnameVerifyingTrustManager(
         private const val IP_ADDRESS = 7
         private const val NAMES_IN_MESSAGE = 5
 
-        /** The platform's default trust manager: the system's certificate authorities, or what the app configured. */
+        /** The platform's default trust manager: the system's certificate authorities, or what the application configured. */
         fun platformDefault(): X509TrustManager =
             TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
                 .apply { init(null as KeyStore?) }

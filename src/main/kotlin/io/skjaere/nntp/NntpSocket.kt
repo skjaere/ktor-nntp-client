@@ -35,7 +35,7 @@ import kotlin.coroutines.CoroutineContext
  *
  * Ktor's socket put a coroutine between the socket and the reader, woken by its selector's thread: every burst of bytes
  * (8 KB at most) cost a selector wake-up and two dispatches, and the reader's coroutine was resumed last, with a timer
- * task per read for the read timeout (library issue K42). Here the thread the kernel wakes is the reader's.
+ * task per read for the read timeout. Here the thread the kernel wakes is the reader's.
  *
  * A wait blocks its thread, so reads, writes and the connect run on [NntpDispatchers.IO], the library's view of
  * Dispatchers.IO: in place for a caller on it, else moved there. A caller on another dispatcher (Main, runBlocking's, a
@@ -208,7 +208,7 @@ internal class NntpSocket private constructor(
 
         /**
          * After [got] bytes, fewer than the reader wants: waits [GATHER_MS] for more to come, then takes them, so one
-         * wake-up brings what a millisecond's packets do (each woke the reader on its own on the emulator, 1.5 KB). The
+         * wake-up brings what a millisecond's packets do (each woke the reader on its own on an Android emulator, 1.5 KB). The
          * bytes in all; an end seen meanwhile shows at the next read. Only a close ends the wait early: the bytes taken
          * may hold the end of the answer, and a cancel thrown now would leave them unseen. The next read sees it.
          */

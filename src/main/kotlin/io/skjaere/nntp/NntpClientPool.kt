@@ -1149,7 +1149,7 @@ class NntpClientPool(
                     // reading article bytes off the wire) leaves the rest of the answer on the wire, or the socket
                     // dead. What's owed is read off on the pool's scope (drainOnPoolScope), the connection checked
                     // out until then so no other caller gets it half-read, and this caller goes on at once: a fetch's
-                    // timeout or a seek used to wait up to the drain's whole budget for a server gone silent (K31). A
+                    // timeout or a seek used to wait up to the drain's whole budget for a server gone silent. A
                     // connection still in step needs no drain, and the finally returns it. The benign post-emit case
                     // (blockCompleted=true) skips all of this.
                     val owing = client?.takeIf { !it.connection.isReusable }

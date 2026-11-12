@@ -55,7 +55,7 @@ class YencHeadersTest {
         }
     }
 
-    // K55: a header with an empty or non-numeric number is a malformed article, reported as a YencDecodingException
+    // A header with an empty or non-numeric number is a malformed article, reported as a YencDecodingException
     // that names the field, so a caller can take the copy as bad and try another provider's.
 
     @Test

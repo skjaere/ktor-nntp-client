@@ -248,7 +248,7 @@ class NntpWholeBodyTest {
      * The decoder's buffers are the connection's, which reads one body at a time. Allocated for each
      * article, a 128 KB read buffer and two 256 KB direct buffers (Java heap on ART), and a 256 KB
      * array to write the Body channel from, they were 0.17 MB for every MB a stream read, more for
-     * small articles (library issue K42). Counted on the calling thread, where the decoder runs; the
+     * small articles. Counted on the calling thread, where the decoder runs; the
      * direct buffers are counted apart, as the JVM keeps them off its heap ([directGrowth]).
      */
     @Test

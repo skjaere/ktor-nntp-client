@@ -25,7 +25,7 @@ import kotlin.test.assertTrue
 
 /**
  * A command its caller cancels mid-answer (a fetch's timeout, a seek) leaves the rest of the answer on the wire. It is
- * read off on the pool's scope, the connection held meanwhile: its caller goes on at once (library issue K31).
+ * read off on the pool's scope, the connection held meanwhile: its caller goes on at once.
  */
 @Timeout(20, unit = TimeUnit.SECONDS)
 class NntpPoolDrainTest {
@@ -87,7 +87,7 @@ class NntpPoolDrainTest {
         }
 
     /**
-     * K38: a BODY cancelled right after it was sent, for an article the server answers 430, never drained. When its
+     * A BODY cancelled right after it was sent, for an article the server answers 430, is still drained. When its
      * status line comes in two pieces and the cancel lands between them, the read cut short has taken the first.
      */
     @Test

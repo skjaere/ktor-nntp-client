@@ -27,7 +27,7 @@ import javax.net.ssl.X509TrustManager
  * [rawRead] and [rawWrite]. [read] is what the server sent, decrypted when its reader asks for more, in the reader's
  * own coroutine; [write] encrypts and sends what is written to it when flushed. Nothing runs between the socket and
  * the reader: Ktor's tls() put a coroutine and a channel there for each direction, one more hand-off per read, and
- * decrypted CBC records in Kotlin with an allocation per record (library issue K43).
+ * decrypted CBC records in Kotlin with an allocation per record.
  *
  * TLS 1.3 when the server offers it, else 1.2, with the platform's cipher suites. Reads and writes take turns, as a
  * connection's commands and answers do (the pool gives it to one caller at a time): a key update the server asks for

@@ -1,2 +1,16 @@
+# Gradle
+.gradle/
+build/
+.kotlin/
+
+# IDE
+.idea/
+*.iml
+
+# Local settings and secrets
+local.properties
+.env*
+.claude/
+
 # Heap dumps: a Gradle daemon that runs out of memory writes one into the build's directory.
 *.hprof

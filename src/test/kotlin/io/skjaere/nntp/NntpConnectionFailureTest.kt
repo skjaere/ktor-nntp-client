@@ -180,7 +180,7 @@ class NntpConnectionFailureTest {
         }
     }
 
-    /** A connect fails with an [NntpConnectionException] as its KDoc says, also when the greeting is cut off (K48). */
+    /** A connect fails with an [NntpConnectionException] as its KDoc says, also when the greeting is cut off. */
     @Test
     fun `a reset while the welcome is read fails the connect as a connection failure, not a lost connection`() = runBlocking<Unit> {
         Thread {

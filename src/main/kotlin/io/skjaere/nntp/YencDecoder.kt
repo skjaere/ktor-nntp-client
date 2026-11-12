@@ -118,7 +118,7 @@ internal object YencDecoder {
     /**
      * A connection's decode buffers, kept from one BODY to the next as it reads one at a time
      * ([NntpConnection.decodeBuffers]). Allocated for each article they were 0.17 MB for every MB
-     * streamed, more for small articles, on ART all of it Java heap (library issue K42).
+     * streamed, more for small articles, on ART all of it Java heap.
      *
      *   - [readBuf]  — heap ByteArray for what follows the =yend line, read to the article's end
      *   - [srcBuf]   — direct ByteBuffer fed to the yEnc decoder, read into straight from the socket
